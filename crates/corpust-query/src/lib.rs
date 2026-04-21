@@ -6,12 +6,15 @@
 //! callers' import paths.
 
 use anyhow::Result;
-use corpust_index::{CorpusIndex, DEFAULT_CONTEXT, DEFAULT_LIMIT, KwicHit};
+use corpust_index::{CorpusIndex, DEFAULT_CONTEXT, DEFAULT_LIMIT, KwicHit, QueryLayer};
+
+pub use corpust_index::QueryLayer as Layer;
 
 /// Parameters for a KWIC query.
 #[derive(Debug, Clone)]
 pub struct KwicRequest<'a> {
     pub term: &'a str,
+    pub layer: QueryLayer,
     pub context: usize,
     pub limit: usize,
 }
@@ -20,9 +23,15 @@ impl<'a> KwicRequest<'a> {
     pub fn new(term: &'a str) -> Self {
         Self {
             term,
+            layer: QueryLayer::Word,
             context: DEFAULT_CONTEXT,
             limit: DEFAULT_LIMIT,
         }
+    }
+
+    pub fn layer(mut self, layer: QueryLayer) -> Self {
+        self.layer = layer;
+        self
     }
 
     pub fn context(mut self, context: usize) -> Self {
@@ -37,5 +46,5 @@ impl<'a> KwicRequest<'a> {
 }
 
 pub fn kwic(index: &CorpusIndex, request: KwicRequest<'_>) -> Result<Vec<KwicHit>> {
-    index.kwic(request.term, request.context, request.limit)
+    index.kwic(request.term, request.layer, request.context, request.limit)
 }

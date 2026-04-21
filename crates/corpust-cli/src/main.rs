@@ -5,8 +5,8 @@
 //! `kwic` (run a single-term concordance over an existing index).
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use corpust_index::{CorpusIndex, DEFAULT_CONTEXT, DEFAULT_LIMIT};
+use clap::{Parser, Subcommand, ValueEnum};
+use corpust_index::{CorpusIndex, DEFAULT_CONTEXT, DEFAULT_LIMIT, QueryLayer};
 use corpust_query::{KwicRequest, kwic};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -35,6 +35,9 @@ enum Command {
         index: PathBuf,
         /// Term to search for.
         term: String,
+        /// Annotation layer to query.
+        #[arg(long, value_enum, default_value_t = LayerArg::Word)]
+        layer: LayerArg,
         /// Tokens of context on each side.
         #[arg(long, default_value_t = DEFAULT_CONTEXT)]
         context: usize,
@@ -44,6 +47,26 @@ enum Command {
     },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LayerArg {
+    /// Surface word form (always populated).
+    Word,
+    /// Lemma — requires annotation at index time.
+    Lemma,
+    /// Part-of-speech tag — requires annotation at index time.
+    Pos,
+}
+
+impl From<LayerArg> for QueryLayer {
+    fn from(arg: LayerArg) -> Self {
+        match arg {
+            LayerArg::Word => QueryLayer::Word,
+            LayerArg::Lemma => QueryLayer::Lemma,
+            LayerArg::Pos => QueryLayer::Pos,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -51,9 +74,10 @@ fn main() -> Result<()> {
         Command::Kwic {
             index,
             term,
+            layer,
             context,
             limit,
-        } => run_kwic(index, &term, context, limit),
+        } => run_kwic(index, &term, layer.into(), context, limit),
     }
 }
 
@@ -81,12 +105,24 @@ fn run_index(input: PathBuf, out: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn run_kwic(index_path: PathBuf, term: &str, context: usize, limit: usize) -> Result<()> {
+fn run_kwic(
+    index_path: PathBuf,
+    term: &str,
+    layer: QueryLayer,
+    context: usize,
+    limit: usize,
+) -> Result<()> {
     let index = CorpusIndex::open(&index_path)
         .with_context(|| format!("opening index at {}", index_path.display()))?;
 
     let t0 = Instant::now();
-    let hits = kwic(&index, KwicRequest::new(term).context(context).limit(limit))?;
+    let hits = kwic(
+        &index,
+        KwicRequest::new(term)
+            .layer(layer)
+            .context(context)
+            .limit(limit),
+    )?;
     let elapsed = t0.elapsed();
 
     let left_width = hits.iter().map(|h| h.left.chars().count()).max().unwrap_or(0);

@@ -55,6 +55,20 @@ struct Fields {
     token_offsets: Field,
 }
 
+/// Which annotation layer a query targets.
+///
+/// `Word` queries the surface-form inverted index (case-insensitive).
+/// `Lemma` queries the lemma layer (case-insensitive) — only populated
+/// for documents indexed with an [`Annotator`] that emits lemmas.
+/// `Pos` queries the POS-tag layer (case-sensitive — conventionally
+/// uppercase tagsets like Penn Treebank).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryLayer {
+    Word,
+    Lemma,
+    Pos,
+}
+
 /// One concordance line.
 #[derive(Debug, Clone)]
 pub struct KwicHit {
@@ -224,11 +238,24 @@ impl CorpusIndex {
     }
 
     /// Run a KWIC (key word in context) query for a single term on the
-    /// `body` (word form) layer. Case-insensitive.
-    pub fn kwic(&self, term: &str, context: usize, limit: usize) -> Result<Vec<KwicHit>> {
+    /// requested [`QueryLayer`]. Context extraction always uses the
+    /// stored original text in `body` — regardless of which layer the
+    /// hit was located on, the reported concordance line shows the
+    /// source-faithful surface form.
+    pub fn kwic(
+        &self,
+        term: &str,
+        layer: QueryLayer,
+        context: usize,
+        limit: usize,
+    ) -> Result<Vec<KwicHit>> {
         let searcher = self.reader.searcher();
-        let lowered = term.to_lowercase();
-        let term_obj = Term::from_field_text(self.fields.body, &lowered);
+        let (query_field, lookup_term) = match layer {
+            QueryLayer::Word => (self.fields.body, term.to_lowercase()),
+            QueryLayer::Lemma => (self.fields.body_lemma, term.to_lowercase()),
+            QueryLayer::Pos => (self.fields.body_pos, term.to_string()),
+        };
+        let term_obj = Term::from_field_text(query_field, &lookup_term);
 
         let mut hits = Vec::with_capacity(limit);
         let mut positions_buf: Vec<u32> = Vec::new();
@@ -237,7 +264,7 @@ impl CorpusIndex {
             if hits.len() >= limit {
                 break;
             }
-            let inv_idx = seg_reader.inverted_index(self.fields.body)?;
+            let inv_idx = seg_reader.inverted_index(query_field)?;
             let Some(mut postings) = inv_idx
                 .read_postings(&term_obj, IndexRecordOption::WithFreqsAndPositions)?
             else {
@@ -446,7 +473,7 @@ mod tests {
         )
         .unwrap();
 
-        let hits = idx.kwic("the", 2, 10).unwrap();
+        let hits = idx.kwic("the", QueryLayer::Word, 2, 10).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].hit, "the");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -466,7 +493,7 @@ mod tests {
         )
         .unwrap();
 
-        let hits = idx.kwic("the", 1, 10).unwrap();
+        let hits = idx.kwic("the", QueryLayer::Word, 1, 10).unwrap();
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().any(|h| h.hit == "The"));
         assert!(hits.iter().any(|h| h.hit == "THE"));
@@ -487,7 +514,7 @@ mod tests {
         )
         .unwrap();
 
-        let hits = idx.kwic("target", 2, 10).unwrap();
+        let hits = idx.kwic("target", QueryLayer::Word, 2, 10).unwrap();
         assert_eq!(hits.len(), 1);
         let h = &hits[0];
         assert_eq!(h.left, "gamma delta");
@@ -510,7 +537,7 @@ mod tests {
         )
         .unwrap();
 
-        let hits = idx.kwic("target", 10, 10).unwrap();
+        let hits = idx.kwic("target", QueryLayer::Word, 10, 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].left, "");
         assert_eq!(hits[0].right, "one two three");
@@ -533,11 +560,19 @@ mod tests {
         )
         .unwrap();
 
-        let hits = idx.kwic("quick", 1, 10).unwrap();
+        let hits = idx.kwic("quick", QueryLayer::Word, 1, 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].hit, "quick");
         assert_eq!(hits[0].left, "the");
         assert_eq!(hits[0].right, "brown");
+
+        // WordOnly emits empty lemma / pos tokens — queries on those
+        // layers find nothing.
+        let no_lemma = idx.kwic("quick", QueryLayer::Lemma, 1, 10).unwrap();
+        assert!(no_lemma.is_empty());
+        let no_pos = idx.kwic("NN", QueryLayer::Pos, 1, 10).unwrap();
+        assert!(no_pos.is_empty());
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
