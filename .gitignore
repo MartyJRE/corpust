@@ -1,4 +1,7 @@
 /target
 /testdata/index
+/testdata/gutenberg/
+/testdata/gutenberg-index/
 .DS_Store
 .idea/
+CLAUDE.local.md

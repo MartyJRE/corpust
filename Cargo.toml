@@ -16,6 +16,10 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/MartyJRE/corpust"
 authors = ["Martin Pražák"]
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [workspace.dependencies]
 corpust-core = { path = "crates/corpust-core" }
 corpust-tokenize = { path = "crates/corpust-tokenize" }
@@ -25,6 +29,6 @@ corpust-query = { path = "crates/corpust-query" }
 
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
-tantivy = "0.22"
+tantivy = "0.26"
 unicode-segmentation = "1.12"
 walkdir = "2.5"

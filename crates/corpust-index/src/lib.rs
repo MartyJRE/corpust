@@ -11,8 +11,8 @@ use anyhow::{Context, Result};
 use corpust_core::{DocId, Document};
 use std::path::{Path, PathBuf};
 use tantivy::{
-    DocAddress, DocSet, Index, IndexReader, Postings, ReloadPolicy, TERMINATED, TantivyDocument,
-    Term, doc,
+    DocAddress, DocSet, Index, IndexReader, ReloadPolicy, TERMINATED, TantivyDocument, Term, doc,
+    postings::Postings,
     schema::{Field, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value},
     tokenizer::{LowerCaser, TextAnalyzer, Token, TokenStream, Tokenizer},
 };
