@@ -1,0 +1,15 @@
+[package]
+name = "corpust-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Corpust: positional inverted index (Tantivy-backed)."
+
+[dependencies]
+corpust-core.workspace = true
+corpust-tokenize.workspace = true
+anyhow.workspace = true
+tantivy.workspace = true
+unicode-segmentation.workspace = true

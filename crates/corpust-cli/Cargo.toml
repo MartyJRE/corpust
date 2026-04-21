@@ -1,0 +1,20 @@
+[package]
+name = "corpust-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Corpust: command-line interface."
+
+[[bin]]
+name = "corpust"
+path = "src/main.rs"
+
+[dependencies]
+corpust-core.workspace = true
+corpust-io.workspace = true
+corpust-index.workspace = true
+corpust-query.workspace = true
+anyhow.workspace = true
+clap.workspace = true

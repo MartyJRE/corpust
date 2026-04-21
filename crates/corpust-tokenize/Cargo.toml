@@ -1,0 +1,12 @@
+[package]
+name = "corpust-tokenize"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Corpust: tokenizers."
+
+[dependencies]
+corpust-core.workspace = true
+unicode-segmentation.workspace = true

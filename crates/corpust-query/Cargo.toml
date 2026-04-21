@@ -1,0 +1,13 @@
+[package]
+name = "corpust-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Corpust: query layer over the index."
+
+[dependencies]
+corpust-core.workspace = true
+corpust-index.workspace = true
+anyhow.workspace = true

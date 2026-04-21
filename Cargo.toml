@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/corpust-core",
+    "crates/corpust-tokenize",
+    "crates/corpust-io",
+    "crates/corpust-index",
+    "crates/corpust-query",
+    "crates/corpust-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MartyJRE/corpust"
+authors = ["Martin Pražák"]
+
+[workspace.dependencies]
+corpust-core = { path = "crates/corpust-core" }
+corpust-tokenize = { path = "crates/corpust-tokenize" }
+corpust-io = { path = "crates/corpust-io" }
+corpust-index = { path = "crates/corpust-index" }
+corpust-query = { path = "crates/corpust-query" }
+
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+tantivy = "0.22"
+unicode-segmentation = "1.12"
+walkdir = "2.5"
