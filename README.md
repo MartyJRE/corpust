@@ -4,20 +4,26 @@ A Rust corpus-linguistics toolkit — aiming for LancsBoxX-level functionality w
 modern performance. Cross-platform desktop app + library, built for billion-word
 corpora on commodity hardware.
 
-> **Status:** pre-alpha. Phase 0 scaffold — ingests plain text, builds a Tantivy
-> index, runs simple KWIC queries from the CLI. No GUI yet.
+> **Status:** pre-alpha. CLI works end-to-end: ingest `.txt`, index with optional
+> TreeTagger-driven POS + lemma annotation, run KWIC queries across word / lemma /
+> POS layers. No GUI yet — Tauri shell is in the roadmap.
 
-## Phase 0 quick start
+## Quick start
 
 ```sh
-# Build everything
-cargo build --workspace
+# Build everything (release mode for real numbers)
+cargo build --release --workspace
 
-# Index a directory of .txt files
-cargo run -p corpust-cli -- index ./testdata --out ./testdata/index
+# Index a directory of .txt files (word layer only)
+cargo run --release -p corpust-cli -- index ./testdata --out ./testdata/index
 
-# Run a KWIC query
-cargo run -p corpust-cli -- kwic --index ./testdata/index the
+# Or with POS + lemma annotation (TreeTagger, English bundled)
+cargo run --release -p corpust-cli -- index ./testdata --out ./testdata/index --annotate
+
+# Run a KWIC query — word / lemma / pos layers
+cargo run --release -p corpust-cli -- kwic --index ./testdata/index the
+cargo run --release -p corpust-cli -- kwic --index ./testdata/index go  --layer lemma
+cargo run --release -p corpust-cli -- kwic --index ./testdata/index NN  --layer pos
 ```
 
 ## Workspace layout
@@ -25,23 +31,60 @@ cargo run -p corpust-cli -- kwic --index ./testdata/index the
 | Crate              | Role                                                     |
 | ------------------ | -------------------------------------------------------- |
 | `corpust-core`     | Domain types (`Document`, `Token`, ids). Pure, no deps.  |
-| `corpust-tokenize` | Tokenizers. Starts with a Unicode whitespace tokenizer.  |
+| `corpust-tokenize` | Tokenizers. Unicode word segmentation today.             |
 | `corpust-io`       | Ingestion. Reads `.txt` directories into `Document`s.    |
-| `corpust-index`    | The hot crate. Tantivy-backed positional index.          |
+| `corpust-annotate` | `Annotator` trait + TreeTagger subprocess adapter.       |
+| `corpust-index`    | The hot crate. Tantivy-backed multi-layer positional index. |
 | `corpust-query`    | Query layer over the index. KWIC today, CQL later.       |
 | `corpust-cli`      | `corpust` binary — dev tool / power-user entry point.    |
 
+## Bundled assets
+
+`resources/treetagger/` vendors TreeTagger binaries for macOS (arm64 + x86_64),
+Linux (x86_64), Windows (x86_64), plus `utf8-tokenize.perl` and the English
+parameter file. See [`resources/treetagger/README.md`](resources/treetagger/README.md)
+for layout and license details. Perl is required at runtime (preinstalled on
+macOS/Linux; Strawberry Perl on Windows).
+
+## Numbers
+
+From today's measurement on a 544-book / 79.5 M-word Project Gutenberg sample
+(release build, fat LTO, M-series MacBook):
+
+| Operation                           | Wall time | Throughput        |
+| ----------------------------------- | --------- | ----------------- |
+| Index build, word-only              | 17.5 s    | 4.5 M words/sec   |
+| Index build, with annotation        | 3:31      | 376 K words/sec   |
+| KWIC, common term (e.g. `the`)      | ~820 µs   | —                 |
+| KWIC, rare term in big book         | ~3.8 ms   | —                 |
+| KWIC, lemma / pos layer             | ~150 µs   | —                 |
+
+For comparison, LancsBoxX is reported to take 12+ hours on a 9 GB EU-resolutions
+corpus and sometimes fail half-way. Our projected time on the same corpus with
+the current implementation is ~70 minutes, dropping to ~30 minutes once the
+persistent-subprocess work (issue [#3](https://github.com/MartyJRE/corpust/issues/3))
+lands.
+
 ## Roadmap
 
-Phase 0 (now): ingest `.txt` → Tantivy index → single-term KWIC via CLI.
+Shipped:
 
-Later:
+- Multi-crate workspace with clean one-way dependency graph
+- Tantivy-backed positional index with per-token byte offsets for O(context) KWIC
+- TreeTagger subprocess adapter; bundled English model
+- `--annotate` flag drives lemma + POS fields across indexing
+- `--layer word | lemma | pos` flag on KWIC queries
+- Rayon-parallel annotation
 
-1. CQL parser (`[lemma="go"] [pos="IN"]`) + executor.
-2. Tauri desktop shell — corpus manager, KWIC view, frequency list.
-3. Annotation pipeline (POS/lemma via TreeTagger, then pure-Rust taggers).
-4. Statistics — collocations, keyness, dispersion.
-5. XML/TEI ingestion + structural queries.
+Open issues track the next steps:
+
+- [#1](https://github.com/MartyJRE/corpust/issues/1) — store indexes in platform data dir
+- [#3](https://github.com/MartyJRE/corpust/issues/3) — persistent TreeTagger via PTY
+- [#4](https://github.com/MartyJRE/corpust/issues/4) — Rust port of `utf8-tokenize.perl`
+- [#5](https://github.com/MartyJRE/corpust/issues/5) — `corpust annotate install-lang <code>`
+
+Further out: CQL parser + executor, Tauri desktop shell, statistics (collocations,
+keyness, dispersion), XML/TEI ingestion.
 
 ## License
 
