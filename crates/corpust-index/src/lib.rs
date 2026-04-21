@@ -1,16 +1,23 @@
 //! Positional inverted index, backed by Tantivy.
 //!
-//! A custom Tokenizer (Unicode-word-segmentation + lowercasing) drives both
-//! indexing and — implicitly — position numbering, so that display-side
-//! retokenization (also via `unicode-segmentation`) aligns with the token
-//! positions Tantivy stores in its posting lists.
+//! Three aligned text fields per document:
 //!
-//! In addition to the inverted index, each document stores a packed array of
-//! per-token byte offsets (`token_offsets`). At query time KWIC looks up the
-//! byte window for a hit directly and retokenizes only that tiny slice, so
+//! - `body`        — word forms (always populated)
+//! - `body_lemma`  — lemmas (populated only when an [`Annotator`] is used)
+//! - `body_pos`    — POS tags (populated only when an [`Annotator`] is used)
+//!
+//! All three share the same token positions: when an annotator is present,
+//! it drives tokenization across every layer via Tantivy's
+//! `PreTokenizedString`, so a position `p` refers to the same token in
+//! every field. When no annotator is passed to [`CorpusIndex::add_documents`],
+//! we fall back to the registered "corpust" tokenizer for `body` and leave
+//! `body_lemma` / `body_pos` empty for that document.
+//!
+//! A stored `token_offsets` sidecar carries per-token byte offsets so KWIC
 //! context extraction is O(context) regardless of document length.
 
 use anyhow::{Context, Result};
+use corpust_annotate::Annotator;
 use corpust_core::{DocId, Document};
 use std::path::{Path, PathBuf};
 use tantivy::{
@@ -20,7 +27,7 @@ use tantivy::{
         BytesOptions, Field, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions,
         Value,
     },
-    tokenizer::{LowerCaser, TextAnalyzer, Token, TokenStream, Tokenizer},
+    tokenizer::{LowerCaser, PreTokenizedString, TextAnalyzer, Token, TokenStream, Tokenizer},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -43,6 +50,8 @@ struct Fields {
     doc_id: Field,
     path: Field,
     body: Field,
+    body_lemma: Field,
+    body_pos: Field,
     token_offsets: Field,
 }
 
@@ -82,6 +91,8 @@ impl CorpusIndex {
             doc_id: schema.get_field("doc_id")?,
             path: schema.get_field("path")?,
             body: schema.get_field("body")?,
+            body_lemma: schema.get_field("body_lemma")?,
+            body_pos: schema.get_field("body_pos")?,
             token_offsets: schema.get_field("token_offsets")?,
         };
         Self::from_index(index, fields)
@@ -100,32 +111,120 @@ impl CorpusIndex {
     }
 
     /// Index a batch of documents. Commits once at the end.
-    pub fn add_documents(&self, documents: impl IntoIterator<Item = Document>) -> Result<()> {
+    ///
+    /// If `annotator` is `Some`, the annotator's tokenization drives every
+    /// layer (body / body_lemma / body_pos) and its byte offsets populate
+    /// `token_offsets`. If `None`, the registered "corpust" tokenizer handles
+    /// `body`, lemma / pos fields are left empty for each document, and
+    /// `token_offsets` is derived from `unicode_word_indices`.
+    pub fn add_documents(
+        &self,
+        documents: impl IntoIterator<Item = Document>,
+        annotator: Option<&dyn Annotator>,
+    ) -> Result<()> {
         let mut writer = self.index.writer(50_000_000)?;
         for document in documents {
-            let offsets: Vec<u32> = document
-                .text
-                .unicode_word_indices()
-                .map(|(start, _)| start as u32)
-                .collect();
-            let offsets_bytes = offsets_to_bytes(&offsets);
-
-            writer.add_document(doc!(
-                self.fields.doc_id => document.id,
-                self.fields.path => document.path.display().to_string(),
-                self.fields.body => document.text,
-                self.fields.token_offsets => offsets_bytes,
-            ))?;
+            match annotator {
+                Some(a) => self.add_annotated(&mut writer, &document, a)?,
+                None => self.add_unannotated(&mut writer, &document)?,
+            }
         }
         writer.commit()?;
         self.reader.reload()?;
         Ok(())
     }
 
-    /// Run a KWIC (key word in context) query for a single term.
-    ///
-    /// Case-insensitive. `context` is the number of surrounding tokens to
-    /// include on each side.
+    fn add_unannotated(
+        &self,
+        writer: &mut tantivy::IndexWriter,
+        document: &Document,
+    ) -> Result<()> {
+        let offsets: Vec<u32> = document
+            .text
+            .unicode_word_indices()
+            .map(|(start, _)| start as u32)
+            .collect();
+        let offsets_bytes = offsets_to_bytes(&offsets);
+
+        writer.add_document(doc!(
+            self.fields.doc_id => document.id,
+            self.fields.path => document.path.display().to_string(),
+            self.fields.body => document.text.clone(),
+            self.fields.token_offsets => offsets_bytes,
+        ))?;
+        Ok(())
+    }
+
+    fn add_annotated(
+        &self,
+        writer: &mut tantivy::IndexWriter,
+        document: &Document,
+        annotator: &dyn Annotator,
+    ) -> Result<()> {
+        let annotated = annotator.annotate(&document.text)?;
+
+        let mut body_tokens = Vec::with_capacity(annotated.len());
+        let mut lemma_tokens = Vec::with_capacity(annotated.len());
+        let mut pos_tokens = Vec::with_capacity(annotated.len());
+        let mut offsets: Vec<u32> = Vec::with_capacity(annotated.len());
+
+        for t in &annotated {
+            offsets.push(t.byte_start as u32);
+            body_tokens.push(Token {
+                offset_from: t.byte_start,
+                offset_to: t.byte_end,
+                position: t.position as usize,
+                text: t.word.to_lowercase(),
+                position_length: 1,
+            });
+            lemma_tokens.push(Token {
+                offset_from: t.byte_start,
+                offset_to: t.byte_end,
+                position: t.position as usize,
+                text: t
+                    .lemma
+                    .as_deref()
+                    .map(str::to_lowercase)
+                    .unwrap_or_default(),
+                position_length: 1,
+            });
+            pos_tokens.push(Token {
+                offset_from: t.byte_start,
+                offset_to: t.byte_end,
+                position: t.position as usize,
+                // POS tags keep original case — conventionally uppercase.
+                text: t.pos.as_deref().unwrap_or("").to_string(),
+                position_length: 1,
+            });
+        }
+
+        let body_pre = PreTokenizedString {
+            text: document.text.clone(),
+            tokens: body_tokens,
+        };
+        let lemma_pre = PreTokenizedString {
+            text: String::new(),
+            tokens: lemma_tokens,
+        };
+        let pos_pre = PreTokenizedString {
+            text: String::new(),
+            tokens: pos_tokens,
+        };
+        let offsets_bytes = offsets_to_bytes(&offsets);
+
+        writer.add_document(doc!(
+            self.fields.doc_id => document.id,
+            self.fields.path => document.path.display().to_string(),
+            self.fields.body => body_pre,
+            self.fields.body_lemma => lemma_pre,
+            self.fields.body_pos => pos_pre,
+            self.fields.token_offsets => offsets_bytes,
+        ))?;
+        Ok(())
+    }
+
+    /// Run a KWIC (key word in context) query for a single term on the
+    /// `body` (word form) layer. Case-insensitive.
     pub fn kwic(&self, term: &str, context: usize, limit: usize) -> Result<Vec<KwicHit>> {
         let searcher = self.reader.searcher();
         let lowered = term.to_lowercase();
@@ -297,13 +396,20 @@ fn build_schema() -> (Schema, Fields) {
     let doc_id = builder.add_u64_field("doc_id", STORED);
     let path = builder.add_text_field("path", STORED);
 
-    let body_indexing = TextFieldIndexing::default()
+    let indexing = TextFieldIndexing::default()
         .set_tokenizer(TOKENIZER_NAME)
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+
     let body_options = TextOptions::default()
-        .set_indexing_options(body_indexing)
+        .set_indexing_options(indexing.clone())
         .set_stored();
     let body = builder.add_text_field("body", body_options);
+
+    let lemma_options = TextOptions::default().set_indexing_options(indexing.clone());
+    let body_lemma = builder.add_text_field("body_lemma", lemma_options);
+
+    let pos_options = TextOptions::default().set_indexing_options(indexing);
+    let body_pos = builder.add_text_field("body_pos", pos_options);
 
     let token_offsets =
         builder.add_bytes_field("token_offsets", BytesOptions::default().set_stored());
@@ -314,6 +420,8 @@ fn build_schema() -> (Schema, Fields) {
             doc_id,
             path,
             body,
+            body_lemma,
+            body_pos,
             token_offsets,
         },
     )
@@ -322,16 +430,20 @@ fn build_schema() -> (Schema, Fields) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use corpust_annotate::WordOnlyAnnotator;
 
     #[test]
     fn round_trip_kwic() {
-        let tmp = std::env::temp_dir().join(format!("corpust-idx-{}", rand_suffix()));
+        let tmp = tempdir();
         let idx = CorpusIndex::create(&tmp).unwrap();
-        idx.add_documents([Document {
-            id: 0,
-            path: PathBuf::from("a.txt"),
-            text: "the quick brown fox jumps over the lazy dog".to_string(),
-        }])
+        idx.add_documents(
+            [Document {
+                id: 0,
+                path: PathBuf::from("a.txt"),
+                text: "the quick brown fox jumps over the lazy dog".to_string(),
+            }],
+            None,
+        )
         .unwrap();
 
         let hits = idx.kwic("the", 2, 10).unwrap();
@@ -342,13 +454,16 @@ mod tests {
 
     #[test]
     fn kwic_preserves_case_on_display() {
-        let tmp = std::env::temp_dir().join(format!("corpust-idx-{}", rand_suffix()));
+        let tmp = tempdir();
         let idx = CorpusIndex::create(&tmp).unwrap();
-        idx.add_documents([Document {
-            id: 0,
-            path: PathBuf::from("a.txt"),
-            text: "The quick brown fox jumps over THE lazy dog".to_string(),
-        }])
+        idx.add_documents(
+            [Document {
+                id: 0,
+                path: PathBuf::from("a.txt"),
+                text: "The quick brown fox jumps over THE lazy dog".to_string(),
+            }],
+            None,
+        )
         .unwrap();
 
         let hits = idx.kwic("the", 1, 10).unwrap();
@@ -360,14 +475,16 @@ mod tests {
 
     #[test]
     fn kwic_window_bounds_are_exact() {
-        // Ten tokens, request context=2 around the middle hit.
-        let tmp = std::env::temp_dir().join(format!("corpust-idx-{}", rand_suffix()));
+        let tmp = tempdir();
         let idx = CorpusIndex::create(&tmp).unwrap();
-        idx.add_documents([Document {
-            id: 0,
-            path: PathBuf::from("a.txt"),
-            text: "alpha beta gamma delta target epsilon zeta eta theta iota".to_string(),
-        }])
+        idx.add_documents(
+            [Document {
+                id: 0,
+                path: PathBuf::from("a.txt"),
+                text: "alpha beta gamma delta target epsilon zeta eta theta iota".to_string(),
+            }],
+            None,
+        )
         .unwrap();
 
         let hits = idx.kwic("target", 2, 10).unwrap();
@@ -381,13 +498,16 @@ mod tests {
 
     #[test]
     fn kwic_window_clamps_at_doc_edges() {
-        let tmp = std::env::temp_dir().join(format!("corpust-idx-{}", rand_suffix()));
+        let tmp = tempdir();
         let idx = CorpusIndex::create(&tmp).unwrap();
-        idx.add_documents([Document {
-            id: 0,
-            path: PathBuf::from("a.txt"),
-            text: "target one two three".to_string(),
-        }])
+        idx.add_documents(
+            [Document {
+                id: 0,
+                path: PathBuf::from("a.txt"),
+                text: "target one two three".to_string(),
+            }],
+            None,
+        )
         .unwrap();
 
         let hits = idx.kwic("target", 10, 10).unwrap();
@@ -395,6 +515,34 @@ mod tests {
         assert_eq!(hits[0].left, "");
         assert_eq!(hits[0].right, "one two three");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn annotated_path_indexes_successfully() {
+        // WordOnlyAnnotator doesn't produce lemma/pos, but exercising it
+        // proves the PreTokenizedString plumbing is wired up correctly.
+        let tmp = tempdir();
+        let idx = CorpusIndex::create(&tmp).unwrap();
+        idx.add_documents(
+            [Document {
+                id: 0,
+                path: PathBuf::from("a.txt"),
+                text: "the quick brown fox".to_string(),
+            }],
+            Some(&WordOnlyAnnotator),
+        )
+        .unwrap();
+
+        let hits = idx.kwic("quick", 1, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].hit, "quick");
+        assert_eq!(hits[0].left, "the");
+        assert_eq!(hits[0].right, "brown");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn tempdir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("corpust-idx-{}", rand_suffix()))
     }
 
     fn rand_suffix() -> u64 {

@@ -257,6 +257,7 @@ name = "corpust-index"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "corpust-annotate",
  "corpust-core",
  "corpust-tokenize",
  "tantivy",

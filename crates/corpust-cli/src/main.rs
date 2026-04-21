@@ -68,7 +68,7 @@ fn run_index(input: PathBuf, out: PathBuf) -> Result<()> {
     let t1 = Instant::now();
     let index = CorpusIndex::create(&out)
         .with_context(|| format!("creating index at {}", out.display()))?;
-    index.add_documents(docs)?;
+    index.add_documents(docs, None)?;
     let index_elapsed = t1.elapsed();
 
     println!(
