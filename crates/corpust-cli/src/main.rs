@@ -6,10 +6,13 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use corpust_annotate::{Annotator, treetagger::TreeTagger};
 use corpust_index::{CorpusIndex, DEFAULT_CONTEXT, DEFAULT_LIMIT, QueryLayer};
 use corpust_query::{KwicRequest, kwic};
 use std::path::PathBuf;
 use std::time::Instant;
+
+const DEFAULT_TAGGER_BUNDLE: &str = "./resources/treetagger";
 
 #[derive(Parser)]
 #[command(name = "corpust", version, about = "Corpus-linguistics CLI")]
@@ -27,6 +30,17 @@ enum Command {
         /// Where to write the index.
         #[arg(long)]
         out: PathBuf,
+        /// Enable POS + lemma annotation via TreeTagger during indexing.
+        /// Substantially slower — reloads the language model per document.
+        #[arg(long)]
+        annotate: bool,
+        /// Path to the TreeTagger bundle. Defaults to `./resources/treetagger`
+        /// relative to the current working directory (repo layout).
+        #[arg(long, default_value = DEFAULT_TAGGER_BUNDLE)]
+        tagger_bundle: PathBuf,
+        /// TreeTagger language name (as used in parameter-file names).
+        #[arg(long, default_value = "english")]
+        language: String,
     },
     /// Run a single-term KWIC concordance over an existing index.
     Kwic {
@@ -70,7 +84,13 @@ impl From<LayerArg> for QueryLayer {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Index { input, out } => run_index(input, out),
+        Command::Index {
+            input,
+            out,
+            annotate,
+            tagger_bundle,
+            language,
+        } => run_index(input, out, annotate, tagger_bundle, language),
         Command::Kwic {
             index,
             term,
@@ -81,7 +101,13 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_index(input: PathBuf, out: PathBuf) -> Result<()> {
+fn run_index(
+    input: PathBuf,
+    out: PathBuf,
+    annotate: bool,
+    tagger_bundle: PathBuf,
+    language: String,
+) -> Result<()> {
     let t0 = Instant::now();
     let docs = corpust_io::read_text_dir(&input)
         .with_context(|| format!("reading corpus at {}", input.display()))?;
@@ -89,10 +115,26 @@ fn run_index(input: PathBuf, out: PathBuf) -> Result<()> {
     let doc_count = docs.len();
     let byte_count: usize = docs.iter().map(|d| d.text.len()).sum();
 
+    // Leak the string so we can keep the Annotator's `'static` constraint
+    // satisfied — the value lives until process exit anyway.
+    let lang_static: &'static str = Box::leak(language.into_boxed_str());
+    let tagger = if annotate {
+        let tt = TreeTagger::from_bundle(&tagger_bundle, lang_static).with_context(|| {
+            format!(
+                "locating TreeTagger bundle at {}",
+                tagger_bundle.display()
+            )
+        })?;
+        println!("annotation enabled: {}", tt.id());
+        Some(tt)
+    } else {
+        None
+    };
+
     let t1 = Instant::now();
     let index = CorpusIndex::create(&out)
         .with_context(|| format!("creating index at {}", out.display()))?;
-    index.add_documents(docs, None)?;
+    index.add_documents(docs, tagger.as_ref().map(|t| t as &dyn corpust_annotate::Annotator))?;
     let index_elapsed = t1.elapsed();
 
     println!(

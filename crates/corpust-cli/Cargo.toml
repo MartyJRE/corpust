@@ -16,5 +16,6 @@ corpust-core.workspace = true
 corpust-io.workspace = true
 corpust-index.workspace = true
 corpust-query.workspace = true
+corpust-annotate.workspace = true
 anyhow.workspace = true
 clap.workspace = true
