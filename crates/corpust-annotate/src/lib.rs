@@ -8,6 +8,8 @@
 //! fallback. The TreeTagger adapter lives in its own module once
 //! added — it depends on an external subprocess and opt-in resources.
 
+pub mod treetagger;
+
 use anyhow::Result;
 use corpust_core::Position;
 use std::borrow::Cow;
