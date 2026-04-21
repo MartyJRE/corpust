@@ -1,19 +1,20 @@
 //! Positional inverted index, backed by Tantivy.
 //!
-//! Phase 0 stores documents with a single `body` text field indexed with
-//! positions, plus stored copies of the doc id / path / body for retrieval.
-//! KWIC extraction re-tokenizes the stored body — cheap at small scale, will
-//! be replaced with direct positional reads once we outgrow it.
+//! A custom Tokenizer (Unicode-word-segmentation + lowercasing) drives both
+//! indexing and — implicitly — position numbering, so that display-side
+//! retokenization (also via `unicode-segmentation`) aligns with the token
+//! positions Tantivy stores in its posting lists. That alignment lets
+//! [`CorpusIndex::kwic`] skip the term directly to its hits via positional
+//! reads rather than scanning every token in every matched document.
 
 use anyhow::{Context, Result};
 use corpust_core::{DocId, Document};
 use std::path::{Path, PathBuf};
 use tantivy::{
-    Index, IndexReader, ReloadPolicy, TantivyDocument,
-    collector::TopDocs,
-    doc,
-    query::QueryParser,
+    DocAddress, DocSet, Index, IndexReader, Postings, ReloadPolicy, TERMINATED, TantivyDocument,
+    Term, doc,
     schema::{Field, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value},
+    tokenizer::{LowerCaser, TextAnalyzer, Token, TokenStream, Tokenizer},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -22,6 +23,8 @@ pub const DEFAULT_CONTEXT: usize = 7;
 
 /// Default cap on returned KWIC hits.
 pub const DEFAULT_LIMIT: usize = 50;
+
+const TOKENIZER_NAME: &str = "corpust";
 
 pub struct CorpusIndex {
     index: Index,
@@ -59,12 +62,14 @@ impl CorpusIndex {
 
         let (schema, fields) = build_schema();
         let index = Index::create_in_dir(path, schema)?;
+        register_tokenizer(&index);
         Self::from_index(index, fields)
     }
 
     /// Open an existing index on disk.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let index = Index::open_in_dir(path)?;
+        register_tokenizer(&index);
         let schema = index.schema();
         let fields = Fields {
             doc_id: schema.get_field("doc_id")?,
@@ -103,56 +108,140 @@ impl CorpusIndex {
 
     /// Run a KWIC (key word in context) query for a single term.
     ///
-    /// `context` is the number of surrounding tokens to include on each side.
+    /// Case-insensitive. `context` is the number of surrounding tokens to
+    /// include on each side.
     pub fn kwic(&self, term: &str, context: usize, limit: usize) -> Result<Vec<KwicHit>> {
         let searcher = self.reader.searcher();
-        let parser = QueryParser::for_index(&self.index, vec![self.fields.body]);
-        let query = parser.parse_query(term)?;
-        // Pull a generous set of candidate docs; we still cap total hits below.
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit.max(1) * 4))?;
+        let lowered = term.to_lowercase();
+        let term_obj = Term::from_field_text(self.fields.body, &lowered);
 
-        let needle = term.to_lowercase();
         let mut hits = Vec::with_capacity(limit);
+        let mut positions_buf: Vec<u32> = Vec::new();
 
-        for (_score, addr) in top_docs {
+        'segments: for (seg_ord, seg_reader) in searcher.segment_readers().iter().enumerate() {
             if hits.len() >= limit {
                 break;
             }
-            let retrieved: TantivyDocument = searcher.doc(addr)?;
-            let body = retrieved
-                .get_first(self.fields.body)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let path = retrieved
-                .get_first(self.fields.path)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let doc_id = retrieved
-                .get_first(self.fields.doc_id)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let inv_idx = seg_reader.inverted_index(self.fields.body)?;
+            let Some(mut postings) = inv_idx
+                .read_postings(&term_obj, IndexRecordOption::WithFreqsAndPositions)?
+            else {
+                continue;
+            };
 
-            let tokens: Vec<&str> = body.unicode_words().collect();
-            for (i, word) in tokens.iter().enumerate() {
-                if word.to_lowercase() == needle {
+            loop {
+                let doc = postings.doc();
+                if doc == TERMINATED {
+                    continue 'segments;
+                }
+                if hits.len() >= limit {
+                    break 'segments;
+                }
+
+                let doc_addr = DocAddress::new(seg_ord as u32, doc);
+                let retrieved: TantivyDocument = searcher.doc(doc_addr)?;
+                let body = retrieved
+                    .get_first(self.fields.body)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let path = retrieved
+                    .get_first(self.fields.path)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let doc_id = retrieved
+                    .get_first(self.fields.doc_id)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+
+                positions_buf.clear();
+                postings.positions(&mut positions_buf);
+
+                // Display-side tokenization: must align with the indexer.
+                let tokens: Vec<&str> = body.unicode_words().collect();
+
+                for &pos in &positions_buf {
+                    if hits.len() >= limit {
+                        break;
+                    }
+                    let i = pos as usize;
+                    if i >= tokens.len() {
+                        continue;
+                    }
                     let left_start = i.saturating_sub(context);
                     let right_end = (i + 1 + context).min(tokens.len());
                     hits.push(KwicHit {
                         doc_id,
                         path: PathBuf::from(path),
                         left: tokens[left_start..i].join(" "),
-                        hit: word.to_string(),
+                        hit: tokens[i].to_string(),
                         right: tokens[i + 1..right_end].join(" "),
                     });
-                    if hits.len() >= limit {
-                        break;
-                    }
                 }
+
+                postings.advance();
             }
         }
 
         Ok(hits)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tokenizer
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+struct UnicodeWordTokenizer;
+
+struct UnicodeWordStream<'a> {
+    iter: std::vec::IntoIter<(usize, &'a str)>,
+    token: Token,
+}
+
+impl Tokenizer for UnicodeWordTokenizer {
+    type TokenStream<'a> = UnicodeWordStream<'a>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        let words: Vec<(usize, &str)> = text.unicode_word_indices().collect();
+        UnicodeWordStream {
+            iter: words.into_iter(),
+            token: Token {
+                position: usize::MAX,
+                ..Token::default()
+            },
+        }
+    }
+}
+
+impl<'a> TokenStream for UnicodeWordStream<'a> {
+    fn advance(&mut self) -> bool {
+        match self.iter.next() {
+            Some((byte_start, word)) => {
+                self.token.position = self.token.position.wrapping_add(1);
+                self.token.offset_from = byte_start;
+                self.token.offset_to = byte_start + word.len();
+                self.token.text.clear();
+                self.token.text.push_str(word);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn token(&self) -> &Token {
+        &self.token
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        &mut self.token
+    }
+}
+
+fn register_tokenizer(index: &Index) {
+    let analyzer = TextAnalyzer::builder(UnicodeWordTokenizer)
+        .filter(LowerCaser)
+        .build();
+    index.tokenizers().register(TOKENIZER_NAME, analyzer);
 }
 
 fn build_schema() -> (Schema, Fields) {
@@ -161,7 +250,7 @@ fn build_schema() -> (Schema, Fields) {
     let path = builder.add_text_field("path", STORED);
 
     let body_indexing = TextFieldIndexing::default()
-        .set_tokenizer("default")
+        .set_tokenizer(TOKENIZER_NAME)
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
     let body_options = TextOptions::default()
         .set_indexing_options(body_indexing)
@@ -195,7 +284,25 @@ mod tests {
 
         let hits = idx.kwic("the", 2, 10).unwrap();
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].hit.to_lowercase(), "the");
+        assert_eq!(hits[0].hit, "the");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn kwic_preserves_case_on_display() {
+        let tmp = std::env::temp_dir().join(format!("corpust-idx-{}", rand_suffix()));
+        let idx = CorpusIndex::create(&tmp).unwrap();
+        idx.add_documents([Document {
+            id: 0,
+            path: PathBuf::from("a.txt"),
+            text: "The quick brown fox jumps over THE lazy dog".to_string(),
+        }])
+        .unwrap();
+
+        let hits = idx.kwic("the", 1, 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|h| h.hit == "The"));
+        assert!(hits.iter().any(|h| h.hit == "THE"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
