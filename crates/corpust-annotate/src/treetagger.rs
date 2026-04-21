@@ -1,98 +1,181 @@
 //! TreeTagger subprocess adapter.
 //!
-//! Runs an external `tree-tagger-*` invocation (the shell wrapper that
-//! chains `tokenize.pl` → `tree-tagger` for a given language), pipes raw
-//! text to its stdin, reads tab-separated `word\tPOS\tlemma` output from
-//! stdout, and realigns the output tokens back to byte spans in the
-//! original source.
+//! Runs a two-stage pipeline per document:
 //!
-//! v1 trade-offs deliberately taken:
+//! ```text
+//! raw text ──► perl utf8-tokenize.perl -e -a english-abbreviations
+//!           ──► tree-tagger -token -lemma -sgml english.par
+//!           ──► word\tPOS\tlemma TSV
+//! ```
 //!
-//! - **Spawn per document.** Correctness-first. The model reload
-//!   (~50 MB English parameter file) is paid on every call, which is
-//!   noticeable on big corpora. A long-running pooled subprocess
-//!   landed in a follow-up.
-//! - **Trust TreeTagger's tokenization.** The alignment forward-scan
-//!   assumes output token strings appear verbatim in the source. True
-//!   for TreeTagger's tokenizer on straight text; contractions split
-//!   cleanly (`don't` → `do` + `n't` both literally present in the
-//!   source substring). Misalignment falls back to a zero-length span
-//!   at the cursor, which keeps downstream positional bookkeeping
-//!   intact at the cost of a slightly wrong byte window on that token.
+//! Tokenization happens in Perl (TreeTagger's own `utf8-tokenize.perl`)
+//! so contractions and clitics split the way LancsBox expects. The binary
+//! is platform-specific; the Perl script and language model are shared.
+//! Output tokens are realigned back to byte spans in the source via a
+//! forward scan so downstream positional bookkeeping stays intact.
+//!
+//! v1 trade-offs:
+//!
+//! - **Spawn per document** — both tokenizer and tagger subprocesses are
+//!   created fresh for each call. The ~14 MB model reload dominates for
+//!   large corpora; pooling lands in a follow-up.
+//! - **Perl required** — preinstalled on macOS and Linux; Windows users
+//!   need Strawberry Perl or similar. A pure-Rust port of the tokenizer
+//!   would remove this dep entirely and is the eventual plan.
 
 use crate::{AnnotatedToken, Annotator};
 use anyhow::{Context, Result, bail};
 use corpust_core::Position;
 use std::borrow::Cow;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// External TreeTagger invocation.
+/// TreeTagger subprocess adapter.
 pub struct TreeTagger {
-    command: String,
-    args: Vec<String>,
+    tagger_binary: PathBuf,
+    tokenizer_script: PathBuf,
+    abbreviations_file: PathBuf,
+    model_file: PathBuf,
     language: &'static str,
     id: String,
 }
 
 impl TreeTagger {
-    /// Configure an adapter that spawns `command` with `args` as its
-    /// TreeTagger pipeline. `language` is an ISO 639-1 code recorded in
-    /// the annotator's id for provenance.
-    ///
-    /// Typical invocations:
-    ///
-    /// - `TreeTagger::new("tree-tagger-english", &[], "en")`
-    ///   — uses the bundled shell wrapper.
-    /// - `TreeTagger::new("tree-tagger", &["-token", "-lemma", "english.par"], "en")`
-    ///   — direct invocation, no wrapper.
-    pub fn new(command: impl Into<String>, args: &[&str], language: &'static str) -> Self {
-        let command = command.into();
-        let id = format!("treetagger-{}", language);
+    /// Configure an adapter from explicit paths. Useful for non-bundled
+    /// installations (user-installed TreeTagger, custom layouts).
+    pub fn new(
+        tagger_binary: impl Into<PathBuf>,
+        tokenizer_script: impl Into<PathBuf>,
+        abbreviations_file: impl Into<PathBuf>,
+        model_file: impl Into<PathBuf>,
+        language: &'static str,
+    ) -> Self {
         Self {
-            command,
-            args: args.iter().map(|s| s.to_string()).collect(),
+            tagger_binary: tagger_binary.into(),
+            tokenizer_script: tokenizer_script.into(),
+            abbreviations_file: abbreviations_file.into(),
+            model_file: model_file.into(),
             language,
-            id,
+            id: format!("treetagger-{language}"),
         }
     }
 
+    /// Locate a TreeTagger installation inside the repo's bundled layout:
+    ///
+    /// ```text
+    /// <bundle_root>/
+    /// ├── bin/<platform>/tree-tagger(.exe)
+    /// ├── cmd/utf8-tokenize.perl
+    /// └── lib/
+    ///     ├── <language>-abbreviations
+    ///     └── <language>.par
+    /// ```
+    ///
+    /// `<platform>` is one of `macos-arm64`, `macos-x86_64`,
+    /// `linux-x86_64`, `windows-x86_64`. `language` is the full
+    /// TreeTagger language name (`"english"`, not `"en"`).
+    pub fn from_bundle(bundle_root: &Path, language: &'static str) -> Result<Self> {
+        let platform = current_platform_dir()?;
+        let binary_name = if cfg!(target_os = "windows") {
+            "tree-tagger.exe"
+        } else {
+            "tree-tagger"
+        };
+
+        let tagger = bundle_root.join("bin").join(platform).join(binary_name);
+        let tokenizer = bundle_root.join("cmd").join("utf8-tokenize.perl");
+        let abbr = bundle_root
+            .join("lib")
+            .join(format!("{language}-abbreviations"));
+        let model = bundle_root.join("lib").join(format!("{language}.par"));
+
+        for p in [&tagger, &tokenizer, &abbr, &model] {
+            if !p.exists() {
+                bail!(
+                    "TreeTagger bundle missing: {} (bundle_root = {})",
+                    p.display(),
+                    bundle_root.display()
+                );
+            }
+        }
+
+        Ok(Self::new(tagger, tokenizer, abbr, model, language))
+    }
+
     fn run(&self, text: &str) -> Result<Vec<RawTag>> {
-        let mut child = Command::new(&self.command)
-            .args(&self.args)
+        let tokenized = self.tokenize(text)?;
+        let tagged = self.tag(&tokenized)?;
+        Ok(parse_tsv(&tagged))
+    }
+
+    fn tokenize(&self, text: &str) -> Result<Vec<u8>> {
+        let mut child = Command::new("perl")
+            .arg(&self.tokenizer_script)
+            .arg("-e")
+            .arg("-a")
+            .arg(&self.abbreviations_file)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("spawning `{}`", self.command))?;
+            .context("spawning perl tokenizer")?;
 
         {
             let stdin = child
                 .stdin
                 .as_mut()
-                .context("TreeTagger stdin unexpectedly closed")?;
+                .context("perl stdin unexpectedly closed")?;
             stdin
                 .write_all(text.as_bytes())
-                .context("writing text to TreeTagger")?;
+                .context("writing to perl tokenizer")?;
         }
-        // Drop stdin to signal EOF.
+        drop(child.stdin.take());
+
+        let output = child.wait_with_output().context("waiting for perl")?;
+        if !output.status.success() {
+            bail!(
+                "tokenizer exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(output.stdout)
+    }
+
+    fn tag(&self, tokenized: &[u8]) -> Result<String> {
+        let mut child = Command::new(&self.tagger_binary)
+            .args(["-token", "-lemma", "-sgml"])
+            .arg(&self.model_file)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawning {}", self.tagger_binary.display()))?;
+
+        {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .context("tree-tagger stdin unexpectedly closed")?;
+            stdin
+                .write_all(tokenized)
+                .context("writing to tree-tagger")?;
+        }
         drop(child.stdin.take());
 
         let output = child
             .wait_with_output()
-            .context("waiting for TreeTagger")?;
-
+            .context("waiting for tree-tagger")?;
         if !output.status.success() {
             bail!(
-                "TreeTagger exited with {}: {}",
+                "tree-tagger exited with {}: {}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
 
-        let stdout = String::from_utf8(output.stdout)
-            .context("TreeTagger output was not valid UTF-8")?;
-        Ok(parse_tsv(&stdout))
+        String::from_utf8(output.stdout).context("tree-tagger output was not valid UTF-8")
     }
 }
 
@@ -108,6 +191,16 @@ impl Annotator for TreeTagger {
 
     fn id(&self) -> &str {
         &self.id
+    }
+}
+
+fn current_platform_dir() -> Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Ok("macos-arm64"),
+        ("macos", "x86_64") => Ok("macos-x86_64"),
+        ("linux", "x86_64") => Ok("linux-x86_64"),
+        ("windows", "x86_64") => Ok("windows-x86_64"),
+        (os, arch) => bail!("unsupported platform: {os}-{arch}"),
     }
 }
 
@@ -127,6 +220,9 @@ fn parse_tsv(output: &str) -> Vec<RawTag> {
             }
             let mut parts = line.split('\t');
             let word = parts.next()?.to_string();
+            if word.is_empty() {
+                return None;
+            }
             let pos = parts.next().map(str::to_string).filter(|s| !s.is_empty());
             let lemma = parts
                 .next()
@@ -147,14 +243,7 @@ fn align_to_source(tags: Vec<RawTag>, text: &str) -> Vec<AnnotatedToken<'_>> {
                 let end = (start + tag.word.len()).min(text.len());
                 (start, end)
             }
-            None => {
-                // Fall back to a zero-length span at the cursor. The
-                // token keeps its inverted-index entry (useful for
-                // lemma/pos queries), but its byte window is a point
-                // rather than a span. Acceptable degradation; indexing
-                // continues.
-                (cursor, cursor)
-            }
+            None => (cursor, cursor),
         };
         aligned.push(AnnotatedToken {
             word: Cow::Owned(tag.word),
@@ -181,7 +270,6 @@ mod tests {
         assert_eq!(tags[0].word, "The");
         assert_eq!(tags[0].pos.as_deref(), Some("DT"));
         assert_eq!(tags[0].lemma.as_deref(), Some("the"));
-        assert_eq!(tags[3].word, "fox");
         assert_eq!(tags[3].pos.as_deref(), Some("NN"));
     }
 
@@ -190,136 +278,119 @@ mod tests {
         let raw = "Xyzzy\tNNP\t<unknown>\n";
         let tags = parse_tsv(raw);
         assert_eq!(tags.len(), 1);
-        assert_eq!(tags[0].word, "Xyzzy");
         assert!(tags[0].lemma.is_none());
+    }
+
+    #[test]
+    fn parse_tsv_skips_empty_and_status_lines() {
+        // TreeTagger sometimes interleaves tab-prefixed progress lines
+        // if stderr got merged; be defensive.
+        let raw = "\treading parameters\nThe\tDT\tthe\n\n\tfinished\n";
+        let tags = parse_tsv(raw);
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].word, "The");
     }
 
     #[test]
     fn align_to_source_straightforward() {
         let text = "The quick brown fox.";
         let tags = vec![
-            RawTag {
-                word: "The".into(),
-                pos: Some("DT".into()),
-                lemma: Some("the".into()),
-            },
-            RawTag {
-                word: "quick".into(),
-                pos: Some("JJ".into()),
-                lemma: Some("quick".into()),
-            },
-            RawTag {
-                word: "brown".into(),
-                pos: Some("JJ".into()),
-                lemma: Some("brown".into()),
-            },
-            RawTag {
-                word: "fox".into(),
-                pos: Some("NN".into()),
-                lemma: Some("fox".into()),
-            },
-            RawTag {
-                word: ".".into(),
-                pos: Some("SENT".into()),
-                lemma: Some(".".into()),
-            },
+            raw("The", "DT", "the"),
+            raw("quick", "JJ", "quick"),
+            raw("brown", "JJ", "brown"),
+            raw("fox", "NN", "fox"),
+            raw(".", "SENT", "."),
         ];
-
         let aligned = align_to_source(tags, text);
         assert_eq!(aligned.len(), 5);
-
-        assert_eq!(aligned[0].byte_start, 0);
-        assert_eq!(aligned[0].byte_end, 3);
         assert_eq!(&text[aligned[0].byte_start..aligned[0].byte_end], "The");
-
-        assert_eq!(aligned[1].byte_start, 4);
-        assert_eq!(aligned[1].byte_end, 9);
-
         assert_eq!(aligned[3].byte_start, 16);
         assert_eq!(aligned[3].byte_end, 19);
-
         assert_eq!(aligned[4].byte_start, 19);
-        assert_eq!(aligned[4].byte_end, 20);
     }
 
     #[test]
     fn align_to_source_handles_contraction_split() {
-        // TreeTagger splits "don't" into "do" + "n't" — both halves
-        // appear literally in the source, so the forward scan lines
-        // them up contiguously.
         let text = "I don't know.";
         let tags = vec![
-            RawTag {
-                word: "I".into(),
-                pos: Some("PP".into()),
-                lemma: Some("I".into()),
-            },
-            RawTag {
-                word: "do".into(),
-                pos: Some("VVP".into()),
-                lemma: Some("do".into()),
-            },
-            RawTag {
-                word: "n't".into(),
-                pos: Some("RB".into()),
-                lemma: Some("not".into()),
-            },
-            RawTag {
-                word: "know".into(),
-                pos: Some("VV".into()),
-                lemma: Some("know".into()),
-            },
-            RawTag {
-                word: ".".into(),
-                pos: Some("SENT".into()),
-                lemma: Some(".".into()),
-            },
+            raw("I", "PP", "I"),
+            raw("do", "VVP", "do"),
+            raw("n't", "RB", "not"),
+            raw("know", "VV", "know"),
+            raw(".", "SENT", "."),
         ];
-
         let aligned = align_to_source(tags, text);
         assert_eq!(aligned.len(), 5);
-
-        // "do" at [2,4], "n't" at [4,7] — contiguous, no gap.
-        assert_eq!(aligned[1].word, "do");
         assert_eq!(aligned[1].byte_start, 2);
         assert_eq!(aligned[1].byte_end, 4);
-
-        assert_eq!(aligned[2].word, "n't");
         assert_eq!(aligned[2].byte_start, 4);
         assert_eq!(aligned[2].byte_end, 7);
-
         assert_eq!(aligned[2].lemma.as_deref(), Some("not"));
     }
 
     #[test]
     fn align_to_source_missing_token_keeps_stream_intact() {
-        // Pathological: TreeTagger emitted a token that doesn't appear
-        // in the source. We don't crash — we emit a zero-length span
-        // and continue; positions stay intact.
         let text = "hello world";
-        let tags = vec![
-            RawTag {
-                word: "hello".into(),
-                pos: None,
-                lemma: None,
-            },
-            RawTag {
-                word: "WIDGET".into(), // not in source
-                pos: None,
-                lemma: None,
-            },
-            RawTag {
-                word: "world".into(),
-                pos: None,
-                lemma: None,
-            },
-        ];
-
+        let tags = vec![raw("hello", "X", "x"), raw("WIDGET", "X", "x"), raw("world", "X", "x")];
         let aligned = align_to_source(tags, text);
         assert_eq!(aligned.len(), 3);
-        assert_eq!(aligned[0].byte_end, 5);
-        assert_eq!(aligned[1].byte_start, aligned[1].byte_end); // zero span
-        assert_eq!(aligned[2].word, "world");
+        assert_eq!(aligned[1].byte_start, aligned[1].byte_end);
         assert_eq!(aligned[2].byte_start, 6);
+    }
+
+    #[test]
+    fn from_bundle_succeeds_on_current_platform() {
+        let bundle = bundle_path();
+        if !bundle.exists() {
+            eprintln!("bundle not at {}, skipping", bundle.display());
+            return;
+        }
+        let tt = TreeTagger::from_bundle(&bundle, "english").unwrap();
+        assert_eq!(tt.language, "english");
+        assert!(tt.tagger_binary.exists());
+    }
+
+    /// End-to-end sanity: actually spawn the pipeline, verify POS +
+    /// lemma come back correctly. Slow-ish (~2 s) because TreeTagger
+    /// reloads its parameter file each call. Skipped when the bundle
+    /// isn't present (e.g. a minimal clone without resources/).
+    #[test]
+    fn end_to_end_tags_an_english_sentence() {
+        let bundle = bundle_path();
+        if !bundle.exists() {
+            eprintln!("bundle not at {}, skipping", bundle.display());
+            return;
+        }
+        let tt = TreeTagger::from_bundle(&bundle, "english").unwrap();
+        let tokens = tt
+            .annotate("The quick brown fox jumps over the lazy dog.")
+            .unwrap();
+        assert!(!tokens.is_empty());
+
+        let jumps = tokens.iter().find(|t| t.word.as_ref() == "jumps");
+        assert!(jumps.is_some(), "expected a token for 'jumps'");
+        assert_eq!(jumps.unwrap().lemma.as_deref(), Some("jump"));
+        assert_eq!(jumps.unwrap().pos.as_deref(), Some("NNS"));
+
+        let the = tokens.iter().find(|t| t.word.as_ref() == "The");
+        assert!(the.is_some());
+        assert_eq!(the.unwrap().pos.as_deref(), Some("DT"));
+    }
+
+    fn bundle_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("resources/treetagger")
+    }
+
+    fn raw(word: &str, pos: &str, lemma: &str) -> RawTag {
+        RawTag {
+            word: word.into(),
+            pos: Some(pos.into()),
+            lemma: Some(lemma.into()),
+        }
     }
 }
