@@ -59,11 +59,13 @@ From today's measurement on a 544-book / 79.5 M-word Project Gutenberg sample
 | KWIC, rare term in big book         | ~3.8 ms   | —                 |
 | KWIC, lemma / pos layer             | ~150 µs   | —                 |
 
-For comparison, LancsBoxX is reported to take 12+ hours on a 9 GB EU-resolutions
-corpus and sometimes fail half-way. Our projected time on the same corpus with
-the current implementation is ~70 minutes, dropping to ~30 minutes once the
-persistent-subprocess work (issue [#3](https://github.com/MartyJRE/corpust/issues/3))
-lands.
+For comparison, LancsBoxX on a 9 GB EU-resolutions corpus took 12+ hours to
+reach ~50% and then crashed — never finished. Our projected end-to-end time
+on the same corpus with today's code is **~70 minutes** (~20× faster on the
+whole-job comparison, since a linearly-extrapolated LancsBox run would have
+been at least 24 hours). With the persistent-subprocess work
+(issue [#3](https://github.com/MartyJRE/corpust/issues/3)) that drops to
+**~30 minutes**, i.e. ~48× faster.
 
 ## Roadmap
 
