@@ -3,9 +3,12 @@
 //! A custom Tokenizer (Unicode-word-segmentation + lowercasing) drives both
 //! indexing and — implicitly — position numbering, so that display-side
 //! retokenization (also via `unicode-segmentation`) aligns with the token
-//! positions Tantivy stores in its posting lists. That alignment lets
-//! [`CorpusIndex::kwic`] skip the term directly to its hits via positional
-//! reads rather than scanning every token in every matched document.
+//! positions Tantivy stores in its posting lists.
+//!
+//! In addition to the inverted index, each document stores a packed array of
+//! per-token byte offsets (`token_offsets`). At query time KWIC looks up the
+//! byte window for a hit directly and retokenizes only that tiny slice, so
+//! context extraction is O(context) regardless of document length.
 
 use anyhow::{Context, Result};
 use corpust_core::{DocId, Document};
@@ -13,7 +16,10 @@ use std::path::{Path, PathBuf};
 use tantivy::{
     DocAddress, DocSet, Index, IndexReader, ReloadPolicy, TERMINATED, TantivyDocument, Term, doc,
     postings::Postings,
-    schema::{Field, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value},
+    schema::{
+        BytesOptions, Field, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions,
+        Value,
+    },
     tokenizer::{LowerCaser, TextAnalyzer, Token, TokenStream, Tokenizer},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -37,6 +43,7 @@ struct Fields {
     doc_id: Field,
     path: Field,
     body: Field,
+    token_offsets: Field,
 }
 
 /// One concordance line.
@@ -75,6 +82,7 @@ impl CorpusIndex {
             doc_id: schema.get_field("doc_id")?,
             path: schema.get_field("path")?,
             body: schema.get_field("body")?,
+            token_offsets: schema.get_field("token_offsets")?,
         };
         Self::from_index(index, fields)
     }
@@ -95,10 +103,18 @@ impl CorpusIndex {
     pub fn add_documents(&self, documents: impl IntoIterator<Item = Document>) -> Result<()> {
         let mut writer = self.index.writer(50_000_000)?;
         for document in documents {
+            let offsets: Vec<u32> = document
+                .text
+                .unicode_word_indices()
+                .map(|(start, _)| start as u32)
+                .collect();
+            let offsets_bytes = offsets_to_bytes(&offsets);
+
             writer.add_document(doc!(
                 self.fields.doc_id => document.id,
                 self.fields.path => document.path.display().to_string(),
                 self.fields.body => document.text,
+                self.fields.token_offsets => offsets_bytes,
             ))?;
         }
         writer.commit()?;
@@ -152,29 +168,46 @@ impl CorpusIndex {
                     .get_first(self.fields.doc_id)
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
+                let offsets_bytes = retrieved
+                    .get_first(self.fields.token_offsets)
+                    .and_then(|v| v.as_bytes())
+                    .unwrap_or_default();
+                let offsets = bytes_to_offsets(offsets_bytes);
 
                 positions_buf.clear();
                 postings.positions(&mut positions_buf);
-
-                // Display-side tokenization: must align with the indexer.
-                let tokens: Vec<&str> = body.unicode_words().collect();
 
                 for &pos in &positions_buf {
                     if hits.len() >= limit {
                         break;
                     }
-                    let i = pos as usize;
-                    if i >= tokens.len() {
+                    let p = pos as usize;
+                    if p >= offsets.len() {
                         continue;
                     }
-                    let left_start = i.saturating_sub(context);
-                    let right_end = (i + 1 + context).min(tokens.len());
+
+                    let window_start = p.saturating_sub(context);
+                    let window_end = (p + context + 1).min(offsets.len());
+                    let byte_start = offsets[window_start] as usize;
+                    let byte_end = if window_end < offsets.len() {
+                        offsets[window_end] as usize
+                    } else {
+                        body.len()
+                    };
+
+                    let window_text = &body[byte_start..byte_end];
+                    let window_tokens: Vec<&str> = window_text.unicode_words().collect();
+                    let hit_idx = p - window_start;
+                    if hit_idx >= window_tokens.len() {
+                        continue;
+                    }
+
                     hits.push(KwicHit {
                         doc_id,
                         path: PathBuf::from(path),
-                        left: tokens[left_start..i].join(" "),
-                        hit: tokens[i].to_string(),
-                        right: tokens[i + 1..right_end].join(" "),
+                        left: window_tokens[..hit_idx].join(" "),
+                        hit: window_tokens[hit_idx].to_string(),
+                        right: window_tokens[hit_idx + 1..].join(" "),
                     });
                 }
 
@@ -244,6 +277,21 @@ fn register_tokenizer(index: &Index) {
     index.tokenizers().register(TOKENIZER_NAME, analyzer);
 }
 
+fn offsets_to_bytes(offsets: &[u32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(offsets.len() * 4);
+    for &o in offsets {
+        buf.extend_from_slice(&o.to_le_bytes());
+    }
+    buf
+}
+
+fn bytes_to_offsets(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 fn build_schema() -> (Schema, Fields) {
     let mut builder = Schema::builder();
     let doc_id = builder.add_u64_field("doc_id", STORED);
@@ -257,12 +305,16 @@ fn build_schema() -> (Schema, Fields) {
         .set_stored();
     let body = builder.add_text_field("body", body_options);
 
+    let token_offsets =
+        builder.add_bytes_field("token_offsets", BytesOptions::default().set_stored());
+
     (
         builder.build(),
         Fields {
             doc_id,
             path,
             body,
+            token_offsets,
         },
     )
 }
@@ -303,6 +355,45 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().any(|h| h.hit == "The"));
         assert!(hits.iter().any(|h| h.hit == "THE"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn kwic_window_bounds_are_exact() {
+        // Ten tokens, request context=2 around the middle hit.
+        let tmp = std::env::temp_dir().join(format!("corpust-idx-{}", rand_suffix()));
+        let idx = CorpusIndex::create(&tmp).unwrap();
+        idx.add_documents([Document {
+            id: 0,
+            path: PathBuf::from("a.txt"),
+            text: "alpha beta gamma delta target epsilon zeta eta theta iota".to_string(),
+        }])
+        .unwrap();
+
+        let hits = idx.kwic("target", 2, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        let h = &hits[0];
+        assert_eq!(h.left, "gamma delta");
+        assert_eq!(h.hit, "target");
+        assert_eq!(h.right, "epsilon zeta");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn kwic_window_clamps_at_doc_edges() {
+        let tmp = std::env::temp_dir().join(format!("corpust-idx-{}", rand_suffix()));
+        let idx = CorpusIndex::create(&tmp).unwrap();
+        idx.add_documents([Document {
+            id: 0,
+            path: PathBuf::from("a.txt"),
+            text: "target one two three".to_string(),
+        }])
+        .unwrap();
+
+        let hits = idx.kwic("target", 10, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].left, "");
+        assert_eq!(hits[0].right, "one two three");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
