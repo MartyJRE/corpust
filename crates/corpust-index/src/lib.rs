@@ -17,8 +17,9 @@
 //! context extraction is O(context) regardless of document length.
 
 use anyhow::{Context, Result};
-use corpust_annotate::Annotator;
+use corpust_annotate::{AnnotatedToken, Annotator};
 use corpust_core::{DocId, Document};
+use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use tantivy::{
     DocAddress, DocSet, Index, IndexReader, ReloadPolicy, TERMINATED, TantivyDocument, Term, doc,
@@ -126,23 +127,53 @@ impl CorpusIndex {
 
     /// Index a batch of documents. Commits once at the end.
     ///
-    /// If `annotator` is `Some`, the annotator's tokenization drives every
-    /// layer (body / body_lemma / body_pos) and its byte offsets populate
-    /// `token_offsets`. If `None`, the registered "corpust" tokenizer handles
-    /// `body`, lemma / pos fields are left empty for each document, and
-    /// `token_offsets` is derived from `unicode_word_indices`.
+    /// When `annotator` is `Some`, annotation runs across documents in
+    /// parallel via rayon (each worker calls `annotator.annotate()`
+    /// concurrently; annotators are expected to be stateless or handle
+    /// concurrency internally). Writes to the Tantivy index stay
+    /// sequential — Tantivy's IndexWriter is single-threaded.
+    ///
+    /// When `annotator` is `None`, the registered "corpust" tokenizer
+    /// handles `body`; lemma / POS fields are left empty for each
+    /// document.
     pub fn add_documents(
         &self,
         documents: impl IntoIterator<Item = Document>,
-        annotator: Option<&dyn Annotator>,
+        annotator: Option<&(dyn Annotator + Sync)>,
     ) -> Result<()> {
         let mut writer = self.index.writer(50_000_000)?;
-        for document in documents {
-            match annotator {
-                Some(a) => self.add_annotated(&mut writer, &document, a)?,
-                None => self.add_unannotated(&mut writer, &document)?,
+
+        match annotator {
+            None => {
+                for document in documents {
+                    self.add_unannotated(&mut writer, &document)?;
+                }
+            }
+            Some(a) => {
+                // Process in chunks so peak memory from buffered
+                // annotation output stays bounded on big corpora.
+                const CHUNK_SIZE: usize = 16;
+                let docs: Vec<Document> = documents.into_iter().collect();
+                for chunk in docs.chunks(CHUNK_SIZE) {
+                    let annotated: Vec<(usize, Vec<AnnotatedToken<'_>>)> = chunk
+                        .par_iter()
+                        .enumerate()
+                        .map(|(i, doc)| -> Result<_> {
+                            let tokens = a.annotate(&doc.text)?;
+                            Ok((i, tokens))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+
+                    // Preserve input order when writing.
+                    let mut ordered = annotated;
+                    ordered.sort_by_key(|(i, _)| *i);
+                    for (i, tokens) in ordered {
+                        self.add_annotated(&mut writer, &chunk[i], &tokens)?;
+                    }
+                }
             }
         }
+
         writer.commit()?;
         self.reader.reload()?;
         Ok(())
@@ -173,16 +204,14 @@ impl CorpusIndex {
         &self,
         writer: &mut tantivy::IndexWriter,
         document: &Document,
-        annotator: &dyn Annotator,
+        annotated: &[AnnotatedToken<'_>],
     ) -> Result<()> {
-        let annotated = annotator.annotate(&document.text)?;
-
         let mut body_tokens = Vec::with_capacity(annotated.len());
         let mut lemma_tokens = Vec::with_capacity(annotated.len());
         let mut pos_tokens = Vec::with_capacity(annotated.len());
         let mut offsets: Vec<u32> = Vec::with_capacity(annotated.len());
 
-        for t in &annotated {
+        for t in annotated {
             offsets.push(t.byte_start as u32);
             body_tokens.push(Token {
                 offset_from: t.byte_start,

@@ -12,5 +12,6 @@ corpust-core.workspace = true
 corpust-tokenize.workspace = true
 corpust-annotate.workspace = true
 anyhow.workspace = true
+rayon.workspace = true
 tantivy.workspace = true
 unicode-segmentation.workspace = true

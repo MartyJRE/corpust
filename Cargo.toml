@@ -31,6 +31,7 @@ corpust-query = { path = "crates/corpust-query" }
 
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
+rayon = "1.10"
 tantivy = "0.26"
 unicode-segmentation = "1.12"
 walkdir = "2.5"

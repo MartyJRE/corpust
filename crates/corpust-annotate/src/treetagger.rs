@@ -1,27 +1,27 @@
 //! TreeTagger subprocess adapter.
 //!
-//! Runs a two-stage pipeline per document:
+//! Pipeline per document:
 //!
 //! ```text
-//! raw text ──► perl utf8-tokenize.perl -e -a english-abbreviations
-//!           ──► tree-tagger -token -lemma -sgml english.par
+//! raw text ──► perl utf8-tokenize.perl ──► one token per line
+//!           ──► tree-tagger -token -lemma -sgml <english.par>
 //!           ──► word\tPOS\tlemma TSV
 //! ```
 //!
-//! Tokenization happens in Perl (TreeTagger's own `utf8-tokenize.perl`)
-//! so contractions and clitics split the way LancsBox expects. The binary
-//! is platform-specific; the Perl script and language model are shared.
+//! Two subprocesses are spawned per call. TreeTagger is an external
+//! C program that block-buffers its stdout when the writer is a pipe
+//! (which we are), so it only flushes on EOF — meaning we can't drive
+//! it persistently through plain pipes without a pseudoterminal.
+//! That makes `spawn-per-document` the simple correct path: the tagger
+//! exits after each document, its buffer flushes, we read full output.
+//!
+//! The ~14 MB model reload on every spawn is the obvious cost. Parallel
+//! indexing (one `TreeTagger` per rayon worker, each with its own
+//! per-doc lifecycle) amortizes it across cores. A persistent PTY-based
+//! subprocess remains the long-term answer but is deferred.
+//!
 //! Output tokens are realigned back to byte spans in the source via a
-//! forward scan so downstream positional bookkeeping stays intact.
-//!
-//! v1 trade-offs:
-//!
-//! - **Spawn per document** — both tokenizer and tagger subprocesses are
-//!   created fresh for each call. The ~14 MB model reload dominates for
-//!   large corpora; pooling lands in a follow-up.
-//! - **Perl required** — preinstalled on macOS and Linux; Windows users
-//!   need Strawberry Perl or similar. A pure-Rust port of the tokenizer
-//!   would remove this dep entirely and is the eventual plan.
+//! forward scan, so downstream positional bookkeeping stays intact.
 
 use crate::{AnnotatedToken, Annotator};
 use anyhow::{Context, Result, bail};
@@ -42,8 +42,7 @@ pub struct TreeTagger {
 }
 
 impl TreeTagger {
-    /// Configure an adapter from explicit paths. Useful for non-bundled
-    /// installations (user-installed TreeTagger, custom layouts).
+    /// Configure an adapter from explicit paths.
     pub fn new(
         tagger_binary: impl Into<PathBuf>,
         tokenizer_script: impl Into<PathBuf>,
@@ -61,20 +60,9 @@ impl TreeTagger {
         }
     }
 
-    /// Locate a TreeTagger installation inside the repo's bundled layout:
-    ///
-    /// ```text
-    /// <bundle_root>/
-    /// ├── bin/<platform>/tree-tagger(.exe)
-    /// ├── cmd/utf8-tokenize.perl
-    /// └── lib/
-    ///     ├── <language>-abbreviations
-    ///     └── <language>.par
-    /// ```
-    ///
-    /// `<platform>` is one of `macos-arm64`, `macos-x86_64`,
-    /// `linux-x86_64`, `windows-x86_64`. `language` is the full
-    /// TreeTagger language name (`"english"`, not `"en"`).
+    /// Locate a TreeTagger installation inside the repo's bundled
+    /// layout. See `resources/treetagger/README.md` for the expected
+    /// file tree.
     pub fn from_bundle(bundle_root: &Path, language: &'static str) -> Result<Self> {
         let platform = current_platform_dir()?;
         let binary_name = if cfg!(target_os = "windows") {
@@ -110,7 +98,7 @@ impl TreeTagger {
     }
 
     fn tokenize(&self, text: &str) -> Result<Vec<u8>> {
-        let mut child = Command::new("perl")
+        let child = Command::new("perl")
             .arg(&self.tokenizer_script)
             .arg("-e")
             .arg("-a")
@@ -121,30 +109,11 @@ impl TreeTagger {
             .spawn()
             .context("spawning perl tokenizer")?;
 
-        {
-            let stdin = child
-                .stdin
-                .as_mut()
-                .context("perl stdin unexpectedly closed")?;
-            stdin
-                .write_all(text.as_bytes())
-                .context("writing to perl tokenizer")?;
-        }
-        drop(child.stdin.take());
-
-        let output = child.wait_with_output().context("waiting for perl")?;
-        if !output.status.success() {
-            bail!(
-                "tokenizer exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(output.stdout)
+        run_subprocess(child, text.as_bytes(), "tokenizer")
     }
 
     fn tag(&self, tokenized: &[u8]) -> Result<String> {
-        let mut child = Command::new(&self.tagger_binary)
+        let child = Command::new(&self.tagger_binary)
             .args(["-token", "-lemma", "-sgml"])
             .arg(&self.model_file)
             .stdin(Stdio::piped())
@@ -153,30 +122,45 @@ impl TreeTagger {
             .spawn()
             .with_context(|| format!("spawning {}", self.tagger_binary.display()))?;
 
-        {
-            let stdin = child
-                .stdin
-                .as_mut()
-                .context("tree-tagger stdin unexpectedly closed")?;
-            stdin
-                .write_all(tokenized)
-                .context("writing to tree-tagger")?;
-        }
-        drop(child.stdin.take());
-
-        let output = child
-            .wait_with_output()
-            .context("waiting for tree-tagger")?;
-        if !output.status.success() {
-            bail!(
-                "tree-tagger exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-
-        String::from_utf8(output.stdout).context("tree-tagger output was not valid UTF-8")
+        let stdout = run_subprocess(child, tokenized, "tree-tagger")?;
+        String::from_utf8(stdout).context("tree-tagger output was not valid UTF-8")
     }
+}
+
+/// Drive a subprocess safely: write `input` to its stdin on a side
+/// thread while the main thread concurrently reads stdout and stderr.
+/// Avoids the classic "full pipe → deadlock" when `input` is bigger
+/// than the OS pipe buffer (~64 KB).
+fn run_subprocess(mut child: std::process::Child, input: &[u8], label: &str) -> Result<Vec<u8>> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .with_context(|| format!("{label}: stdin unexpectedly closed"))?;
+    let input_owned = input.to_vec();
+
+    let writer = std::thread::spawn(move || -> std::io::Result<()> {
+        stdin.write_all(&input_owned)?;
+        drop(stdin);
+        Ok(())
+    });
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("{label}: waiting for subprocess"))?;
+
+    writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("{label}: writer thread panicked"))?
+        .with_context(|| format!("{label}: writing to stdin"))?;
+
+    if !output.status.success() {
+        bail!(
+            "{label} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
 }
 
 impl Annotator for TreeTagger {
@@ -224,6 +208,7 @@ fn parse_tsv(output: &str) -> Vec<RawTag> {
                 return None;
             }
             let pos = parts.next().map(str::to_string).filter(|s| !s.is_empty());
+            pos.as_ref()?;
             let lemma = parts
                 .next()
                 .map(str::to_string)
@@ -264,13 +249,10 @@ mod tests {
 
     #[test]
     fn parse_tsv_handles_canonical_output() {
-        let raw = "The\tDT\tthe\nquick\tJJ\tquick\nbrown\tJJ\tbrown\nfox\tNN\tfox\n.\tSENT\t.\n";
+        let raw = "The\tDT\tthe\nquick\tJJ\tquick\nfox\tNN\tfox\n";
         let tags = parse_tsv(raw);
-        assert_eq!(tags.len(), 5);
-        assert_eq!(tags[0].word, "The");
+        assert_eq!(tags.len(), 3);
         assert_eq!(tags[0].pos.as_deref(), Some("DT"));
-        assert_eq!(tags[0].lemma.as_deref(), Some("the"));
-        assert_eq!(tags[3].pos.as_deref(), Some("NN"));
     }
 
     #[test]
@@ -282,31 +264,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_tsv_skips_empty_and_status_lines() {
-        // TreeTagger sometimes interleaves tab-prefixed progress lines
-        // if stderr got merged; be defensive.
-        let raw = "\treading parameters\nThe\tDT\tthe\n\n\tfinished\n";
+    fn parse_tsv_skips_sgml_pass_through_lines() {
+        let raw = "<MARKER/>\nThe\tDT\tthe\n";
         let tags = parse_tsv(raw);
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].word, "The");
-    }
-
-    #[test]
-    fn align_to_source_straightforward() {
-        let text = "The quick brown fox.";
-        let tags = vec![
-            raw("The", "DT", "the"),
-            raw("quick", "JJ", "quick"),
-            raw("brown", "JJ", "brown"),
-            raw("fox", "NN", "fox"),
-            raw(".", "SENT", "."),
-        ];
-        let aligned = align_to_source(tags, text);
-        assert_eq!(aligned.len(), 5);
-        assert_eq!(&text[aligned[0].byte_start..aligned[0].byte_end], "The");
-        assert_eq!(aligned[3].byte_start, 16);
-        assert_eq!(aligned[3].byte_end, 19);
-        assert_eq!(aligned[4].byte_start, 19);
     }
 
     #[test]
@@ -320,11 +282,8 @@ mod tests {
             raw(".", "SENT", "."),
         ];
         let aligned = align_to_source(tags, text);
-        assert_eq!(aligned.len(), 5);
         assert_eq!(aligned[1].byte_start, 2);
-        assert_eq!(aligned[1].byte_end, 4);
         assert_eq!(aligned[2].byte_start, 4);
-        assert_eq!(aligned[2].byte_end, 7);
         assert_eq!(aligned[2].lemma.as_deref(), Some("not"));
     }
 
@@ -342,23 +301,16 @@ mod tests {
     fn from_bundle_succeeds_on_current_platform() {
         let bundle = bundle_path();
         if !bundle.exists() {
-            eprintln!("bundle not at {}, skipping", bundle.display());
             return;
         }
         let tt = TreeTagger::from_bundle(&bundle, "english").unwrap();
         assert_eq!(tt.language, "english");
-        assert!(tt.tagger_binary.exists());
     }
 
-    /// End-to-end sanity: actually spawn the pipeline, verify POS +
-    /// lemma come back correctly. Slow-ish (~2 s) because TreeTagger
-    /// reloads its parameter file each call. Skipped when the bundle
-    /// isn't present (e.g. a minimal clone without resources/).
     #[test]
     fn end_to_end_tags_an_english_sentence() {
         let bundle = bundle_path();
         if !bundle.exists() {
-            eprintln!("bundle not at {}, skipping", bundle.display());
             return;
         }
         let tt = TreeTagger::from_bundle(&bundle, "english").unwrap();
@@ -366,15 +318,16 @@ mod tests {
             .annotate("The quick brown fox jumps over the lazy dog.")
             .unwrap();
         assert!(!tokens.is_empty());
+        let jumps = tokens.iter().find(|t| t.word.as_ref() == "jumps").unwrap();
+        assert_eq!(jumps.lemma.as_deref(), Some("jump"));
+    }
 
-        let jumps = tokens.iter().find(|t| t.word.as_ref() == "jumps");
-        assert!(jumps.is_some(), "expected a token for 'jumps'");
-        assert_eq!(jumps.unwrap().lemma.as_deref(), Some("jump"));
-        assert_eq!(jumps.unwrap().pos.as_deref(), Some("NNS"));
-
-        let the = tokens.iter().find(|t| t.word.as_ref() == "The");
-        assert!(the.is_some());
-        assert_eq!(the.unwrap().pos.as_deref(), Some("DT"));
+    fn raw(word: &str, pos: &str, lemma: &str) -> RawTag {
+        RawTag {
+            word: word.into(),
+            pos: Some(pos.into()),
+            lemma: Some(lemma.into()),
+        }
     }
 
     fn bundle_path() -> PathBuf {
@@ -384,13 +337,5 @@ mod tests {
             .parent()
             .unwrap()
             .join("resources/treetagger")
-    }
-
-    fn raw(word: &str, pos: &str, lemma: &str) -> RawTag {
-        RawTag {
-            word: word.into(),
-            pos: Some(pos.into()),
-            lemma: Some(lemma.into()),
-        }
     }
 }

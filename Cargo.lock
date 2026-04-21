@@ -242,6 +242,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "corpust-annotate",
  "corpust-core",
  "corpust-index",
  "corpust-io",
@@ -260,6 +261,7 @@ dependencies = [
  "corpust-annotate",
  "corpust-core",
  "corpust-tokenize",
+ "rayon",
  "tantivy",
  "unicode-segmentation",
 ]

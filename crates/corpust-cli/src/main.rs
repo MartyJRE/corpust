@@ -134,7 +134,12 @@ fn run_index(
     let t1 = Instant::now();
     let index = CorpusIndex::create(&out)
         .with_context(|| format!("creating index at {}", out.display()))?;
-    index.add_documents(docs, tagger.as_ref().map(|t| t as &dyn corpust_annotate::Annotator))?;
+    index.add_documents(
+        docs,
+        tagger
+            .as_ref()
+            .map(|t| t as &(dyn corpust_annotate::Annotator + Sync)),
+    )?;
     let index_elapsed = t1.elapsed();
 
     println!(
