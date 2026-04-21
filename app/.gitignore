@@ -1,0 +1,17 @@
+node_modules
+dist
+dist-ssr
+.env
+.env.*
+!.env.example
+.vite
+
+# Tauri
+src-tauri/target
+src-tauri/gen
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.log

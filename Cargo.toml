@@ -8,6 +8,7 @@ members = [
     "crates/corpust-index",
     "crates/corpust-query",
     "crates/corpust-cli",
+    "app/src-tauri",
 ]
 
 [workspace.package]

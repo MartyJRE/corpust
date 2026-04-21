@@ -1,0 +1,32 @@
+[package]
+name = "corpust-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Corpust: Tauri desktop app."
+
+[lib]
+name = "corpust_ui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "corpust-ui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+corpust-core.workspace = true
+corpust-io.workspace = true
+corpust-index.workspace = true
+corpust-query.workspace = true
+corpust-annotate.workspace = true
+anyhow.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
