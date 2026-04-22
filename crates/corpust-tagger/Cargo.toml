@@ -1,0 +1,17 @@
+[package]
+name = "corpust-tagger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Corpust: pure-Rust POS / lemma tagger reading TreeTagger .par files."
+
+[dependencies]
+corpust-core.workspace = true
+corpust-annotate.workspace = true
+anyhow.workspace = true
+
+[[bin]]
+name = "par-explore"
+path = "src/bin/par_explore.rs"

@@ -742,6 +742,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "corpust-tagger"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "corpust-annotate",
+ "corpust-core",
+]
+
+[[package]]
 name = "corpust-tokenize"
 version = "0.1.0"
 dependencies = [
