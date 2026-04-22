@@ -16,8 +16,9 @@ const TABS: { id: MainView; label: string; Icon: typeof Search }[] = [
 export function TitleStrip({ view, onView }: TitleStripProps) {
   return (
     <div className="cx-titlestrip">
-      <Wordmark />
+      <Wordmark size="xs" />
       <div className="cx-ts-tabs" style={{ marginLeft: 14 }}>
+
         {TABS.map((t) => (
           <button
             key={t.id}

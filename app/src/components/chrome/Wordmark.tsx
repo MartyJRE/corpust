@@ -1,5 +1,5 @@
-export function Wordmark({ size = "sm" }: { size?: "sm" | "md" | "lg" }) {
-  const fs = size === "lg" ? 44 : size === "md" ? 26 : 22;
+export function Wordmark({ size = "sm" }: { size?: "xs" | "sm" | "md" | "lg" }) {
+  const fs = size === "lg" ? 44 : size === "md" ? 26 : size === "xs" ? 13 : 22;
   return (
     <div
       style={{
