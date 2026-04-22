@@ -577,11 +577,30 @@
 .cx-coll-segbtn button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .cx-coll-graph {
-  position: relative; height: 340px;
+  position: relative; height: 380px;
   background: var(--bg-raised); border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  margin-bottom: 18px; overflow: hidden;
+  margin-bottom: 8px; overflow: hidden;
 }
+.cx-coll-svg-wrap { padding: 0; }
+
+.cx-coll-legend {
+  display: flex; gap: 14px;
+  padding: 4px 4px 16px;
+  font-family: var(--font-mono); font-size: 10px;
+  color: var(--fg-muted);
+  align-items: center;
+  flex-wrap: wrap;
+  text-transform: uppercase; letter-spacing: 0.05em;
+}
+.cx-coll-leg-item { display: inline-flex; align-items: center; gap: 5px; }
+.cx-coll-leg-dot {
+  display: inline-block; width: 9px; height: 9px;
+  border-radius: 50%; border: 1px solid var(--border);
+  opacity: 0.55;
+}
+.cx-coll-leg-sep { color: var(--fg-subtle); }
+.cx-coll-leg-note { color: var(--fg-subtle); text-transform: none; letter-spacing: 0; }
 .cx-coll-axis { position: absolute; top: 50%; left: 0; right: 0; height: 1px; background: color-mix(in oklch, var(--border) 80%, transparent); }
 .cx-coll-center {
   position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
