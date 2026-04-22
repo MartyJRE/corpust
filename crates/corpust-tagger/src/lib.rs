@@ -21,6 +21,7 @@
 //! test against the reference `tree-tagger` binary.
 
 pub mod par;
+pub mod testkit;
 
 /// Re-export the Perl-compatible tokenizer so callers that depend on
 /// `corpust-tagger` don't also need to pull in `corpust-tokenize`.
