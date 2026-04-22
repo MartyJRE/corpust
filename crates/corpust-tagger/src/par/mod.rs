@@ -14,6 +14,7 @@
 //! one owns a single section and a differential test that diffs its
 //! output against what the reference binary produces for the same input.
 
+pub mod dtree;
 pub mod header;
 pub mod lexicon;
 
