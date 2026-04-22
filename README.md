@@ -4,11 +4,13 @@ A Rust corpus-linguistics toolkit — aiming for LancsBoxX-level functionality w
 modern performance. Cross-platform desktop app + library, built for billion-word
 corpora on commodity hardware.
 
-> **Status:** pre-alpha. CLI works end-to-end: ingest `.txt`, index with optional
-> TreeTagger-driven POS + lemma annotation, run KWIC queries across word / lemma /
-> POS layers. No GUI yet — Tauri shell is in the roadmap.
+> **Status:** pre-alpha. CLI works end-to-end (ingest → annotate → KWIC).
+> Tauri desktop app scaffolded, running on fixture data — Tauri IPC wiring
+> to the real backend commands is still pending.
 
 ## Quick start
+
+### CLI
 
 ```sh
 # Build everything (release mode for real numbers)
@@ -26,6 +28,15 @@ cargo run --release -p corpust-cli -- kwic --index ./testdata/index go  --layer 
 cargo run --release -p corpust-cli -- kwic --index ./testdata/index NN  --layer pos
 ```
 
+### Desktop app
+
+```sh
+cd app
+npm install          # first run only
+npm run dev          # browser preview at http://localhost:1420
+npm run tauri:dev    # real Tauri desktop window (compiles Rust backend)
+```
+
 ## Workspace layout
 
 | Crate              | Role                                                     |
@@ -37,6 +48,7 @@ cargo run --release -p corpust-cli -- kwic --index ./testdata/index NN  --layer 
 | `corpust-index`    | The hot crate. Tantivy-backed multi-layer positional index. |
 | `corpust-query`    | Query layer over the index. KWIC today, CQL later.       |
 | `corpust-cli`      | `corpust` binary — dev tool / power-user entry point.    |
+| `app/src-tauri`    | `corpust-ui` — Tauri desktop app (React + Tailwind + shadcn/ui). |
 
 ## Bundled assets
 
@@ -77,6 +89,9 @@ Shipped:
 - `--annotate` flag drives lemma + POS fields across indexing
 - `--layer word | lemma | pos` flag on KWIC queries
 - Rayon-parallel annotation
+- Tauri desktop app scaffold (React + Tailwind + shadcn/ui) with KWIC view,
+  collocation scatter, frequency view, corpus detail, command palette,
+  build dialog — currently running on fixture data
 
 Open issues track the next steps:
 
@@ -84,9 +99,10 @@ Open issues track the next steps:
 - [#3](https://github.com/MartyJRE/corpust/issues/3) — persistent TreeTagger via PTY
 - [#4](https://github.com/MartyJRE/corpust/issues/4) — Rust port of `utf8-tokenize.perl`
 - [#5](https://github.com/MartyJRE/corpust/issues/5) — `corpust annotate install-lang <code>`
+- [#6](https://github.com/MartyJRE/corpust/issues/6) — UI polish pass for non-collocation views
 
-Further out: CQL parser + executor, Tauri desktop shell, statistics (collocations,
-keyness, dispersion), XML/TEI ingestion.
+Further out: Tauri IPC wiring (desktop app → real backend), CQL parser + executor,
+keyness / dispersion stats, XML/TEI ingestion.
 
 ## License
 
