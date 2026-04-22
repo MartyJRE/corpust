@@ -10,6 +10,7 @@ description = "Corpust: pure-Rust POS / lemma tagger reading TreeTagger .par fil
 [dependencies]
 corpust-core.workspace = true
 corpust-annotate.workspace = true
+corpust-tokenize.workspace = true
 anyhow.workspace = true
 
 [[bin]]

@@ -1,8 +1,15 @@
 //! Tokenizers.
 //!
-//! Phase 0 ships a single Unicode-word tokenizer. Real corpus-linguistics
-//! tokenization (language-aware, punctuation-aware, clitic splitting, etc.)
-//! will arrive as extra implementations behind the [`Tokenizer`] trait.
+//! Two tokenizers live here today:
+//! - [`UnicodeWordTokenizer`]: Unicode word-boundary splitter used by the
+//!   indexer. Returns [`Token`][corpust_core::Token] with byte offsets
+//!   for KWIC alignment.
+//! - [`treetagger::Tokenizer`]: byte-for-byte port of Helmut Schmid's
+//!   `utf8-tokenize.perl -e`, used to feed the TreeTagger binary (and
+//!   eventually our in-process Rust tagger) with a compatible token
+//!   stream.
+
+pub mod treetagger;
 
 use corpust_core::{Position, Token};
 use unicode_segmentation::UnicodeSegmentation;

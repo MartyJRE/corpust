@@ -3,22 +3,32 @@
 //! Pipeline per document:
 //!
 //! ```text
-//! raw text ──► perl utf8-tokenize.perl ──► one token per line
+//! raw text ──► corpust_tokenize::treetagger::Tokenizer (in-process Rust)
+//!           ──► one token per line
 //!           ──► tree-tagger -token -lemma -sgml <english.par>
 //!           ──► word\tPOS\tlemma TSV
 //! ```
 //!
-//! Two subprocesses are spawned per call. TreeTagger is an external
-//! C program that block-buffers its stdout when the writer is a pipe
-//! (which we are), so it only flushes on EOF — meaning we can't drive
-//! it persistently through plain pipes without a pseudoterminal.
-//! That makes `spawn-per-document` the simple correct path: the tagger
-//! exits after each document, its buffer flushes, we read full output.
+//! Only one subprocess is spawned per call — the `tree-tagger` binary.
+//! Tokenization runs in-process via the Rust port of
+//! `utf8-tokenize.perl`, which has byte-for-byte parity with the
+//! upstream Perl script (verified across 2.2 M tokens on Gutenberg
+//! text). That removes the per-document `perl` fork cost and the
+//! Perl dependency on Windows.
 //!
-//! The ~14 MB model reload on every spawn is the obvious cost. Parallel
-//! indexing (one `TreeTagger` per rayon worker, each with its own
-//! per-doc lifecycle) amortizes it across cores. A persistent PTY-based
-//! subprocess remains the long-term answer but is deferred.
+//! TreeTagger is an external C program that block-buffers its stdout
+//! when the writer is a pipe (which we are), so it only flushes on
+//! EOF — meaning we can't drive it persistently through plain pipes
+//! without a pseudoterminal. That makes `spawn-per-document` the
+//! simple correct path: the tagger exits after each document, its
+//! buffer flushes, we read full output.
+//!
+//! The ~14 MB model reload on every spawn is the obvious remaining
+//! cost. Parallel indexing (one `TreeTagger` per rayon worker, each
+//! with its own per-doc lifecycle) amortizes it across cores. The
+//! long-term answer — a fully in-process Rust tagger reading the
+//! `.par` file directly — is being built in the `corpust-tagger`
+//! crate alongside this adapter.
 //!
 //! Output tokens are realigned back to byte spans in the source via a
 //! forward scan, so downstream positional bookkeeping stays intact.
@@ -26,6 +36,7 @@
 use crate::{AnnotatedToken, Annotator};
 use anyhow::{Context, Result, bail};
 use corpust_core::Position;
+use corpust_tokenize::treetagger::Tokenizer;
 use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -34,9 +45,8 @@ use std::process::{Command, Stdio};
 /// TreeTagger subprocess adapter.
 pub struct TreeTagger {
     tagger_binary: PathBuf,
-    tokenizer_script: PathBuf,
-    abbreviations_file: PathBuf,
     model_file: PathBuf,
+    tokenizer: Tokenizer,
     language: &'static str,
     id: String,
 }
@@ -45,24 +55,27 @@ impl TreeTagger {
     /// Configure an adapter from explicit paths.
     pub fn new(
         tagger_binary: impl Into<PathBuf>,
-        tokenizer_script: impl Into<PathBuf>,
-        abbreviations_file: impl Into<PathBuf>,
+        abbreviations_file: impl AsRef<Path>,
         model_file: impl Into<PathBuf>,
         language: &'static str,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let tokenizer = Tokenizer::from_abbreviations_file(abbreviations_file)?;
+        Ok(Self {
             tagger_binary: tagger_binary.into(),
-            tokenizer_script: tokenizer_script.into(),
-            abbreviations_file: abbreviations_file.into(),
             model_file: model_file.into(),
+            tokenizer,
             language,
             id: format!("treetagger-{language}"),
-        }
+        })
     }
 
     /// Locate a TreeTagger installation inside the repo's bundled
     /// layout. See `resources/treetagger/README.md` for the expected
     /// file tree.
+    ///
+    /// The `cmd/utf8-tokenize.perl` script is no longer needed — the
+    /// Rust port in `corpust_tokenize::treetagger` replaces it — so
+    /// this no longer validates its presence.
     pub fn from_bundle(bundle_root: &Path, language: &'static str) -> Result<Self> {
         let platform = current_platform_dir()?;
         let binary_name = if cfg!(target_os = "windows") {
@@ -72,13 +85,12 @@ impl TreeTagger {
         };
 
         let tagger = bundle_root.join("bin").join(platform).join(binary_name);
-        let tokenizer = bundle_root.join("cmd").join("utf8-tokenize.perl");
         let abbr = bundle_root
             .join("lib")
             .join(format!("{language}-abbreviations"));
         let model = bundle_root.join("lib").join(format!("{language}.par"));
 
-        for p in [&tagger, &tokenizer, &abbr, &model] {
+        for p in [&tagger, &abbr, &model] {
             if !p.exists() {
                 bail!(
                     "TreeTagger bundle missing: {} (bundle_root = {})",
@@ -88,28 +100,26 @@ impl TreeTagger {
             }
         }
 
-        Ok(Self::new(tagger, tokenizer, abbr, model, language))
+        Self::new(tagger, abbr, model, language)
     }
 
     fn run(&self, text: &str) -> Result<Vec<RawTag>> {
-        let tokenized = self.tokenize(text)?;
+        let tokenized = self.tokenize(text);
         let tagged = self.tag(&tokenized)?;
         Ok(parse_tsv(&tagged))
     }
 
-    fn tokenize(&self, text: &str) -> Result<Vec<u8>> {
-        let child = Command::new("perl")
-            .arg(&self.tokenizer_script)
-            .arg("-e")
-            .arg("-a")
-            .arg(&self.abbreviations_file)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawning perl tokenizer")?;
-
-        run_subprocess(child, text.as_bytes(), "tokenizer")
+    fn tokenize(&self, text: &str) -> Vec<u8> {
+        // `tree-tagger -token` consumes one token per line. Emit
+        // exactly that format — no trailing blank line needed.
+        let tokens = self.tokenizer.tokenize(text);
+        let total: usize = tokens.iter().map(|t| t.len() + 1).sum();
+        let mut buf = Vec::with_capacity(total);
+        for t in tokens {
+            buf.extend_from_slice(t.as_bytes());
+            buf.push(b'\n');
+        }
+        buf
     }
 
     fn tag(&self, tokenized: &[u8]) -> Result<String> {

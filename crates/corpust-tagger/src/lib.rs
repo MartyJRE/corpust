@@ -21,7 +21,10 @@
 //! test against the reference `tree-tagger` binary.
 
 pub mod par;
-pub mod tokenize;
+
+/// Re-export the Perl-compatible tokenizer so callers that depend on
+/// `corpust-tagger` don't also need to pull in `corpust-tokenize`.
+pub use corpust_tokenize::treetagger as tokenize;
 
 use anyhow::Result;
 use corpust_annotate::{AnnotatedToken, Annotator};

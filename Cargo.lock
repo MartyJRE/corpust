@@ -690,6 +690,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "corpust-core",
+ "corpust-tokenize",
  "unicode-segmentation",
 ]
 
@@ -748,12 +749,14 @@ dependencies = [
  "anyhow",
  "corpust-annotate",
  "corpust-core",
+ "corpust-tokenize",
 ]
 
 [[package]]
 name = "corpust-tokenize"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "corpust-core",
  "unicode-segmentation",
 ]

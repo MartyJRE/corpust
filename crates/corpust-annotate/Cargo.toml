@@ -9,5 +9,6 @@ description = "Corpust: POS / lemma annotation pipeline."
 
 [dependencies]
 corpust-core.workspace = true
+corpust-tokenize.workspace = true
 anyhow.workspace = true
 unicode-segmentation.workspace = true
