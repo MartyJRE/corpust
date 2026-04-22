@@ -21,6 +21,7 @@
 //! test against the reference `tree-tagger` binary.
 
 pub mod par;
+pub mod tokenize;
 
 use anyhow::Result;
 use corpust_annotate::{AnnotatedToken, Annotator};
