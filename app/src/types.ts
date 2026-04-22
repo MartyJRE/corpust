@@ -1,25 +1,25 @@
-// Domain types exposed to the frontend. Keep these in sync with the
-// Rust side — they mirror corpust-core + corpust-index + corpust-query.
+// Domain types exposed to the frontend. Mirror the Rust-side
+// corpust-core / corpust-index / corpust-query.
+
+export type CorpusKind = "literary" | "legal" | "news" | "mixed";
 
 export interface CorpusMeta {
-  /** Stable name used in the UI + in URLs/paths. */
   id: string;
-  /** Human-readable label. */
   name: string;
-  /** Filesystem path to the on-disk Tantivy index. */
+  kind: CorpusKind;
   indexPath: string;
-  /** Filesystem path of the source directory the corpus was built from. */
   sourcePath: string;
-  /** Whether the corpus was built with TreeTagger annotation (lemma + POS). */
   annotated: boolean;
-  /** Total documents. */
   docCount: number;
-  /** Approximate total token count (may be an estimate for unannotated builds). */
   tokenCount: number;
-  /** ISO-8601 timestamp of index build completion. */
+  types: number;
+  avgDocLen: number;
   builtAt: string;
-  /** Tagger provenance, if annotated — e.g. "treetagger-english". */
-  taggerId?: string;
+  buildMs: number;
+  languages: string[];
+  tokeniser: string;
+  annotator: string | null;
+  sizeOnDisk: number;
 }
 
 export type QueryLayer = "word" | "lemma" | "pos";
@@ -28,48 +28,93 @@ export interface KwicRequest {
   corpusId: string;
   term: string;
   layer: QueryLayer;
-  /** Tokens of context on each side. */
   context: number;
-  /** Max hits to return. */
   limit: number;
 }
 
 export interface KwicHit {
-  /** Document index inside the corpus. */
-  docId: number;
-  /** Relative path of the source file — shown as the left-most column. */
-  path: string;
-  /** Left context, N tokens. */
+  docId: string;
+  pos: number;
   left: string;
-  /** The hit token (the thing that matched the query). */
   hit: string;
-  /** Right context, N tokens. */
   right: string;
+  lemma?: string;
+  pos_tag?: string;
 }
 
 export interface KwicResult {
   hits: KwicHit[];
-  /** Query wall-clock duration, rendered in the status bar. */
   elapsedMs: number;
-  /** Whether the `limit` was reached (there might be more hits). */
   truncated: boolean;
 }
 
+export interface ExpandedHit {
+  docTitle: string;
+  docMeta: string;
+  before: string;
+  match: string;
+  after: string;
+}
+
+export interface Collocate {
+  word: string;
+  pos: string;
+  leftCount: number;
+  rightCount: number;
+  total: number;
+  logDice: number;
+  mi: number;
+  z: number;
+  dist: number;
+}
+
+export interface FreqRow {
+  word?: string;
+  tag?: string;
+  label?: string;
+  count: number;
+  pct: number;
+}
+
+export interface DocFreqRow {
+  doc: string;
+  hits: number;
+  per1m: number;
+}
+
+export interface DocumentMeta {
+  id: string;
+  title: string;
+  author: string;
+  year: number;
+  tokens: number;
+}
+
+export interface RecentQuery {
+  id: number;
+  layer: QueryLayer;
+  term: string;
+  hits: number;
+  corpus: string;
+}
+
 export interface BuildRequest {
-  /** Directory containing .txt files. */
   sourcePath: string;
-  /** Where to write the index. */
   outPath: string;
-  /** Run TreeTagger during indexing to populate lemma + POS. */
   annotate: boolean;
 }
 
 export interface BuildProgress {
   taskId: string;
-  /** 0..1 */
-  phase: "reading" | "indexing" | "committing" | "done" | "failed";
+  phase: "idle" | "reading" | "indexing" | "annotating" | "committing" | "done" | "failed";
   docsSeen: number;
   docsTotal: number | null;
   elapsedMs: number;
   error?: string;
 }
+
+export type MainView = "search" | "corpus" | "settings";
+export type SubView = "kwic" | "coll" | "freq";
+export type SortMode = "left1" | "right1" | "doc";
+export type CollMetric = "logDice" | "mi" | "z";
+export type FreqBy = "word" | "pos";

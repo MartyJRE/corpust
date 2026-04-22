@@ -1,69 +1,119 @@
-// Top-of-main query input. The tool's "address bar": pick layer + type a
-// term + hit enter. Results stream into KwicTable below.
-
-import { useState } from "react";
-import { Input } from "@/components/ui/input";
-import { Button } from "@/components/ui/button";
+import { Plus, Search, X } from "lucide-react";
+import type { FormEvent } from "react";
 import type { QueryLayer } from "@/types";
 
 const LAYERS: { value: QueryLayer; label: string; hint: string }[] = [
-  { value: "word", label: "word", hint: "surface form (case-insensitive)" },
-  { value: "lemma", label: "lemma", hint: "dictionary form — requires annotation" },
-  { value: "pos", label: "pos", hint: "POS tag — case-sensitive (e.g. NN, VBD)" },
+  { value: "word", label: "word", hint: "surface form · case-insensitive" },
+  { value: "lemma", label: "lemma", hint: "dictionary form · requires annotation" },
+  { value: "pos", label: "pos", hint: "POS tag · case-sensitive (NN, VBD, …)" },
 ];
 
-export interface QueryBarProps {
-  disabled?: boolean;
-  onRun: (params: { term: string; layer: QueryLayer }) => void;
+export interface Filter {
+  key: string;
+  label: string;
 }
 
-export function QueryBar({ disabled, onRun }: QueryBarProps) {
-  const [term, setTerm] = useState("");
-  const [layer, setLayer] = useState<QueryLayer>("word");
+export interface QueryBarProps {
+  layer: QueryLayer;
+  term: string;
+  onLayer: (l: QueryLayer) => void;
+  onTerm: (t: string) => void;
+  onRun: () => void;
+  disabled?: boolean;
+  annotated?: boolean;
+  onOpenPalette: () => void;
+  filters: Filter[];
+  onRemoveFilter: (k: string) => void;
+}
 
-  const submit = (e: React.FormEvent) => {
+export function QueryBar({
+  layer,
+  term,
+  onLayer,
+  onTerm,
+  onRun,
+  disabled,
+  annotated,
+  onOpenPalette,
+  filters,
+  onRemoveFilter,
+}: QueryBarProps) {
+  const submit = (e: FormEvent) => {
     e.preventDefault();
-    if (!term.trim()) return;
-    onRun({ term: term.trim(), layer });
+    if (term.trim()) onRun();
   };
 
   return (
-    <form
-      onSubmit={submit}
-      className="flex items-center gap-2 border-b border-border bg-card px-4 py-2"
-    >
-      <div className="flex gap-1 rounded-md border border-border p-0.5">
-        {LAYERS.map((l) => (
-          <button
-            key={l.value}
-            type="button"
-            title={l.hint}
-            onClick={() => setLayer(l.value)}
-            className={`rounded px-2 py-1 font-mono text-xs transition-colors ${
-              layer === l.value
-                ? "bg-accent text-accent-foreground"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            {l.label}
-          </button>
-        ))}
+    <form onSubmit={submit} className="cx-querybar">
+      <div className="cx-layer-toggle" title="Linguistic query layer">
+        {LAYERS.map((l) => {
+          const locked = l.value !== "word" && !annotated;
+          return (
+            <button
+              key={l.value}
+              type="button"
+              title={l.hint}
+              onClick={() => onLayer(l.value)}
+              disabled={locked}
+              className={`cx-layer cx-layer-${l.value} ${layer === l.value ? "is-on" : ""}`}
+            >
+              {l.label}
+            </button>
+          );
+        })}
       </div>
-      <Input
-        value={term}
-        onChange={(e) => setTerm(e.target.value)}
-        placeholder={
-          layer === "pos"
-            ? "POS tag (e.g. NN, VBD, IN)…"
-            : "term or regex…"
-        }
-        className="font-mono"
-        disabled={disabled}
-        autoFocus
-      />
-      <Button type="submit" size="sm" disabled={disabled || !term.trim()}>
+
+      <div className="cx-input-wrap">
+        <span className="cx-input-icon">
+          <Search size={14} />
+        </span>
+        <input
+          className="cx-input cx-input-mono"
+          value={term}
+          onChange={(e) => onTerm(e.target.value)}
+          placeholder={
+            layer === "pos"
+              ? "POS tag (e.g. NN, VBD, IN)…"
+              : layer === "lemma"
+                ? "lemma (e.g. go, be, run)…"
+                : "term or regex…"
+          }
+          disabled={disabled}
+          spellCheck={false}
+        />
+        <div className="cx-input-suffix">{term && <span>{layer === "pos" ? "exact" : "regex ok"}</span>}</div>
+      </div>
+
+      {filters.map((f) => (
+        <span
+          key={f.key}
+          className="cx-filter-chip is-on"
+          onClick={() => onRemoveFilter(f.key)}
+          role="button"
+          tabIndex={0}
+        >
+          {f.label}
+          <span className="x">
+            <X size={10} />
+          </span>
+        </span>
+      ))}
+      <button type="button" className="cx-filter-chip" title="Add a metadata filter">
+        <Plus size={10} />
+        filter
+      </button>
+
+      <button type="submit" className="cx-btn cx-btn-primary" disabled={disabled || !term.trim()}>
         Run
-      </Button>
+      </button>
+      <button
+        type="button"
+        className="cx-btn cx-btn-outline cx-btn-icon"
+        onClick={onOpenPalette}
+        title="Command palette (⌘K)"
+      >
+        <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--fg-muted)" }}>⌘K</span>
+      </button>
     </form>
   );
 }

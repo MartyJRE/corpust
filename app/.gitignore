@@ -5,6 +5,8 @@ dist-ssr
 .env.*
 !.env.example
 .vite
+.vite-tsbuild
+*.tsbuildinfo
 
 # Tauri
 src-tauri/target

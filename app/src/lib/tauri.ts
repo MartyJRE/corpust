@@ -1,8 +1,8 @@
-// Thin typed wrapper over Tauri's `invoke`. Everything the React side
-// does against the Rust backend goes through these functions — the UI
-// never talks to `@tauri-apps/api/core` directly.
+// Thin typed wrapper over Tauri's `invoke`. Today these are stubs — real
+// implementations land once the commands in app/src-tauri/src/commands.rs
+// are fleshed out. UI code reaches through these fns so swapping fixture
+// data for real IPC is a single-file change.
 
-import { invoke } from "@tauri-apps/api/core";
 import type {
   BuildProgress,
   BuildRequest,
@@ -11,22 +11,26 @@ import type {
   KwicResult,
 } from "@/types";
 
+// Lazy import so calls outside a Tauri runtime (e.g. Storybook) don't crash.
+async function invokeSafe<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<T>(command, args);
+}
+
 export async function listCorpora(): Promise<CorpusMeta[]> {
-  return invoke<CorpusMeta[]>("list_corpora");
+  return invokeSafe<CorpusMeta[]>("list_corpora");
 }
 
 export async function openCorpus(indexPath: string): Promise<CorpusMeta> {
-  return invoke<CorpusMeta>("open_corpus", { indexPath });
+  return invokeSafe<CorpusMeta>("open_corpus", { indexPath });
 }
 
 export async function runKwic(req: KwicRequest): Promise<KwicResult> {
-  return invoke<KwicResult>("run_kwic", { req });
+  return invokeSafe<KwicResult>("run_kwic", { req });
 }
 
 export async function buildIndex(req: BuildRequest): Promise<string> {
-  // Returns a task id; progress events stream via the `build:progress`
-  // event channel.
-  return invoke<string>("build_index", { req });
+  return invokeSafe<string>("build_index", { req });
 }
 
 export type { BuildProgress };
