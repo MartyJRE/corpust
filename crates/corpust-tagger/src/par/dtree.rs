@@ -21,16 +21,32 @@
 //!   ```
 //!   12-byte header (no `node_id`).
 //!
-//! What's **not** decoded:
+//! What's **partially** decoded:
 //!
-//! - The **internal nodes** that encode the tree's splitting
-//!   predicates. Their exact layout and traversal algorithm are still
-//!   unknown (they don't carry the `1` type discriminator leaves and
-//!   default share, and differential training hasn't yet produced a
-//!   corpus that forces non-trivial split values to fall out).
-//! - The ~40 bytes of trie-like data just before the tree region —
-//!   identical across balanced and skewed corpora at the same tagset
-//!   shape, so structural rather than content.
+//! - **Internal nodes are 12 bytes = 3 u32 fields.** Confirmed by
+//!   differential training on minimum 2-tag models:
+//!     ```text
+//!     u32  offset_i         // 1 for cl=1 bigram, 2 for cl=2 trigram
+//!                           // (matches Schmid's `tag_{-i} = t` test)
+//!     u32  tag_id           // the tag t being tested (observed 0..1 on toys)
+//!     u32  branch_info      // pointer/count for traversal — exact
+//!                           //   semantics tbd: differs between cl=1
+//!                           //   (value 0) and cl=2 (value 1) on the
+//!                           //   same 3-node tree topology, so it's
+//!                           //   encoding *something* about traversal
+//!                           //   but not just a simple child offset.
+//!     ```
+//!   The count of internal records and their full traversal algorithm
+//!   still need more work — `english.par`'s 44,692-byte internal blob
+//!   doesn't divide cleanly by 12, so either there are other records
+//!   interleaved (likely) or the internal layout changes with model
+//!   size (less likely but possible).
+//!
+//! - The ~40 bytes of trie-like data just before the tree region on
+//!   toy models — identical across balanced and skewed corpora at the
+//!   same tagset shape, so structural rather than content. English
+//!   models don't have this — their prefix/suffix tries live in the
+//!   preceding 170 KB slab.
 //!
 //! Consequence for the in-process tagger: we can look up
 //! `P(tag | word)` from the lexicon and `P(tag)` from the default,
@@ -73,13 +89,62 @@ pub struct Default {
 }
 
 /// Partial reader output. `raw_internals` is the opaque blob that
-/// encodes the tree structure we haven't decoded yet; kept around so
-/// a future reader pass can crack it without re-loading the file.
+/// encodes the tree structure we haven't fully decoded yet; kept
+/// around so a future reader pass can crack it without re-loading the
+/// file. Partial decode: 12-byte (offset_i, tag_id, branch_info)
+/// records are known to live inside `raw_internals`, but their count
+/// and traversal semantics aren't yet certain.
 #[derive(Debug, Clone)]
 pub struct DecisionTree {
     pub leaves: Vec<Leaf>,
     pub default: Default,
     pub raw_internals: Vec<u8>,
+}
+
+/// A single internal (non-leaf) decision-tree node as we currently
+/// understand it. Parsing is best-effort — the raw `branch_info`
+/// field's semantics are still being pinned down so traversal isn't
+/// yet possible from this record alone.
+#[derive(Debug, Clone, Copy)]
+pub struct Internal {
+    /// Position to test. Schmid's paper calls this `i` in
+    /// `tag_{-i} = t`. Observed values: `1` for bigram-context
+    /// models, `2` for trigram-context.
+    pub offset_i: u32,
+    /// Tag ID being tested.
+    pub tag_id: u32,
+    /// Opaque pointer / count. Differs between tree topologies but
+    /// exact semantics (yes-child offset? subtree size? a bitmap?)
+    /// need more differential data to pin down.
+    pub branch_info: u32,
+}
+
+/// Parse an 8- or 12-byte internal-node record from the given slice.
+///
+/// Returns `Some(node)` if the bytes look like a plausible internal
+/// node (offset_i ∈ {1, 2, 3}, tag_id in range), else `None`. This
+/// is a best-effort heuristic — we can't yet guarantee correctness
+/// of every field, only that the header's shape is right.
+pub fn try_parse_internal(bytes: &[u8], num_tags: u32) -> Option<Internal> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    let offset_i = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let tag_id = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    let branch_info = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    // Sanity: `offset_i` in a standard TreeTagger build is 1, 2, or
+    // 3 (bi-/tri-/quatro-gram context lengths).
+    if offset_i == 0 || offset_i > 3 {
+        return None;
+    }
+    if tag_id >= num_tags {
+        return None;
+    }
+    Some(Internal {
+        offset_i,
+        tag_id,
+        branch_info,
+    })
 }
 
 /// Parse the decision tree from `cur` to the end of the file.
@@ -266,6 +331,45 @@ mod tests {
             .parent()?
             .join("resources/treetagger/lib/english.par");
         candidate.exists().then_some(candidate)
+    }
+
+    #[test]
+    fn parses_known_internal_shape() {
+        // Bytes captured from m_cl1 (2-tag bigram) toy model — the
+        // 12 bytes at file offset 0xdc which precede the only leaf.
+        // Confirms our understanding that offset_i=1 on a bigram
+        // model.
+        let bytes = [
+            0x01, 0x00, 0x00, 0x00, // offset_i = 1 (bigram)
+            0x00, 0x00, 0x00, 0x00, // tag_id = 0
+            0x00, 0x00, 0x00, 0x00, // branch_info = 0
+        ];
+        let node = try_parse_internal(&bytes, 2).unwrap();
+        assert_eq!(node.offset_i, 1);
+        assert_eq!(node.tag_id, 0);
+        assert_eq!(node.branch_info, 0);
+
+        // Bytes from m_cl2 (trigram): offset_i=2, branch_info=1
+        let bytes = [
+            0x02, 0x00, 0x00, 0x00, // offset_i = 2 (trigram)
+            0x00, 0x00, 0x00, 0x00, // tag_id = 0
+            0x01, 0x00, 0x00, 0x00, // branch_info = 1
+        ];
+        let node = try_parse_internal(&bytes, 2).unwrap();
+        assert_eq!(node.offset_i, 2);
+        assert_eq!(node.branch_info, 1);
+    }
+
+    #[test]
+    fn rejects_garbage_as_internal() {
+        // Zeros everywhere: offset_i=0 isn't valid (bigram/trigram/quatrogram only).
+        assert!(try_parse_internal(&[0; 12], 58).is_none());
+        // Huge offset_i.
+        let bytes = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(try_parse_internal(&bytes, 58).is_none());
+        // tag_id out of range.
+        let bytes = [0x01, 0, 0, 0, 0x50, 0, 0, 0, 0, 0, 0, 0];
+        assert!(try_parse_internal(&bytes, 58).is_none());
     }
 
     #[test]
