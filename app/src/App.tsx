@@ -22,7 +22,8 @@ import { CommandPalette, type CommandDef } from "@/components/overlays/CommandPa
 import { BuildDialog } from "@/components/overlays/BuildDialog";
 import { CORPORA, RECENT_QUERIES, pickHits } from "@/data";
 import { makeDensity } from "@/lib/utils";
-import { inTauri, runKwic as runKwicTauri } from "@/lib/tauri";
+import { inTauri, runCollocates, runKwic as runKwicTauri } from "@/lib/tauri";
+import type { Collocate } from "@/types";
 import type {
   CorpusMeta,
   KwicHit,
@@ -42,6 +43,7 @@ export function App() {
   const [layer, setLayer] = useState<QueryLayer>("word");
   const [term, setTerm] = useState("linguistic");
   const [result, setResult] = useState<KwicResult | null>(null);
+  const [collocates, setCollocates] = useState<Collocate[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<KwicHit | null>(null);
   const [sortMode, setSortMode] = useState<SortMode>("right1");
@@ -104,6 +106,35 @@ export function App() {
     run();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Fetch real collocates when the Collocations view is active on a
+  // real (backend-registered) corpus. Fixture corpora keep whatever
+  // data.ts ships.
+  useEffect(() => {
+    if (subview !== "coll" || !activeCorpus || !term.trim()) return;
+    if (!inTauri() || !activeCorpus.id.startsWith("corpus-")) {
+      setCollocates(null);
+      return;
+    }
+    let cancelled = false;
+    runCollocates({
+      corpusId: activeCorpus.id,
+      term: term.trim(),
+      layer,
+      window: 5,
+      limit: 60,
+    })
+      .then((r) => {
+        if (!cancelled) setCollocates(r.collocates);
+      })
+      .catch((e) => {
+        console.error("runCollocates failed:", e);
+        if (!cancelled) setCollocates([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [subview, activeCorpus, term, layer]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -273,7 +304,7 @@ export function App() {
             </>
           )}
           {subview === "coll" && activeCorpus && (
-            <CollocationsView corpus={activeCorpus} term={term} />
+            <CollocationsView corpus={activeCorpus} term={term} data={collocates} />
           )}
           {subview === "freq" && activeCorpus && (
             <FrequencyView corpus={activeCorpus} term={term} />

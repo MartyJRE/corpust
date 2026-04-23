@@ -6,10 +6,27 @@
 import type {
   BuildProgress,
   BuildRequest,
+  Collocate,
   CorpusMeta,
   KwicRequest,
   KwicResult,
+  QueryLayer,
 } from "@/types";
+
+export interface CollocatesRequest {
+  corpusId: string;
+  term: string;
+  layer: QueryLayer;
+  window: number;
+  limit: number;
+}
+
+export interface CollocatesResult {
+  collocates: Collocate[];
+  elapsedMs: number;
+  nodeHits: number;
+  windowTokens: number;
+}
 
 // Lazy import so calls outside a Tauri runtime (e.g. Storybook) don't crash.
 async function invokeSafe<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -27,6 +44,10 @@ export async function openCorpus(indexPath: string): Promise<CorpusMeta> {
 
 export async function runKwic(req: KwicRequest): Promise<KwicResult> {
   return invokeSafe<KwicResult>("run_kwic", { req });
+}
+
+export async function runCollocates(req: CollocatesRequest): Promise<CollocatesResult> {
+  return invokeSafe<CollocatesResult>("run_collocates", { req });
 }
 
 export async function buildIndex(req: BuildRequest): Promise<CorpusMeta> {

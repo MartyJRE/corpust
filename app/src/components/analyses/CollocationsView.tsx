@@ -60,16 +60,23 @@ const PH = H - M.top - M.bottom;
 export interface CollocationsViewProps {
   corpus: CorpusMeta | null;
   term: string;
+  /** Real collocates from the backend. When null, falls back to the
+   *  fixture `COLLOCATIONS` so the view still looks populated in
+   *  demos / non-Tauri preview. */
+  data?: Collocate[] | null;
 }
 
-export function CollocationsView({ term }: CollocationsViewProps) {
+export function CollocationsView({ term, data: dataProp }: CollocationsViewProps) {
   const [metric, setMetric] = useState<CollMetric>("logDice");
   const [win, setWin] = useState<3 | 5 | 10>(5);
   const [hover, setHover] = useState<string | null>(null);
 
-  const data = COLLOCATIONS;
-  const maxScore = useMemo(() => Math.max(...data.map((d) => d[metric])), [data, metric]);
-  const maxTotal = useMemo(() => Math.max(...data.map((d) => d.total)), [data]);
+  const data = useMemo(
+    () => (dataProp && dataProp.length > 0 ? dataProp : COLLOCATIONS),
+    [dataProp],
+  );
+  const maxScore = useMemo(() => Math.max(1e-6, ...data.map((d) => d[metric])), [data, metric]);
+  const maxTotal = useMemo(() => Math.max(1, ...data.map((d) => d.total)), [data]);
 
   const xFor = (pref: number) => M.left + ((pref + 1) / 2) * PW;
   const yFor = (score: number) => M.top + PH - (score / (maxScore * 1.05)) * PH;

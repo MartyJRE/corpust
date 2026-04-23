@@ -43,6 +43,7 @@ pub fn run() {
             commands::list_corpora,
             commands::open_corpus,
             commands::run_kwic,
+            commands::run_collocates,
             commands::build_index,
         ])
         .run(tauri::generate_context!())
@@ -149,6 +150,41 @@ pub struct KwicResult {
     pub hits: Vec<KwicHit>,
     pub elapsed_ms: f64,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollocatesRequest {
+    pub corpus_id: String,
+    pub term: String,
+    pub layer: QueryLayer,
+    /// ±N tokens around the node to consider as the window.
+    pub window: usize,
+    /// Max number of collocate candidates to return.
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Collocate {
+    pub word: String,
+    pub pos: String,
+    pub left_count: u32,
+    pub right_count: u32,
+    pub total: u32,
+    pub log_dice: f64,
+    pub mi: f64,
+    pub z: f64,
+    pub dist: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollocatesResult {
+    pub collocates: Vec<Collocate>,
+    pub elapsed_ms: f64,
+    pub node_hits: u32,
+    pub window_tokens: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]

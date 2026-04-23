@@ -6,8 +6,8 @@
 //! returned `corpusId` / `taskId` handles.
 
 use crate::{
-    AppState, BuildRequest, CorpusMeta, KwicHit as KwicHitDto, KwicRequest, KwicResult,
-    OpenedCorpus, TaggerKind,
+    AppState, BuildRequest, Collocate as CollocateDto, CollocatesRequest, CollocatesResult,
+    CorpusMeta, KwicHit as KwicHitDto, KwicRequest, KwicResult, OpenedCorpus, TaggerKind,
 };
 use corpust_annotate::{Annotator, treetagger::TreeTagger};
 use corpust_index::{CorpusIndex, DEFAULT_CONTEXT};
@@ -107,6 +107,114 @@ pub fn open_corpus(
             },
         );
     Ok(meta)
+}
+
+#[tauri::command]
+pub fn run_collocates(
+    state: State<'_, AppState>,
+    req: CollocatesRequest,
+) -> Result<CollocatesResult, String> {
+    let reg = state.corpora.lock().expect("corpus registry poisoned");
+    let opened = reg
+        .get(&req.corpus_id)
+        .ok_or_else(|| format!("no open corpus with id {}", req.corpus_id))?;
+
+    // Pull a large KWIC result with the caller's window as context,
+    // then aggregate collocates from the left/right strings. For now
+    // we cap at 5000 hits — enough for meaningful collocations on
+    // common terms without blowing up on "the".
+    const HIT_CAP: usize = 5000;
+    let window = req.window.max(1).min(30);
+    let kreq = CoreKwicRequest::new(&req.term)
+        .layer(req.layer.into())
+        .context(window)
+        .limit(HIT_CAP);
+    let t0 = Instant::now();
+    let hits = run_core_kwic(&opened.index, kreq)
+        .map_err(|e| format!("kwic failed: {e:#}"))?;
+
+    // Count word occurrences per side.
+    use std::collections::HashMap;
+    let mut left_counts: HashMap<String, u32> = HashMap::new();
+    let mut right_counts: HashMap<String, u32> = HashMap::new();
+    let mut window_tokens: u32 = 0;
+
+    for h in &hits {
+        for w in tokenize_for_collocates(&h.left) {
+            *left_counts.entry(w.to_owned()).or_default() += 1;
+            window_tokens += 1;
+        }
+        for w in tokenize_for_collocates(&h.right) {
+            *right_counts.entry(w.to_owned()).or_default() += 1;
+            window_tokens += 1;
+        }
+    }
+
+    // Merge sides + rank by total.
+    let mut merged: HashMap<String, (u32, u32)> = HashMap::new();
+    for (w, l) in left_counts {
+        merged.entry(w).or_default().0 = l;
+    }
+    for (w, r) in right_counts {
+        merged.entry(w).or_default().1 = r;
+    }
+    let mut vec: Vec<(String, u32, u32)> = merged
+        .into_iter()
+        .map(|(w, (l, r))| (w, l, r))
+        .collect();
+    vec.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+    vec.truncate(req.limit.max(1).min(200));
+
+    let collocates: Vec<CollocateDto> = vec
+        .into_iter()
+        .map(|(w, l, r)| {
+            let total = l + r;
+            // Placeholder stats until we wire corpus-wide term
+            // frequencies. log2(total+1) gives a monotonic proxy that
+            // spreads the scatter's y-axis readably.
+            let score = ((total + 1) as f64).log2();
+            CollocateDto {
+                word: w,
+                pos: String::new(),
+                left_count: l,
+                right_count: r,
+                total,
+                log_dice: score,
+                mi: score,
+                z: score,
+                dist: 0,
+            }
+        })
+        .collect();
+
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    Ok(CollocatesResult {
+        collocates,
+        elapsed_ms,
+        node_hits: hits.len() as u32,
+        window_tokens,
+    })
+}
+
+/// Split a KWIC context string into collocate candidates.
+/// - whitespace-separated,
+/// - lowercased,
+/// - punctuation-trimmed at ends,
+/// - filter empty/single-char tokens,
+/// - filter pure-digit tokens.
+fn tokenize_for_collocates(s: &str) -> impl Iterator<Item = String> + '_ {
+    s.split_whitespace().filter_map(|tok| {
+        let trimmed: String = tok
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
+        if trimmed.len() < 2 {
+            return None;
+        }
+        if trimmed.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        Some(trimmed)
+    })
 }
 
 #[tauri::command]
