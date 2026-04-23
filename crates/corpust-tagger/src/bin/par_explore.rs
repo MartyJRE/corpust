@@ -9,11 +9,12 @@
 //! Usage:
 //!
 //! ```text
-//! par-explore header <file>
-//! par-explore hex    <file> --from <off> --len <bytes>
-//! par-explore cstrs  <file> --from <off> --count <n>
-//! par-explore u32s   <file> --from <off> --count <n>
-//! par-explore f32s   <file> --from <off> --count <n>
+//! par-explore header     <file>
+//! par-explore hex        <file> --from <off> --len <bytes>
+//! par-explore cstrs      <file> --from <off> --count <n>
+//! par-explore u32s       <file> --from <off> --count <n>
+//! par-explore f32s       <file> --from <off> --count <n>
+//! par-explore dtree-walk <file> --from <off> [--count <n>]
 //! ```
 //!
 //! Offsets and lengths are decimal by default, `0x...` parses as hex.
@@ -54,8 +55,12 @@ fn main() -> Result<()> {
         "cstrs" => dump_cstrs(&bytes, from, count),
         "u32s" => dump_u32s(&bytes, from, count),
         "f32s" => dump_f32s(&bytes, from, count),
+        "dtree-walk" => dump_dtree_walk(&bytes, from, count),
         "" => {
-            eprintln!("usage: par-explore <header|hex|cstrs|u32s|f32s> <file> [--from N] [--len N] [--count N]");
+            eprintln!(
+                "usage: par-explore <header|hex|cstrs|u32s|f32s|dtree-walk> <file> \
+                 [--from N] [--len N] [--count N]"
+            );
             std::process::exit(2);
         }
         other => bail!("unknown subcommand {other}"),
@@ -142,6 +147,101 @@ fn dump_u32s(bytes: &[u8], from: usize, count: usize) -> Result<()> {
         println!(
             "0x{off:08x}  u32 LE = {v:>12}  (i32 = {vi:>12}, hex = 0x{v:08x})"
         );
+    }
+    Ok(())
+}
+
+/// Walk the decision-tree section from `from` and print each record's
+/// kind + key fields in order. Use `--count` to cap output (default
+/// 16). The total record counts per kind are printed at the end so
+/// you can spot-check them against `train-tree-tagger`'s reported
+/// "Number of nodes: K".
+fn dump_dtree_walk(bytes: &[u8], from: usize, count: usize) -> Result<()> {
+    let mut cur = par::Cursor::new(bytes);
+    let header = par::header::read(&mut cur)?;
+    // header::read leaves the cursor just after the tag table, not at
+    // the dtree — reset and advance to the caller-supplied offset.
+    let mut cur = par::Cursor::new(bytes);
+    cur.advance(from)?;
+    let tree = par::dtree::read(&mut cur, &header)?;
+
+    println!(
+        "dtree @ 0x{from:x} ({from}): {} records total",
+        tree.records.len()
+    );
+    let mut section_off = 0usize;
+    for (i, rec) in tree.records.iter().enumerate() {
+        if i >= count {
+            println!("  … (truncated; pass --count {} to see all)", tree.records.len());
+            break;
+        }
+        let file_off = from + section_off;
+        match rec {
+            par::dtree::DTreeRecord::Internal(n) => {
+                println!(
+                    "  [{i:>5}] @ sec+{section_off:>7} / 0x{file_off:08x}  Internal  \
+                     offset_i={:>2}  tag_id={:>3} ({})  branch_info={}",
+                    n.offset_i,
+                    n.tag_id,
+                    header.tag(n.tag_id).unwrap_or("?"),
+                    n.branch_info
+                );
+                section_off += 12;
+            }
+            par::dtree::DTreeRecord::Leaf(l) => {
+                println!(
+                    "  [{i:>5}] @ sec+{section_off:>7} / 0x{file_off:08x}  Leaf     \
+                     node_id={:>6}  weight={:>7}",
+                    l.node_id, l.distribution.weight
+                );
+                section_off += 16 + header.tags.len() * 12;
+            }
+            par::dtree::DTreeRecord::PrunedInternal(p) => {
+                println!(
+                    "  [{i:>5}] @ sec+{section_off:>7} / 0x{file_off:08x}  PrunedInt \
+                     weight={:>7}",
+                    p.distribution.weight
+                );
+                section_off += 12 + header.tags.len() * 12;
+            }
+            par::dtree::DTreeRecord::Default(d) => {
+                println!(
+                    "  [{i:>5}] @ sec+{section_off:>7} / 0x{file_off:08x}  Default  \
+                     weight={:>7}  (EOF)",
+                    d.distribution.weight
+                );
+                section_off += 12 + header.tags.len() * 12;
+            }
+        }
+    }
+    let c = tree.kind_counts();
+    println!();
+    println!(
+        "summary: {} internals, {} leaves, {} pruned-internals, {} defaults",
+        c.internals, c.leaves, c.pruned_internals, c.defaults
+    );
+    // Break down the 12-byte Internal records by their first two
+    // u32s — sub-task 2 needs to know how `offset_i` and `tag_id`
+    // co-vary (the plan's toy models saw `offset_i ∈ {1,2,3}` but
+    // `english.par` shows a different pattern), plus `branch_info`'s
+    // range, to pick which corpus to train a toy against.
+    use std::collections::BTreeMap;
+    let mut by_header: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+    let mut branch_min = u32::MAX;
+    let mut branch_max = u32::MIN;
+    for n in tree.internals() {
+        *by_header.entry((n.offset_i, n.tag_id)).or_insert(0) += 1;
+        branch_min = branch_min.min(n.branch_info);
+        branch_max = branch_max.max(n.branch_info);
+    }
+    print!("internals by (offset_i, tag_id): ");
+    let parts: Vec<String> = by_header
+        .iter()
+        .map(|((o, t), c)| format!("({o},{t})={c}"))
+        .collect();
+    println!("{}", parts.join(", "));
+    if !by_header.is_empty() {
+        println!("branch_info range: {branch_min}..={branch_max}");
     }
     Ok(())
 }

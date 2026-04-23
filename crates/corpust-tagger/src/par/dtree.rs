@@ -1,243 +1,402 @@
-//! `.par` decision-tree section — partial reader.
+//! `.par` decision-tree section — forward walker with typed records.
 //!
-//! What's decoded (from differential training on toy models +
-//! hex-dump inspection on `english.par`):
+//! Differential-training archaeology (see the pure-Rust TreeTagger
+//! plan, *Section 4*) has pinned down **four** record shapes that
+//! appear in this section. This reader walks the section in file
+//! order, labels each record by kind, and fails loudly on anything
+//! that doesn't match one of the four known shapes — that failure
+//! mode is a feature: it exposes any fifth kind the next time we
+//! meet one.
 //!
-//! - **Leaf record** (64 bytes on N=3, 720 bytes on N=58):
-//!   ```text
-//!   u32  node_id             // identifies which tree path leads here
-//!   u32  1                   // type discriminator: 1 = leaf
-//!   u32  num_tags
-//!   u32  weight              // training sample count reaching this leaf
-//!   [u32 tag_id, f64 prob] × num_tags   -- sums to 1.0
-//!   ```
+//! ```text
+//! kind                    | total bytes (N=num_tags)   | header layout
+//! ------------------------|----------------------------|-----------------------------
+//! Internal                | 12                         | [offset_i, tag_id, branch_info]
+//! Leaf                    | 16 + N*12                  | [node_id, 1, N, weight]
+//! PrunedInternal          | 12 + N*12                  | [1, N, weight]
+//! Default (always last)   | 12 + N*12                  | [1, N, weight]
+//! ```
 //!
-//! - **Default fallback** (always last in the decision-tree section):
-//!   ```text
-//!   u32  1                   // type discriminator: 1 = default
-//!   u32  num_tags
-//!   u32  weight
-//!   [u32 tag_id, f64 prob] × num_tags   -- P(tag) unconditional
-//!   ```
-//!   12-byte header (no `node_id`).
+//! Distribution payload (Leaf / PrunedInternal / Default) is always
+//! `N × (u32 tag_id, f64 prob)` records with `tag_id == index` and
+//! probabilities summing to `~1.0`.
 //!
-//! What's **partially** decoded:
+//! Note: **PrunedInternal and Default share a binary layout.** An
+//! earlier plan draft said PrunedInternal had a `[1, N, weight, 0]`
+//! header (16 bytes); the trailing `0` was actually `tag_id=0` of the
+//! first distribution record. They're distinguished purely by
+//! position — the Default is always the record flush with EOF.
 //!
-//! - **Internal nodes are 12 bytes = 3 u32 fields.** Confirmed by
-//!   differential training on minimum 2-tag models:
-//!     ```text
-//!     u32  offset_i         // 1 for cl=1 bigram, 2 for cl=2 trigram
-//!                           // (matches Schmid's `tag_{-i} = t` test)
-//!     u32  tag_id           // the tag t being tested (observed 0..1 on toys)
-//!     u32  branch_info      // pointer/count for traversal — exact
-//!                           //   semantics tbd: differs between cl=1
-//!                           //   (value 0) and cl=2 (value 1) on the
-//!                           //   same 3-node tree topology, so it's
-//!                           //   encoding *something* about traversal
-//!                           //   but not just a simple child offset.
-//!     ```
-//!   The count of internal records and their full traversal algorithm
-//!   still need more work — `english.par`'s 44,692-byte internal blob
-//!   doesn't divide cleanly by 12, so either there are other records
-//!   interleaved (likely) or the internal layout changes with model
-//!   size (less likely but possible).
+//! Disambiguation order at each cursor position `p`:
 //!
-//! - The ~40 bytes of trie-like data just before the tree region on
-//!   toy models — identical across balanced and skewed corpora at the
-//!   same tagset shape, so structural rather than content. English
-//!   models don't have this — their prefix/suffix tries live in the
-//!   preceding 170 KB slab.
+//! 1. If `p == len - (12 + N*12)` AND header starts with `[1, N, _]`
+//!    AND the N following distribution records validate → **Default**.
+//! 2. If `u32[p+4] == 1` AND `u32[p+8] == N` AND the distribution at
+//!    `p+16` validates → **Leaf**. The distribution sum-to-1.0 check
+//!    is the strong test; the header shape alone isn't enough to rule
+//!    out coincidence.
+//! 3. If `u32[p] == 1` AND `u32[p+4] == N` AND the distribution at
+//!    `p+12` validates → **PrunedInternal**.
+//! 4. Else if `u32[p] ∈ {0,1,2,3}` AND `u32[p+4] < N` → **Internal**.
+//!    `offset_i = 0` is observed on `english.par` — interspersed
+//!    between Leaf/PrunedInternal records — so it's treated as a
+//!    valid internal even though Schmid '94 §3 only references
+//!    `i ∈ {1,2}`. Interpretation is unresolved (may be a
+//!    root-pointer sentinel or a child-skip marker).
+//! 5. Else bail with the offset and nearby bytes, so follow-up
+//!    archaeology has somewhere concrete to start.
 //!
-//! Consequence for the in-process tagger: we can look up
-//! `P(tag | word)` from the lexicon and `P(tag)` from the default,
-//! but we can't route a context tag pair to its specific leaf. A
-//! Viterbi built on this partial decode would use the default
-//! distribution uniformly as the context-probability estimate — a
-//! known-degraded model that sets a floor for accuracy before full
-//! tree traversal lands.
+//! Consumers get [`DecisionTree::records`] in order so they can
+//! reconstruct tree topology later (preorder DFS with yes-child
+//! implied by position, no-child pointer carried in `branch_info`)
+//! once we've pinned down `branch_info` semantics in sub-task 2.
+//!
+//! Open question from this pass: on `english.par` the walker finds
+//! **exactly one** `node_id`-headed ([`Leaf`]) record — at section
+//! offset 0 — and 782 `PrunedInternal` records. That's suggestive
+//! that what we're calling `Leaf` is really "the record with an
+//! explicit node_id" (plausibly the tree root) rather than every
+//! terminal node. All the actual distribution-carrying nodes use
+//! the `[1, N, weight]` format we're labelling `PrunedInternal`.
+//! The kind name is kept for continuity with the plan's taxonomy;
+//! sub-task 3 (traversal) will resolve what each kind really
+//! represents semantically.
 
 use super::Cursor;
 use super::header::Header;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// One tag with its probability.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagProb {
     pub tag_id: u32,
     pub prob: f64,
 }
 
-/// Decision-tree leaf — a full `P(tag | context)` distribution plus
-/// the node id that identifies its context path.
+/// Distribution payload shared by Leaf / PrunedInternal / Default.
+#[derive(Debug, Clone)]
+pub struct Distribution {
+    /// Training sample count reaching this node.
+    pub weight: u32,
+    /// `P(tag | this node's context)`. `probs[k].tag_id == k`;
+    /// entries sum to `~1.0`.
+    pub probs: Vec<TagProb>,
+}
+
+/// 12-byte record between/around distribution records in the dtree
+/// section. Field names here reflect the plan's working hypothesis
+/// (`[offset_i, tag_id, branch_info]` = Schmid's `tag_{-i}=t` test),
+/// **but current `english.par` evidence contradicts that reading**:
 ///
-/// We don't yet know how to *reach* a specific leaf from a context
-/// tag pair, so in the partial reader these are kept as a flat list
-/// primarily for accounting and future use.
-#[derive(Debug, Clone)]
-pub struct Leaf {
-    pub node_id: u32,
-    pub weight: u32,
-    pub distribution: Vec<TagProb>,
-}
-
-/// Default distribution — always present, used as the fallback when
-/// the decision tree doesn't yield a specific leaf.
-#[derive(Debug, Clone)]
-pub struct Default {
-    pub weight: u32,
-    pub distribution: Vec<TagProb>,
-}
-
-/// Partial reader output. `raw_internals` is the opaque blob that
-/// encodes the tree structure we haven't fully decoded yet; kept
-/// around so a future reader pass can crack it without re-loading the
-/// file. Partial decode: 12-byte (offset_i, tag_id, branch_info)
-/// records are known to live inside `raw_internals`, but their count
-/// and traversal semantics aren't yet certain.
-#[derive(Debug, Clone)]
-pub struct DecisionTree {
-    pub leaves: Vec<Leaf>,
-    pub default: Default,
-    pub raw_internals: Vec<u8>,
-}
-
-/// A single internal (non-leaf) decision-tree node as we currently
-/// understand it. Parsing is best-effort — the raw `branch_info`
-/// field's semantics are still being pinned down so traversal isn't
-/// yet possible from this record alone.
+/// - `offset_i` is always `0` across all 781 records.
+/// - `tag_id` takes two values: `0` (724 records) and `1` (57 records).
+/// - `branch_info` ranges over all 58 tag IDs (min 0, max 57).
+///
+/// That's a very different structural signature from what toy-model
+/// archaeology saw (varying `offset_i` in `{1,2}`, etc.). The
+/// `english.par` internals look more like a *different* record kind
+/// that my walker is treating as the same — possibly a tree-edge
+/// index record or a leaf-pointer — whereas genuine Schmid-style
+/// `tag_{-i}=t` tests might live in a different section entirely.
+/// Keeping the old names here for continuity with the plan's doc;
+/// sub-task 2 will rename once we've confirmed the interpretation
+/// with toy-model differentials.
 #[derive(Debug, Clone, Copy)]
 pub struct Internal {
-    /// Position to test. Schmid's paper calls this `i` in
-    /// `tag_{-i} = t`. Observed values: `1` for bigram-context
-    /// models, `2` for trigram-context.
+    /// `u32[0]` of the 12-byte record. Observed always `0` on
+    /// `english.par`; toy-model tests (prior archaeology) saw values
+    /// `1` and `2` — the discrepancy is the open question for
+    /// sub-task 2.
     pub offset_i: u32,
-    /// Tag ID being tested.
+    /// `u32[4]` of the 12-byte record. Always `0` on `english.par`.
     pub tag_id: u32,
-    /// Opaque pointer / count. Differs between tree topologies but
-    /// exact semantics (yes-child offset? subtree size? a bitmap?)
-    /// need more differential data to pin down.
+    /// `u32[8]` of the 12-byte record. On `english.par` this takes
+    /// values in `0..num_tags` — looks like an actual tag ID.
     pub branch_info: u32,
 }
 
-/// Parse an 8- or 12-byte internal-node record from the given slice.
-///
-/// Returns `Some(node)` if the bytes look like a plausible internal
-/// node (offset_i ∈ {1, 2, 3}, tag_id in range), else `None`. This
-/// is a best-effort heuristic — we can't yet guarantee correctness
-/// of every field, only that the header's shape is right.
-pub fn try_parse_internal(bytes: &[u8], num_tags: u32) -> Option<Internal> {
-    if bytes.len() < 12 {
-        return None;
-    }
-    let offset_i = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
-    let tag_id = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
-    let branch_info = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
-    // Sanity: `offset_i` in a standard TreeTagger build is 1, 2, or
-    // 3 (bi-/tri-/quatro-gram context lengths).
-    if offset_i == 0 || offset_i > 3 {
-        return None;
-    }
-    if tag_id >= num_tags {
-        return None;
-    }
-    Some(Internal {
-        offset_i,
-        tag_id,
-        branch_info,
-    })
+/// Decision-tree leaf — `P(tag | context)` at a terminal node.
+#[derive(Debug, Clone)]
+pub struct Leaf {
+    /// Identifies which tree path reaches this leaf. Consumers don't
+    /// have a way to resolve this to a path yet (see sub-task 3) so
+    /// it's preserved verbatim.
+    pub node_id: u32,
+    pub distribution: Distribution,
 }
 
-/// Parse the decision tree from `cur` to the end of the file.
+/// Collapsed-subtree distribution — a branch that used to have
+/// children but got pruned (all children were leaves, gain below
+/// threshold; see Schmid '94 §3.2). Kept in the file to avoid
+/// recomputing its probability vector at inference time.
+#[derive(Debug, Clone)]
+pub struct PrunedInternal {
+    pub distribution: Distribution,
+}
+
+/// Unconditional `P(tag)` fallback. Always the last record in the
+/// section.
+#[derive(Debug, Clone)]
+pub struct Default {
+    pub distribution: Distribution,
+}
+
+/// One record from the decision-tree section, tagged by kind so
+/// downstream code can tell leaves apart from pruned-internal
+/// distributions (both 16+N*12 byte; previous reader fused them).
+#[derive(Debug, Clone)]
+pub enum DTreeRecord {
+    Internal(Internal),
+    Leaf(Leaf),
+    PrunedInternal(PrunedInternal),
+    Default(Default),
+}
+
+/// Just the variant tag of a [`DTreeRecord`]. Used for counting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DTreeKind {
+    Internal,
+    Leaf,
+    PrunedInternal,
+    Default,
+}
+
+impl DTreeRecord {
+    pub fn kind(&self) -> DTreeKind {
+        match self {
+            DTreeRecord::Internal(_) => DTreeKind::Internal,
+            DTreeRecord::Leaf(_) => DTreeKind::Leaf,
+            DTreeRecord::PrunedInternal(_) => DTreeKind::PrunedInternal,
+            DTreeRecord::Default(_) => DTreeKind::Default,
+        }
+    }
+}
+
+/// Per-kind record counts. Useful for sanity checks against what
+/// `train-tree-tagger` reports ("Number of nodes: K").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KindCounts {
+    pub internals: usize,
+    pub leaves: usize,
+    pub pruned_internals: usize,
+    pub defaults: usize,
+}
+
+/// Parsed decision tree — records in file order.
 ///
-/// Strategy:
-/// 1. Locate the **default** by scanning backward from EOF for the
-///    `[1, num_tags, weight]` header that precedes `num_tags` valid
-///    `(tag_id, prob)` records summing to `~1.0`.
-/// 2. Locate **leaves** by scanning forward from `cur` for
-///    `[node_id, 1, num_tags, weight]` headers followed by valid
-///    distributions.
-/// 3. Everything between the cursor start, the leaf headers, and the
-///    default is stashed into `raw_internals` verbatim.
+/// Construction is via [`read`]. The tree structure itself (root
+/// pointer, child links, traversal) isn't wired up yet — that's the
+/// next sub-task once `branch_info` semantics are known.
+#[derive(Debug, Clone)]
+pub struct DecisionTree {
+    /// Every record in the order it appeared in the file.
+    pub records: Vec<DTreeRecord>,
+}
+
+impl DecisionTree {
+    pub fn kind_counts(&self) -> KindCounts {
+        let mut c = KindCounts::default();
+        for r in &self.records {
+            match r.kind() {
+                DTreeKind::Internal => c.internals += 1,
+                DTreeKind::Leaf => c.leaves += 1,
+                DTreeKind::PrunedInternal => c.pruned_internals += 1,
+                DTreeKind::Default => c.defaults += 1,
+            }
+        }
+        c
+    }
+
+    /// The unconditional fallback distribution. Always the last
+    /// record when a tree is parsed successfully, so this is
+    /// infallible on any `DecisionTree` built by [`read`].
+    pub fn default(&self) -> &Default {
+        match self.records.last() {
+            Some(DTreeRecord::Default(d)) => d,
+            _ => unreachable!("read() enforces a trailing Default"),
+        }
+    }
+
+    pub fn leaves(&self) -> impl Iterator<Item = &Leaf> + '_ {
+        self.records.iter().filter_map(|r| match r {
+            DTreeRecord::Leaf(l) => Some(l),
+            _ => None,
+        })
+    }
+
+    pub fn internals(&self) -> impl Iterator<Item = &Internal> + '_ {
+        self.records.iter().filter_map(|r| match r {
+            DTreeRecord::Internal(i) => Some(i),
+            _ => None,
+        })
+    }
+
+    pub fn pruned_internals(&self) -> impl Iterator<Item = &PrunedInternal> + '_ {
+        self.records.iter().filter_map(|r| match r {
+            DTreeRecord::PrunedInternal(p) => Some(p),
+            _ => None,
+        })
+    }
+}
+
+/// Parse the decision-tree section from `cur` to EOF.
+///
+/// See the module docstring for the record-kind disambiguation order.
 pub fn read(cur: &mut Cursor<'_>, header: &Header) -> Result<DecisionTree> {
     let data = cur.bytes_after_cursor();
-    let num_tags = header.tags.len() as u32;
+    let n = header.tags.len() as u32;
+    let n_us = n as usize;
+    let len = data.len();
+    let dist_bytes = n_us * 12;
+    let leaf_size = 16 + dist_bytes;
+    let default_size = 12 + dist_bytes;
 
-    let default_off = find_default_start(data, num_tags)
-        .context("could not locate decision-tree default distribution near EOF")?;
+    if len < default_size {
+        bail!(
+            "decision-tree section is {} bytes — too short to hold a \
+             {}-tag default ({} bytes)",
+            len,
+            n,
+            default_size
+        );
+    }
+    let default_start = len - default_size;
 
-    let leaves = find_leaves(&data[..default_off], num_tags);
+    let mut records = Vec::new();
+    let mut p = 0usize;
 
-    // Build raw_internals from the gaps: before first leaf, between
-    // consecutive leaves, and between last leaf and default.
-    let mut raw_internals = Vec::new();
-    let mut pos = 0usize;
-    let leaf_size = 16 + (num_tags as usize) * 12;
-    let mut sorted_leaves: Vec<_> = leaves.iter().map(|(o, _)| *o).collect();
-    sorted_leaves.sort();
-    for &off in &sorted_leaves {
-        if off > pos {
-            raw_internals.extend_from_slice(&data[pos..off]);
+    while p < len {
+        // 1. Default — only legal at the exact trailing offset.
+        if p == default_start
+            && u32_at(data, p) == Some(1)
+            && u32_at(data, p + 4) == Some(n)
+            && distribution_valid(data, p + 12, n_us)
+        {
+            let weight = u32_at(data, p + 8).unwrap();
+            let probs = read_distribution_probs(data, p + 12, n_us);
+            records.push(DTreeRecord::Default(Default {
+                distribution: Distribution { weight, probs },
+            }));
+            p = len;
+            continue;
         }
-        pos = off + leaf_size;
+
+        // 2. Leaf — [node_id, 1, N, weight] + distribution.
+        if p + leaf_size <= len
+            && u32_at(data, p + 4) == Some(1)
+            && u32_at(data, p + 8) == Some(n)
+            && distribution_valid(data, p + 16, n_us)
+        {
+            let node_id = u32_at(data, p).unwrap();
+            let weight = u32_at(data, p + 12).unwrap();
+            let probs = read_distribution_probs(data, p + 16, n_us);
+            records.push(DTreeRecord::Leaf(Leaf {
+                node_id,
+                distribution: Distribution { weight, probs },
+            }));
+            p += leaf_size;
+            continue;
+        }
+
+        // 3. PrunedInternal — [1, N, weight] + distribution. Same
+        // binary layout as Default; distinguished by position (Default
+        // only fires at EOF, checked in step 1 above).
+        if p + default_size <= len
+            && u32_at(data, p) == Some(1)
+            && u32_at(data, p + 4) == Some(n)
+            && distribution_valid(data, p + 12, n_us)
+        {
+            let weight = u32_at(data, p + 8).unwrap();
+            let probs = read_distribution_probs(data, p + 12, n_us);
+            records.push(DTreeRecord::PrunedInternal(PrunedInternal {
+                distribution: Distribution { weight, probs },
+            }));
+            p += default_size;
+            continue;
+        }
+
+        // 4. Internal — 12 bytes, [offset_i ∈ {0,1,2,3}, tag_id < N, branch_info].
+        if p + 12 <= len {
+            let offset_i = u32_at(data, p).unwrap();
+            let tag_id = u32_at(data, p + 4).unwrap();
+            if matches!(offset_i, 0 | 1 | 2 | 3) && tag_id < n {
+                let branch_info = u32_at(data, p + 8).unwrap();
+                records.push(DTreeRecord::Internal(Internal {
+                    offset_i,
+                    tag_id,
+                    branch_info,
+                }));
+                p += 12;
+                continue;
+            }
+        }
+
+        // None of the four known kinds fit — stop here so the next
+        // archaeology session has a concrete offset to look at.
+        let preview = preview_bytes(data, p, 32);
+        bail!(
+            "unrecognized decision-tree record at section-offset {p} \
+             (remaining={}); next 32 bytes = {preview}",
+            len - p
+        );
     }
-    if default_off > pos {
-        raw_internals.extend_from_slice(&data[pos..default_off]);
+
+    if !matches!(records.last(), Some(DTreeRecord::Default(_))) {
+        bail!(
+            "decision tree didn't terminate with a Default record \
+             (last kind: {:?})",
+            records.last().map(|r| r.kind())
+        );
     }
 
-    let default = parse_default(data, default_off, num_tags)?;
-
-    let leaves: Vec<Leaf> = leaves
-        .into_iter()
-        .map(|(_, leaf)| leaf)
-        .collect();
-
-    // Advance cursor to EOF — the decision tree is the last section.
-    cur.advance(data.len())
+    cur.advance(len)
         .context("advancing cursor to EOF after decision tree")?;
 
-    Ok(DecisionTree {
-        leaves,
-        default,
-        raw_internals,
-    })
+    Ok(DecisionTree { records })
 }
 
-fn find_default_start(data: &[u8], num_tags: u32) -> Option<usize> {
-    let default_size = 12 + (num_tags as usize) * 12;
-    if data.len() < default_size {
-        return None;
-    }
-    // Walk candidate starts at 4-byte strides from the latest
-    // possible position. Pick the one whose records parse and sum
-    // close to 1.0.
-    let latest = data.len() - default_size;
-    for off in (0..=latest).rev().step_by(4) {
-        if valid_default_at(data, off, num_tags) {
-            return Some(off);
-        }
-    }
-    None
+fn u32_at(data: &[u8], off: usize) -> Option<u32> {
+    let slice = data.get(off..off + 4)?;
+    Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
-fn valid_default_at(data: &[u8], off: usize, num_tags: u32) -> bool {
-    if off + 12 + (num_tags as usize) * 12 > data.len() {
-        return false;
-    }
-    let flag = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-    let n = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
-    let _weight = u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap());
-    if flag != 1 || n != num_tags {
+fn f64_at(data: &[u8], off: usize) -> Option<f64> {
+    let slice = data.get(off..off + 8)?;
+    let bits = u64::from_le_bytes([
+        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+    ]);
+    Some(f64::from_bits(bits))
+}
+
+/// Does `num_tags` records of `(u32 tag_id, f64 prob)` at `off`
+/// form a valid distribution? The test is:
+///
+/// - `tag_id == k` for k in `0..num_tags`
+/// - every `prob` is finite and in `[-1e-9, 1]` (allowing tiny
+///   negative noise from f64 rounding, but nothing far off)
+/// - probs sum to `1.0 ± 1e-5`
+///
+/// This is strong enough that random-looking file bytes have
+/// essentially zero probability of passing — the tag-id ascending
+/// constraint alone rejects almost everything, and the sum-to-1
+/// constraint catches the rest.
+fn distribution_valid(data: &[u8], off: usize, num_tags: usize) -> bool {
+    if off + num_tags * 12 > data.len() {
         return false;
     }
     let mut sum = 0.0f64;
-    for k in 0..num_tags as usize {
-        let rec = off + 12 + k * 12;
-        let tag = u32::from_le_bytes(data[rec..rec + 4].try_into().unwrap());
+    for k in 0..num_tags {
+        let rec = off + k * 12;
+        let Some(tag) = u32_at(data, rec) else {
+            return false;
+        };
         if tag != k as u32 {
             return false;
         }
-        let prob = f64::from_le_bytes(data[rec + 4..rec + 12].try_into().unwrap());
-        if !prob.is_finite() || prob < -1e-9 {
+        let Some(prob) = f64_at(data, rec + 4) else {
+            return false;
+        };
+        if !prob.is_finite() || prob < -1e-9 || prob > 1.0 + 1e-6 {
             return false;
         }
         sum += prob;
@@ -245,79 +404,30 @@ fn valid_default_at(data: &[u8], off: usize, num_tags: u32) -> bool {
     (sum - 1.0).abs() < 1e-5
 }
 
-fn parse_default(data: &[u8], off: usize, num_tags: u32) -> Result<Default> {
-    let weight = u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap());
-    let distribution = (0..num_tags as usize)
+fn read_distribution_probs(data: &[u8], off: usize, num_tags: usize) -> Vec<TagProb> {
+    (0..num_tags)
         .map(|k| {
-            let rec = off + 12 + k * 12;
-            let tag = u32::from_le_bytes(data[rec..rec + 4].try_into().unwrap());
-            let prob = f64::from_le_bytes(data[rec + 4..rec + 12].try_into().unwrap());
-            TagProb { tag_id: tag, prob }
+            let rec = off + k * 12;
+            TagProb {
+                tag_id: u32_at(data, rec).unwrap(),
+                prob: f64_at(data, rec + 4).unwrap(),
+            }
         })
-        .collect();
-    Ok(Default { weight, distribution })
+        .collect()
 }
 
-fn find_leaves(data: &[u8], num_tags: u32) -> Vec<(usize, Leaf)> {
-    let leaf_size = 16 + (num_tags as usize) * 12;
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i + leaf_size <= data.len() {
-        if valid_leaf_at(data, i, num_tags) {
-            let leaf = parse_leaf(data, i, num_tags);
-            out.push((i, leaf));
-            // Jump past — leaves don't overlap.
-            i += leaf_size;
-        } else {
-            i += 4;
+fn preview_bytes(data: &[u8], off: usize, len: usize) -> String {
+    let end = (off + len).min(data.len());
+    let bytes = &data[off..end];
+    let mut s = String::with_capacity(bytes.len() * 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
         }
+        use std::fmt::Write as _;
+        write!(&mut s, "{b:02x}").unwrap();
     }
-    out
-}
-
-fn valid_leaf_at(data: &[u8], off: usize, num_tags: u32) -> bool {
-    if off + 16 + (num_tags as usize) * 12 > data.len() {
-        return false;
-    }
-    let _node_id = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-    let flag = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
-    let n = u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap());
-    let _weight = u32::from_le_bytes(data[off + 12..off + 16].try_into().unwrap());
-    if flag != 1 || n != num_tags {
-        return false;
-    }
-    let mut sum = 0.0f64;
-    for k in 0..num_tags as usize {
-        let rec = off + 16 + k * 12;
-        let tag = u32::from_le_bytes(data[rec..rec + 4].try_into().unwrap());
-        if tag != k as u32 {
-            return false;
-        }
-        let prob = f64::from_le_bytes(data[rec + 4..rec + 12].try_into().unwrap());
-        if !prob.is_finite() || prob < -1e-9 {
-            return false;
-        }
-        sum += prob;
-    }
-    (sum - 1.0).abs() < 1e-5
-}
-
-fn parse_leaf(data: &[u8], off: usize, num_tags: u32) -> Leaf {
-    let node_id = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-    let weight = u32::from_le_bytes(data[off + 12..off + 16].try_into().unwrap());
-    let distribution = (0..num_tags as usize)
-        .map(|k| {
-            let rec = off + 16 + k * 12;
-            let tag = u32::from_le_bytes(data[rec..rec + 4].try_into().unwrap());
-            let prob = f64::from_le_bytes(data[rec + 4..rec + 12].try_into().unwrap());
-            TagProb { tag_id: tag, prob }
-        })
-        .collect();
-    Leaf {
-        node_id,
-        weight,
-        distribution,
-    }
+    s
 }
 
 #[cfg(test)]
@@ -333,60 +443,192 @@ mod tests {
         candidate.exists().then_some(candidate)
     }
 
-    #[test]
-    fn parses_known_internal_shape() {
-        // Bytes captured from m_cl1 (2-tag bigram) toy model — the
-        // 12 bytes at file offset 0xdc which precede the only leaf.
-        // Confirms our understanding that offset_i=1 on a bigram
-        // model.
-        let bytes = [
-            0x01, 0x00, 0x00, 0x00, // offset_i = 1 (bigram)
-            0x00, 0x00, 0x00, 0x00, // tag_id = 0
-            0x00, 0x00, 0x00, 0x00, // branch_info = 0
-        ];
-        let node = try_parse_internal(&bytes, 2).unwrap();
-        assert_eq!(node.offset_i, 1);
-        assert_eq!(node.tag_id, 0);
-        assert_eq!(node.branch_info, 0);
-
-        // Bytes from m_cl2 (trigram): offset_i=2, branch_info=1
-        let bytes = [
-            0x02, 0x00, 0x00, 0x00, // offset_i = 2 (trigram)
-            0x00, 0x00, 0x00, 0x00, // tag_id = 0
-            0x01, 0x00, 0x00, 0x00, // branch_info = 1
-        ];
-        let node = try_parse_internal(&bytes, 2).unwrap();
-        assert_eq!(node.offset_i, 2);
-        assert_eq!(node.branch_info, 1);
+    /// Build a synthetic in-memory distribution payload: N records of
+    /// `(tag_id, prob)` that validate as a distribution.
+    fn synth_distribution(num_tags: u32) -> Vec<u8> {
+        let n = num_tags as usize;
+        let prob = 1.0f64 / n as f64;
+        let mut out = Vec::with_capacity(n * 12);
+        for k in 0..num_tags {
+            out.extend_from_slice(&k.to_le_bytes());
+            out.extend_from_slice(&prob.to_le_bytes());
+        }
+        out
     }
 
-    #[test]
-    fn rejects_garbage_as_internal() {
-        // Zeros everywhere: offset_i=0 isn't valid (bigram/trigram/quatrogram only).
-        assert!(try_parse_internal(&[0; 12], 58).is_none());
-        // Huge offset_i.
-        let bytes = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert!(try_parse_internal(&bytes, 58).is_none());
-        // tag_id out of range.
-        let bytes = [0x01, 0, 0, 0, 0x50, 0, 0, 0, 0, 0, 0, 0];
-        assert!(try_parse_internal(&bytes, 58).is_none());
+    fn synth_leaf(node_id: u32, num_tags: u32, weight: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&node_id.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&num_tags.to_le_bytes());
+        out.extend_from_slice(&weight.to_le_bytes());
+        out.extend_from_slice(&synth_distribution(num_tags));
+        out
     }
 
+    fn synth_pruned(num_tags: u32, weight: u32) -> Vec<u8> {
+        // PrunedInternal and Default share the same layout:
+        // [1, N, weight] + distribution.
+        let mut out = Vec::new();
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&num_tags.to_le_bytes());
+        out.extend_from_slice(&weight.to_le_bytes());
+        out.extend_from_slice(&synth_distribution(num_tags));
+        out
+    }
+
+    fn synth_internal(offset_i: u32, tag_id: u32, branch_info: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&offset_i.to_le_bytes());
+        out.extend_from_slice(&tag_id.to_le_bytes());
+        out.extend_from_slice(&branch_info.to_le_bytes());
+        out
+    }
+
+    fn synth_default(num_tags: u32, weight: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&num_tags.to_le_bytes());
+        out.extend_from_slice(&weight.to_le_bytes());
+        out.extend_from_slice(&synth_distribution(num_tags));
+        out
+    }
+
+    fn stub_header(num_tags: u32) -> Header {
+        Header {
+            field_a: 0,
+            field_b: 0,
+            sent_tag_index: 0,
+            tags: (0..num_tags).map(|i| format!("T{i}")).collect(),
+            end_offset: 0,
+        }
+    }
+
+    /// Walker round-trips every kind on a hand-assembled section.
+    #[test]
+    fn walks_all_four_kinds_in_order() {
+        let n = 3u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&synth_internal(2, 1, 42));
+        bytes.extend_from_slice(&synth_leaf(7, n, 10));
+        bytes.extend_from_slice(&synth_internal(1, 0, 99));
+        bytes.extend_from_slice(&synth_pruned(n, 20));
+        bytes.extend_from_slice(&synth_leaf(8, n, 15));
+        bytes.extend_from_slice(&synth_default(n, 100));
+
+        let header = stub_header(n);
+        let mut cur = Cursor::new(&bytes);
+        let tree = read(&mut cur, &header).unwrap();
+
+        let kinds: Vec<_> = tree.records.iter().map(|r| r.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                DTreeKind::Internal,
+                DTreeKind::Leaf,
+                DTreeKind::Internal,
+                DTreeKind::PrunedInternal,
+                DTreeKind::Leaf,
+                DTreeKind::Default,
+            ]
+        );
+
+        let counts = tree.kind_counts();
+        assert_eq!(counts.internals, 2);
+        assert_eq!(counts.leaves, 2);
+        assert_eq!(counts.pruned_internals, 1);
+        assert_eq!(counts.defaults, 1);
+
+        // Internal fields round-trip.
+        let first_internal = tree.internals().next().unwrap();
+        assert_eq!(first_internal.offset_i, 2);
+        assert_eq!(first_internal.tag_id, 1);
+        assert_eq!(first_internal.branch_info, 42);
+
+        // Leaf node_id round-trips.
+        let first_leaf = tree.leaves().next().unwrap();
+        assert_eq!(first_leaf.node_id, 7);
+        assert_eq!(first_leaf.distribution.weight, 10);
+
+        // Default accessor works.
+        assert_eq!(tree.default().distribution.weight, 100);
+    }
+
+    /// A minimal `.par` tail of just a default record parses.
+    #[test]
+    fn walks_default_only() {
+        let n = 3u32;
+        let bytes = synth_default(n, 55);
+        let header = stub_header(n);
+        let mut cur = Cursor::new(&bytes);
+        let tree = read(&mut cur, &header).unwrap();
+        assert_eq!(tree.records.len(), 1);
+        assert!(matches!(tree.records[0], DTreeRecord::Default(_)));
+    }
+
+    /// Bytes that don't look like any of the four kinds bail with a
+    /// useful error pointing at the offset.
+    #[test]
+    fn rejects_unrecognized_shape() {
+        let n = 3u32;
+        // 12 bytes where every candidate kind fails:
+        //   offset_i = 5 (out of {0,1,2,3}) → not Internal
+        //   u32[0]   = 5 (!= 1)             → not PrunedInternal / Default
+        //   u32[4]   = 0 (!= 1)             → not Leaf
+        // Followed by a trailing default so the section is still
+        // terminated (otherwise we'd get the trailing-default error
+        // instead of the record-kind error).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&5u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&synth_default(n, 1));
+        let header = stub_header(n);
+        let mut cur = Cursor::new(&bytes);
+        let err = read(&mut cur, &header).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unrecognized decision-tree record"),
+            "expected a walker-error message, got: {msg}"
+        );
+        assert!(msg.contains("section-offset 0"), "missing offset in: {msg}");
+    }
+
+    /// Must terminate on a Default — otherwise inference has no
+    /// fallback distribution and we should refuse to proceed.
+    #[test]
+    fn requires_trailing_default() {
+        let n = 3u32;
+        // Leaf then another leaf, no default. The walker should
+        // parse both and then complain that there's no Default at
+        // EOF. But the second leaf's trailing bytes exactly fill
+        // the file, so the trailing-default check kicks in.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&synth_leaf(1, n, 5));
+        bytes.extend_from_slice(&synth_leaf(2, n, 6));
+        let header = stub_header(n);
+        let mut cur = Cursor::new(&bytes);
+        let err = read(&mut cur, &header).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("didn't terminate with a Default"),
+            "expected trailing-default error, got: {msg}"
+        );
+    }
+
+    /// Real english.par: the bundled model parses without a walker
+    /// error, ends on a Default, and every distribution sums to ~1.0.
+    /// Also prints the kind counts so they're visible in `cargo test -- --nocapture`.
     #[test]
     fn reads_bundled_english_decision_tree() {
         let Some(par) = english_par_path() else {
             return;
         };
-        // Just verify we can parse by loading the whole file via the
-        // top-level loader once dtree is wired in there. Here we
-        // bypass by advancing a cursor manually from 0xd231bb (known
-        // first-leaf offset) via a direct byte load.
         let bytes = std::fs::read(&par).unwrap();
         let tree_start = 0xd231bb;
         let mut cur = Cursor::new(&bytes);
         cur.advance(tree_start).unwrap();
-        // Need a Header for num_tags. Build a stub with 58 tags.
-        let header = super::super::header::Header {
+        let header = Header {
             field_a: 0,
             field_b: 0,
             sent_tag_index: 31,
@@ -394,20 +636,34 @@ mod tests {
             end_offset: 0,
         };
         let tree = read(&mut cur, &header).unwrap();
-        assert!(!tree.leaves.is_empty(), "no leaves found in english.par");
-        assert_eq!(tree.default.distribution.len(), 58);
-        let sum: f64 = tree.default.distribution.iter().map(|t| t.prob).sum();
-        assert!((sum - 1.0).abs() < 1e-5, "default didn't sum to 1: {sum}");
-        // Every leaf distribution sums to 1.0
-        for (i, leaf) in tree.leaves.iter().enumerate() {
-            let s: f64 = leaf.distribution.iter().map(|t| t.prob).sum();
-            assert!((s - 1.0).abs() < 1e-5, "leaf {i} sum={s}");
-        }
+        let counts = tree.kind_counts();
         eprintln!(
-            "english.par: {} leaves, default weight={}, raw_internals={} bytes",
-            tree.leaves.len(),
-            tree.default.weight,
-            tree.raw_internals.len()
+            "english.par dtree records: {} internals, {} leaves, \
+             {} pruned-internals, {} defaults ({} total)",
+            counts.internals,
+            counts.leaves,
+            counts.pruned_internals,
+            counts.defaults,
+            tree.records.len()
         );
+        assert_eq!(counts.defaults, 1);
+        // Default is last.
+        assert!(matches!(tree.records.last(), Some(DTreeRecord::Default(_))));
+        // Every distribution sums to 1.0.
+        for (i, r) in tree.records.iter().enumerate() {
+            let dist = match r {
+                DTreeRecord::Leaf(l) => &l.distribution,
+                DTreeRecord::PrunedInternal(p) => &p.distribution,
+                DTreeRecord::Default(d) => &d.distribution,
+                DTreeRecord::Internal(_) => continue,
+            };
+            let s: f64 = dist.probs.iter().map(|tp| tp.prob).sum();
+            assert!(
+                (s - 1.0).abs() < 1e-5,
+                "record {i} ({:?}) distribution sum = {s}",
+                r.kind()
+            );
+            assert_eq!(dist.probs.len(), 58);
+        }
     }
 }

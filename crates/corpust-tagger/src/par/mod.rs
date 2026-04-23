@@ -30,6 +30,15 @@ use std::path::Path;
 pub struct Model {
     pub header: header::Header,
     pub lexicon: lexicon::Lexicon,
+    /// Decision-tree section — records in file order, kind-tagged.
+    /// Populated when the file's tail parses cleanly as a dtree
+    /// section; a load that succeeds without this field means the
+    /// walker found unrecognised bytes and we've stored the error so
+    /// callers can keep using the header/lexicon while archaeology
+    /// continues. Intentional looseness: the tries between the lexicon
+    /// and the dtree are still undecoded, so we *can't* seek straight
+    /// to the dtree from the lexicon's end cursor yet.
+    pub dtree: Option<dtree::DecisionTree>,
 }
 
 /// Entry point: memory-map (eventually) and parse a `.par` file.
@@ -43,7 +52,32 @@ pub fn load(path: &Path) -> Result<Model> {
     let mut cur = Cursor::new(&bytes);
     let header = header::read(&mut cur).context("parsing .par header")?;
     let lexicon = lexicon::read(&mut cur, &header).context("parsing .par lexicon")?;
-    Ok(Model { header, lexicon })
+    // Dtree loader is stand-alone: it takes a cursor already
+    // positioned at the dtree start. For `english.par` that's
+    // `0xd231bb`, a known constant until the tries get a proper
+    // reader. Other `.par` files would need their own positioning.
+    // Gated on `english.par`'s known offset so other files don't
+    // silently pull garbage through the dtree walker.
+    let dtree = try_read_english_dtree(&bytes, &header);
+    Ok(Model { header, lexicon, dtree })
+}
+
+/// Best-effort dtree load for the bundled `english.par`. Returns
+/// `None` if the file isn't the exact shape we've reverse-engineered
+/// so far (58 tags, dtree at `0xd231bb`), or if the walker rejects
+/// some bytes — the header + lexicon are still useful in that case,
+/// so we don't propagate the error.
+fn try_read_english_dtree(
+    bytes: &[u8],
+    header: &header::Header,
+) -> Option<dtree::DecisionTree> {
+    const ENGLISH_DTREE_START: usize = 0xd231bb;
+    if header.tags.len() != 58 || bytes.len() <= ENGLISH_DTREE_START {
+        return None;
+    }
+    let mut cur = Cursor::new(bytes);
+    cur.advance(ENGLISH_DTREE_START).ok()?;
+    dtree::read(&mut cur, header).ok()
 }
 
 /// Minimal byte-level cursor for `.par` parsing.
