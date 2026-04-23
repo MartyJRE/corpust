@@ -99,38 +99,47 @@ impl Tagger {
                 return (pos, lemma);
             }
         }
-        // Unknown word: walk the suffix trie (capitalized words also
-        // try the prefix trie) for P(tag | affix), then fall back to
-        // the dtree Default. Lemma stays `None` — matches the
-        // subprocess oracle's `<unknown>` → None convention, so we
-        // don't falsely disagree on lemmas.
+        // Unknown word. Get a best-guess POS from the tries; leave
+        // lemma None — tree-tagger's `<unknown>` → None convention.
+        // (A minority of the oracle's proper-noun outputs use the
+        // surface form as lemma, but there's no way to know which
+        // without matching the oracle's internal capitalized-word
+        // lexicon, so None is the cleanest default.)
         let peak_tag_id = self.guess_unknown_tag(word);
         let pos = peak_tag_id.and_then(|t| self.model.header.tag(t.into()).map(str::to_owned));
         (pos, None)
     }
 
     /// Guess the best POS tag ID for a word missing from the lexicon.
-    /// Tries the suffix trie first (words we've seen with this
-    /// ending), then the prefix trie for capitalized words, then the
-    /// dtree Default as an unconditional prior.
+    ///
+    /// Heuristics, in order:
+    /// 1. **Capitalized** word → default to NP (proper noun, tag 21
+    ///    on the English tagset). TreeTagger treats capitalized
+    ///    unknowns as proper nouns by default, and trying the prefix
+    ///    trie first on these loses on e.g. "Accolon" (which the
+    ///    suffix trie tags as VVN by the 'lon' ending).
+    /// 2. **Lowercase** word → suffix-trie peak.
+    /// 3. Fall back to prefix-trie peak, then to the dtree Default
+    ///    distribution's peak.
     fn guess_unknown_tag(&self, word: &str) -> Option<u8> {
+        // Only "Capitalized" (mixed-case) unknowns default to NP. ALL-CAPS
+        // words tend to be section headings like "BOOK" or
+        // "BIBLIOGRAPHICAL" that oracle tags as regular NN/JJ.
+        let chars: Vec<char> = word.chars().collect();
+        let first_upper = chars.first().copied().map(|c| c.is_uppercase()).unwrap_or(false);
+        let rest_lower = chars.iter().skip(1).all(|c| !c.is_uppercase());
+        if first_upper && rest_lower {
+            if let Some(np) = self.tag_id_by_name("NP") {
+                return Some(np);
+            }
+        }
         let tries = self.model.tries.as_ref()?;
-        // Suffix trie: iterate chars last-to-first.
-        if let Some(dist) = tries.suffix.lookup(word.chars().rev()) {
-            if let Some(tp) = dist.peak() {
-                return Some(tp.tag_id);
-            }
+        if let Some(tp) = tries.suffix.lookup(word.chars().rev()).and_then(|d| d.peak()) {
+            return Some(tp.tag_id);
         }
-        // Capitalized? Try prefix trie.
-        let first = word.chars().next();
-        if matches!(first, Some(c) if c.is_uppercase()) {
-            if let Some(dist) = tries.prefix.lookup(word.chars()) {
-                if let Some(tp) = dist.peak() {
-                    return Some(tp.tag_id);
-                }
-            }
+        if let Some(tp) = tries.prefix.lookup(word.chars()).and_then(|d| d.peak()) {
+            return Some(tp.tag_id);
         }
-        // Final fallback: peak of the dtree Default distribution.
         self.model.dtree.as_ref().and_then(|dt| {
             dt.default()
                 .distribution
@@ -139,6 +148,10 @@ impl Tagger {
                 .max_by(|a, b| a.prob.partial_cmp(&b.prob).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|tp| tp.tag_id as u8)
         })
+    }
+
+    fn tag_id_by_name(&self, name: &str) -> Option<u8> {
+        self.model.header.tag_id(name).and_then(|v| u8::try_from(v).ok())
     }
 }
 
@@ -231,6 +244,82 @@ mod tests {
             assert!(t.pos.is_some(), "{}: should have a POS tag", t.word);
             assert!(t.lemma.is_some(), "{}: should have a lemma", t.word);
         }
+    }
+
+    /// Sample 20 remaining unknown-word POS errors so we can see the
+    /// kind of word where the suffix-trie guess still disagrees with
+    /// the oracle.
+    #[test]
+    #[ignore]
+    fn unknown_error_clustering() {
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let text_path = repo.join("testdata/gutenberg/1251.txt");
+        if !text_path.exists() { return }
+        let sample: String = std::fs::read_to_string(&text_path).unwrap().chars().take(10_000).collect();
+        let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
+        let subject = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        let report = testkit::diff(&oracle, &subject, &sample).unwrap();
+
+        let mut errors: Vec<_> = report.mismatches.iter()
+            .filter(|m| m.kind == testkit::MismatchKind::Pos
+                && subject.model.lexicon.lookup(&m.subject_word).is_none())
+            .collect();
+        errors.sort_by(|a, b| a.subject_word.cmp(&b.subject_word));
+        eprintln!("Unknown-word POS errors (showing first 25 of {}):", errors.len());
+        for m in errors.iter().take(25) {
+            let first_char = m.subject_word.chars().next().unwrap_or('?');
+            let cap = if first_char.is_uppercase() { "CAP" } else { "   " };
+            eprintln!("  {} {:<15} oracle={:<5} subject={}",
+                cap, m.subject_word,
+                m.oracle_pos.as_deref().unwrap_or("-"),
+                m.subject_pos.as_deref().unwrap_or("-"));
+        }
+        let cap_errors = errors.iter().filter(|m| m.subject_word.chars().next().unwrap_or('?').is_uppercase()).count();
+        eprintln!("\nOf {} unknown-word POS errors: {} are capitalized, {} are not",
+            errors.len(), cap_errors, errors.len() - cap_errors);
+    }
+
+    /// Dump the top-20 words responsible for ambiguous-known-word POS
+    /// errors on the gutenberg sample. Lets us see whether the
+    /// remaining gap is concentrated on a few high-frequency words
+    /// or spread thin.
+    #[test]
+    #[ignore]
+    fn ambiguous_error_clustering() {
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let text_path = repo.join("testdata/gutenberg/1251.txt");
+        if !text_path.exists() { return }
+        let sample: String = std::fs::read_to_string(&text_path).unwrap().chars().take(10_000).collect();
+        let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
+        let subject = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        let report = testkit::diff(&oracle, &subject, &sample).unwrap();
+
+        use std::collections::HashMap;
+        let mut by_word: HashMap<(String, String, String), usize> = HashMap::new();
+        for m in &report.mismatches {
+            if m.kind != testkit::MismatchKind::Pos { continue }
+            let n_cand = subject.model.lexicon.lookup(&m.subject_word)
+                .map(|e| e.candidates.len()).unwrap_or(0);
+            if n_cand <= 1 { continue }
+            let key = (
+                m.subject_word.clone(),
+                m.oracle_pos.clone().unwrap_or_default(),
+                m.subject_pos.clone().unwrap_or_default(),
+            );
+            *by_word.entry(key).or_insert(0) += 1;
+        }
+        let mut pairs: Vec<_> = by_word.into_iter().collect();
+        pairs.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        eprintln!("Top ambiguous-known mismatches (word, oracle_pos, subject_pos, count):");
+        for ((w, op, sp), c) in pairs.iter().take(20) {
+            eprintln!("  {c:>3}× {w:<15} oracle={op:<6} subject={sp}");
+        }
+        let total: usize = pairs.iter().map(|(_, c)| c).sum();
+        eprintln!("Total ambiguous-known POS errors: {total} across {} distinct (word, pos-diff) tuples", pairs.len());
     }
 
     /// Same #[ignored] baseline but broken down by error source
