@@ -237,6 +237,135 @@ impl DecisionTree {
             _ => None,
         })
     }
+
+    /// Reconstruct the binary-tree topology from the flat record list
+    /// by parsing it as a preorder DFS (yes-child first). Returns a
+    /// forest because `english.par` is known to contain two
+    /// back-to-back trees after stripping the wrapper [`Leaf`] and
+    /// trailing [`Default`]. Toy models produce a single-element
+    /// forest.
+    ///
+    /// `nodes[0]` is the root of the first tree. `roots` lists the
+    /// index into `nodes` of each tree's root so callers can walk
+    /// each tree separately.
+    ///
+    /// We don't yet know what the fields of an [`Internal`] actually
+    /// mean (sub-task 2 of `pure-rust-treetagger.md`), so
+    /// [`TreeNode::Internal`] just carries the raw Internal fields
+    /// unchanged plus yes/no child pointers. Once the predicate
+    /// semantics are pinned down, `TreeNode::Internal` can grow a
+    /// typed `predicate: Feature { back: u32, tag: u32 }` field
+    /// without touching callers of the topology API.
+    pub fn reconstruct(&self) -> TreeForest {
+        // Strip the wrapper Leaf (when present — only english.par has
+        // it). The trailing Default stays — it's the rightmost leaf
+        // of the last tree under preorder DFS, not a standalone
+        // fallback. (Every binary tree with N leaves has N-1
+        // internals; stripping the Default would give the last tree
+        // N-1 leaves and N-1 internals, which doesn't balance.)
+        let has_wrapper = matches!(self.records.first(), Some(DTreeRecord::Leaf(_)));
+        let body_start = if has_wrapper { 1 } else { 0 };
+        let body = &self.records[body_start..];
+
+        let mut nodes: Vec<TreeNode> = Vec::new();
+        let mut roots: Vec<usize> = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < body.len() {
+            let root = build_subtree(body, &mut cursor, &mut nodes);
+            roots.push(root);
+        }
+
+        TreeForest { nodes, roots }
+    }
+}
+
+/// Topological view of the decision tree(s), reconstructed from the
+/// flat preorder-DFS record list by [`DecisionTree::reconstruct`].
+#[derive(Debug, Clone)]
+pub struct TreeForest {
+    /// All nodes in the forest, indexed by node id. Children of an
+    /// internal node refer to indices into this same vector.
+    pub nodes: Vec<TreeNode>,
+    /// Indices into `nodes` of each tree's root.
+    pub roots: Vec<usize>,
+}
+
+/// A node in a reconstructed decision tree.
+///
+/// Leaf and Default records map to [`TreeNode::Leaf`] — they both
+/// carry a probability distribution and terminate a traversal path.
+#[derive(Debug, Clone)]
+pub enum TreeNode {
+    /// Non-terminal: evaluate the predicate (still opaque) and
+    /// descend into `yes` or `no`.
+    Internal {
+        predicate: Internal,
+        yes: usize,
+        no: usize,
+    },
+    /// Terminal: the distribution here is the answer.
+    Leaf {
+        /// `None` for the pre-tree wrapper Leaf (when present — only
+        /// seen on `english.par` so far) or for the trailing Default.
+        /// Pruned-internal leaves don't carry a node_id either.
+        node_id: Option<u32>,
+        distribution: Distribution,
+    },
+}
+
+fn build_subtree(
+    body: &[DTreeRecord],
+    cursor: &mut usize,
+    nodes: &mut Vec<TreeNode>,
+) -> usize {
+    let rec_idx = *cursor;
+    *cursor += 1;
+    match &body[rec_idx] {
+        DTreeRecord::Internal(internal) => {
+            // Reserve this node's slot first so recursive calls can
+            // push their own nodes without indexing conflict.
+            let my_idx = nodes.len();
+            nodes.push(TreeNode::Leaf {
+                node_id: None,
+                distribution: Distribution {
+                    weight: 0,
+                    probs: Vec::new(),
+                },
+            }); // placeholder, overwritten below
+            let yes = build_subtree(body, cursor, nodes);
+            let no = build_subtree(body, cursor, nodes);
+            nodes[my_idx] = TreeNode::Internal {
+                predicate: *internal,
+                yes,
+                no,
+            };
+            my_idx
+        }
+        DTreeRecord::PrunedInternal(p) => {
+            let my_idx = nodes.len();
+            nodes.push(TreeNode::Leaf {
+                node_id: None,
+                distribution: p.distribution.clone(),
+            });
+            my_idx
+        }
+        DTreeRecord::Leaf(l) => {
+            let my_idx = nodes.len();
+            nodes.push(TreeNode::Leaf {
+                node_id: Some(l.node_id),
+                distribution: l.distribution.clone(),
+            });
+            my_idx
+        }
+        DTreeRecord::Default(d) => {
+            let my_idx = nodes.len();
+            nodes.push(TreeNode::Leaf {
+                node_id: None,
+                distribution: d.distribution.clone(),
+            });
+            my_idx
+        }
+    }
 }
 
 /// Parse the decision-tree section from `cur` to EOF.
@@ -614,6 +743,96 @@ mod tests {
             msg.contains("didn't terminate with a Default"),
             "expected trailing-default error, got: {msg}"
         );
+    }
+
+    /// Preorder-DFS reconstruction on a tree with known shape:
+    /// Internal(Leaf, Internal(Leaf, Default)) — 2 internals, 3
+    /// leaves, with the trailing Default acting as the rightmost
+    /// leaf of the last tree.
+    #[test]
+    fn reconstructs_small_tree() {
+        let n = 3u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&synth_internal(1, 0, 10)); // root
+        bytes.extend_from_slice(&synth_pruned(n, 5)); // root yes-child (leaf)
+        bytes.extend_from_slice(&synth_internal(2, 1, 20)); // root no-child (internal)
+        bytes.extend_from_slice(&synth_pruned(n, 6)); // inner yes-child (leaf)
+        bytes.extend_from_slice(&synth_default(n, 99)); // inner no-child (leaf, Default at EOF)
+
+        let tree = read(&mut Cursor::new(&bytes), &stub_header(n)).unwrap();
+        let forest = tree.reconstruct();
+        assert_eq!(forest.roots.len(), 1);
+
+        let root = &forest.nodes[forest.roots[0]];
+        match root {
+            TreeNode::Internal { predicate, yes, no } => {
+                assert_eq!((predicate.offset_i, predicate.tag_id, predicate.branch_info), (1, 0, 10));
+                match &forest.nodes[*yes] {
+                    TreeNode::Leaf { distribution, .. } => {
+                        assert_eq!(distribution.weight, 5);
+                    }
+                    _ => panic!("root.yes should be a leaf"),
+                }
+                match &forest.nodes[*no] {
+                    TreeNode::Internal { predicate: inner, yes: iy, no: in_, .. } => {
+                        assert_eq!((inner.offset_i, inner.tag_id, inner.branch_info), (2, 1, 20));
+                        match &forest.nodes[*iy] {
+                            TreeNode::Leaf { distribution, .. } => {
+                                assert_eq!(distribution.weight, 6);
+                            }
+                            _ => panic!("inner.yes should be a leaf"),
+                        }
+                        match &forest.nodes[*in_] {
+                            TreeNode::Leaf { distribution, .. } => {
+                                assert_eq!(distribution.weight, 99, "should be the Default acting as rightmost leaf");
+                            }
+                            _ => panic!("inner.no should be a leaf (the Default)"),
+                        }
+                    }
+                    _ => panic!("root.no should be an internal"),
+                }
+            }
+            _ => panic!("root should be an internal"),
+        }
+    }
+
+    /// English.par is known to reconstruct as a forest of 2 trees
+    /// (63-node chain + 1500-node main tree) after stripping the
+    /// wrapper Leaf and trailing Default.
+    #[test]
+    fn reconstructs_english_as_two_trees() {
+        let Some(par) = english_par_path() else {
+            return;
+        };
+        let bytes = std::fs::read(&par).unwrap();
+        let mut cur = Cursor::new(&bytes);
+        cur.advance(0xd231bb).unwrap();
+        let header = Header {
+            field_a: 0,
+            field_b: 0,
+            sent_tag_index: 31,
+            tags: (0..58).map(|i| format!("T{i}")).collect(),
+            end_offset: 0,
+        };
+        let tree = read(&mut cur, &header).unwrap();
+        let forest = tree.reconstruct();
+        assert_eq!(forest.roots.len(), 2, "english.par should be a 2-tree forest");
+        let n0 = subtree_size(&forest.nodes, forest.roots[0]);
+        let n1 = subtree_size(&forest.nodes, forest.roots[1]);
+        eprintln!("english.par forest: tree[0]={n0} nodes, tree[1]={n1} nodes");
+        assert_eq!(n0, 63, "first tree should be 63 nodes");
+        // Wrapper stripped, Default kept as a leaf of the last tree.
+        // Body = 1565 - 1 (wrapper) = 1564 records. n0 + n1 = 1564.
+        assert_eq!(n0 + n1, 1564);
+    }
+
+    fn subtree_size(nodes: &[TreeNode], root: usize) -> usize {
+        match &nodes[root] {
+            TreeNode::Leaf { .. } => 1,
+            TreeNode::Internal { yes, no, .. } => {
+                1 + subtree_size(nodes, *yes) + subtree_size(nodes, *no)
+            }
+        }
     }
 
     /// Real english.par: the bundled model parses without a walker
