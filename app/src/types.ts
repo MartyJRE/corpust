@@ -98,6 +98,8 @@ export interface RecentQuery {
   corpus: string;
 }
 
+export type TaggerKind = "rust" | "subprocess";
+
 export interface BuildRequest {
   sourcePath: string;
   outPath: string;
@@ -105,6 +107,9 @@ export interface BuildRequest {
   /** Display name for the resulting corpus. Falls back to the folder
    *  name on the Rust side when empty. */
   name?: string;
+  /** Which annotator implementation to use when `annotate` is true.
+   *  Defaults to the pure-Rust in-process tagger. */
+  tagger?: TaggerKind;
 }
 
 export interface BuildProgress {

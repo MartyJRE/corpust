@@ -1,6 +1,6 @@
 import { FolderOpen, X } from "lucide-react";
 import { useRef, useState } from "react";
-import type { CorpusMeta } from "@/types";
+import type { CorpusMeta, TaggerKind } from "@/types";
 import { buildIndex, inTauri } from "@/lib/tauri";
 
 async function pickDirectory(): Promise<string | null> {
@@ -15,6 +15,27 @@ interface ProgressEvent {
   docsTotal: number | null;
   elapsedMs: number;
   error?: string;
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)} s`;
+  const m = Math.floor(s / 60);
+  const r = Math.round(s - m * 60);
+  return `${m}m ${r.toString().padStart(2, "0")}s`;
+}
+
+function formatEtaLabel(phase: string, progress: number, elapsedMs: number): string {
+  if (phase === "done") return `took ${formatDuration(elapsedMs)}`;
+  if (phase === "failed") return `failed after ${formatDuration(elapsedMs)}`;
+  // Don't project an ETA before we have enough signal — the first
+  // few percent are dominated by tagger-load and file-read setup,
+  // which isn't a fair basis for a throughput estimate.
+  if (progress < 0.05 || elapsedMs < 300) return `elapsed ${formatDuration(elapsedMs)} · eta …`;
+  const totalMs = elapsedMs / progress;
+  const remainMs = Math.max(0, totalMs - elapsedMs);
+  return `elapsed ${formatDuration(elapsedMs)} · eta ${formatDuration(remainMs)}`;
 }
 
 async function subscribeBuildProgress(
@@ -38,11 +59,13 @@ const TOTAL_DOCS = 544;
 export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
   const [path, setPath] = useState("");
   const [annotate, setAnnotate] = useState(true);
+  const [tagger, setTagger] = useState<TaggerKind>("rust");
   const [name, setName] = useState("");
   const [phase, setPhase] = useState<Phase>("idle");
   const [progress, setProgress] = useState(0);
   const [docIdx, setDocIdx] = useState(0);
   const [docTotal, setDocTotal] = useState<number | null>(null);
+  const [elapsedMs, setElapsedMs] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const unlistenRef = useRef<null | (() => void)>(null);
 
@@ -69,6 +92,7 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
       unlistenRef.current = null;
     }
     unlistenRef.current = await subscribeBuildProgress((p) => {
+      setElapsedMs(p.elapsedMs);
       // "committing"/"done" arrive as synthetic 100% events from Rust.
       if (p.phase !== "failed") setPhase(p.phase);
       if (p.docsTotal) setDocTotal(p.docsTotal);
@@ -91,6 +115,7 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
         outPath,
         annotate,
         name: name.trim() || undefined,
+        tagger,
       });
       setPhase("done");
       setProgress(1);
@@ -249,10 +274,43 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
               disabled={phase !== "idle"}
             />
             <span>
-              Annotate with pure-Rust TreeTagger (lemma + POS)<span className="sub"> · ≈3× slower</span>
+              Annotate (lemma + POS)<span className="sub"> · adds indexing time</span>
             </span>
           </label>
         </div>
+        {annotate && (
+          <div className="cx-form-row">
+            <label className="cx-form-label">
+              Tagger <span className="cx-form-hint">pure-Rust is ~3× faster</span>
+            </label>
+            <div style={{ display: "flex", gap: 16 }}>
+              <label className="cx-checkbox">
+                <input
+                  type="radio"
+                  name="tagger"
+                  checked={tagger === "rust"}
+                  onChange={() => setTagger("rust")}
+                  disabled={phase !== "idle"}
+                />
+                <span>
+                  pure-Rust<span className="sub"> · in-process, ~92% POS</span>
+                </span>
+              </label>
+              <label className="cx-checkbox">
+                <input
+                  type="radio"
+                  name="tagger"
+                  checked={tagger === "subprocess"}
+                  onChange={() => setTagger("subprocess")}
+                  disabled={phase !== "idle"}
+                />
+                <span>
+                  subprocess<span className="sub"> · LancsBox parity, slow</span>
+                </span>
+              </label>
+            </div>
+          </div>
+        )}
 
         {phase !== "idle" && (
           <div className="cx-progress">
@@ -264,7 +322,7 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
               <div style={{ width: `${progress * 100}%` }} />
             </div>
             <div className="cx-progress-meta">
-              <span>eta {phase === "done" || phase === "failed" ? "—" : `${Math.max(1, Math.round((1 - progress) * (annotate ? 55 : 18)))} s`}</span>
+              <span>{formatEtaLabel(phase, progress, elapsedMs)}</span>
               <span>peak mem {phase === "done" ? "428 MB" : `${Math.round(120 + progress * 300)} MB`}</span>
             </div>
             {errorMsg && phase === "failed" && (

@@ -7,9 +7,9 @@
 
 use crate::{
     AppState, BuildRequest, CorpusMeta, KwicHit as KwicHitDto, KwicRequest, KwicResult,
-    OpenedCorpus,
+    OpenedCorpus, TaggerKind,
 };
-use corpust_annotate::Annotator;
+use corpust_annotate::{Annotator, treetagger::TreeTagger};
 use corpust_index::{CorpusIndex, DEFAULT_CONTEXT};
 use corpust_query::{KwicRequest as CoreKwicRequest, kwic as run_core_kwic};
 use corpust_tagger::Tagger as RustTagger;
@@ -209,23 +209,39 @@ fn build_index_inner(
     }
 
     let (tagger, tagger_id) = if req.annotate {
-        let (par, abbr_path) = resolve_treetagger_bundle("english")?;
-        let abbr = if abbr_path.exists() {
-            std::fs::read_to_string(&abbr_path)
-                .map_err(|e| format!("reading {}: {e}", abbr_path.display()))?
-                .lines()
-                .filter_map(|l| {
-                    let t = l.trim();
-                    (!t.is_empty() && !t.starts_with('#')).then(|| t.to_owned())
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let tg = RustTagger::load(&par, "english", abbr)
-            .map_err(|e| format!("loading tagger from {}: {e:#}", par.display()))?;
-        let id = tg.id().to_owned();
-        (Some(Box::new(tg) as Box<dyn Annotator + Sync>), Some(id))
+        match req.tagger {
+            TaggerKind::Rust => {
+                let (par, abbr_path) = resolve_treetagger_bundle("english")?;
+                let abbr = if abbr_path.exists() {
+                    std::fs::read_to_string(&abbr_path)
+                        .map_err(|e| format!("reading {}: {e}", abbr_path.display()))?
+                        .lines()
+                        .filter_map(|l| {
+                            let t = l.trim();
+                            (!t.is_empty() && !t.starts_with('#')).then(|| t.to_owned())
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let tg = RustTagger::load(&par, "english", abbr).map_err(|e| {
+                    format!("loading pure-Rust tagger from {}: {e:#}", par.display())
+                })?;
+                let id = tg.id().to_owned();
+                (Some(Box::new(tg) as Box<dyn Annotator + Sync>), Some(id))
+            }
+            TaggerKind::Subprocess => {
+                let bundle_root = resolve_treetagger_bundle_root()?;
+                let tg = TreeTagger::from_bundle(&bundle_root, "english").map_err(|e| {
+                    format!(
+                        "loading subprocess tagger from {}: {e:#}",
+                        bundle_root.display()
+                    )
+                })?;
+                let id = tg.id().to_owned();
+                (Some(Box::new(tg) as Box<dyn Annotator + Sync>), Some(id))
+            }
+        }
     } else {
         (None, None)
     };
@@ -352,18 +368,30 @@ fn iso_now() -> String {
 /// running a packaged build will eventually need a settings pane to
 /// point us at the right location — tracked for the polish pass.
 fn resolve_treetagger_bundle(language: &str) -> Result<(PathBuf, PathBuf), String> {
+    let bundle = resolve_treetagger_bundle_root()?;
+    let par = bundle.join("lib").join(format!("{language}.par"));
+    if !par.exists() {
+        return Err(format!(
+            "TreeTagger bundle {} has no {}.par under lib/",
+            bundle.display(),
+            language
+        ));
+    }
+    let abbr = bundle
+        .join("lib")
+        .join(format!("{language}-abbreviations"));
+    Ok((par, abbr))
+}
+
+fn resolve_treetagger_bundle_root() -> Result<PathBuf, String> {
     let candidates = [
         PathBuf::from("resources/treetagger"),
         PathBuf::from("../resources/treetagger"),
         PathBuf::from("../../resources/treetagger"),
     ];
     for bundle in candidates {
-        let par = bundle.join("lib").join(format!("{language}.par"));
-        if par.exists() {
-            let abbr = bundle
-                .join("lib")
-                .join(format!("{language}-abbreviations"));
-            return Ok((par, abbr));
+        if bundle.join("lib").exists() {
+            return Ok(bundle);
         }
     }
     Err(format!(

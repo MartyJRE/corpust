@@ -161,4 +161,22 @@ pub struct BuildRequest {
     /// back to the source directory's basename.
     #[serde(default)]
     pub name: Option<String>,
+    /// Which annotator implementation to use when `annotate=true`.
+    /// Defaults to the pure-Rust in-process tagger; the subprocess
+    /// path is kept as an option so users can A/B correctness and
+    /// speed.
+    #[serde(default)]
+    pub tagger: TaggerKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaggerKind {
+    /// Pure-Rust in-process TreeTagger port. Fast (~2.5× end-to-end
+    /// speedup over subprocess) but currently ~92% POS accuracy.
+    #[default]
+    Rust,
+    /// Bundled `tree-tagger` binary; one subprocess per document.
+    /// Accurate (LancsBox parity) but slow.
+    Subprocess,
 }
