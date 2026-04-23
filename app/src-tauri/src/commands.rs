@@ -17,7 +17,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 const PROGRESS_EVENT: &str = "build:progress";
 
@@ -146,18 +146,29 @@ pub fn run_kwic(
     })
 }
 
+/// Runs the build on a worker thread so the UI event loop stays
+/// responsive. Tauri routes sync `fn` commands onto the main thread
+/// by default — long-running work in that context freezes the
+/// window. Making the command `async fn` + punting to
+/// `spawn_blocking` keeps both sides happy: no UI freeze, and the
+/// file/I-O/annotator code inside stays synchronous.
 #[tauri::command]
-pub fn build_index(
+pub async fn build_index(
     app: AppHandle,
-    state: State<'_, AppState>,
     req: BuildRequest,
 ) -> Result<CorpusMeta, String> {
     let started = Instant::now();
-    let result = build_index_inner(&app, &state, &req, started);
-    if let Err(ref msg) = result {
-        emit_failure(&app, started, msg);
-    }
-    result
+    let handle = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let result = build_index_inner(&app, &state, &req, started);
+        if let Err(ref msg) = result {
+            emit_failure(&app, started, msg);
+        }
+        result
+    });
+    handle
+        .await
+        .map_err(|e| format!("build task failed to join: {e}"))?
 }
 
 fn build_index_inner(
