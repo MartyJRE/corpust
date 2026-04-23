@@ -29,8 +29,14 @@ export async function runKwic(req: KwicRequest): Promise<KwicResult> {
   return invokeSafe<KwicResult>("run_kwic", { req });
 }
 
-export async function buildIndex(req: BuildRequest): Promise<string> {
-  return invokeSafe<string>("build_index", { req });
+export async function buildIndex(req: BuildRequest): Promise<CorpusMeta> {
+  return invokeSafe<CorpusMeta>("build_index", { req });
+}
+
+/** True when running inside the Tauri shell. Frontend can fall back to
+ *  fixture data when false (Storybook, vite-only dev). */
+export function inTauri(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
 export type { BuildProgress };

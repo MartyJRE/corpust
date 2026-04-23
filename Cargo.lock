@@ -705,6 +705,7 @@ dependencies = [
  "corpust-index",
  "corpust-io",
  "corpust-query",
+ "corpust-tagger",
 ]
 
 [[package]]
@@ -771,6 +772,7 @@ dependencies = [
  "corpust-index",
  "corpust-io",
  "corpust-query",
+ "corpust-tagger",
  "serde",
  "serde_json",
  "tauri",

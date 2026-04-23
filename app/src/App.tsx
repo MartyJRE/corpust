@@ -22,6 +22,7 @@ import { CommandPalette, type CommandDef } from "@/components/overlays/CommandPa
 import { BuildDialog } from "@/components/overlays/BuildDialog";
 import { CORPORA, RECENT_QUERIES, pickHits } from "@/data";
 import { makeDensity } from "@/lib/utils";
+import { inTauri, runKwic as runKwicTauri } from "@/lib/tauri";
 import type {
   CorpusMeta,
   KwicHit,
@@ -59,7 +60,37 @@ export function App() {
     if (!activeCorpus || !term.trim()) return;
     setLoading(true);
     setResult(null);
-    // TODO: replace with `await runKwic({ corpusId, term, layer, … })`
+    const isRealCorpus = inTauri() && activeCorpus.id.startsWith("corpus-");
+    if (isRealCorpus) {
+      runKwicTauri({
+        corpusId: activeCorpus.id,
+        term: term.trim(),
+        layer,
+        context: 8,
+        limit: 200,
+      })
+        .then((r) => {
+          // The Tauri backend returns hits with a numeric doc_id +
+          // file path; the frontend's KwicHit shape carries docId
+          // (string) and no path. Adapt the shape inline until the
+          // types converge.
+          const hits: KwicHit[] = r.hits.map((h, i) => ({
+            docId: String(h.docId),
+            pos: i,
+            left: h.left,
+            hit: h.hit,
+            right: h.right,
+          }));
+          setResult({ hits, elapsedMs: r.elapsedMs, truncated: r.truncated });
+        })
+        .catch((e) => {
+          console.error("runKwic failed:", e);
+          setResult({ hits: [], elapsedMs: 0, truncated: false });
+        })
+        .finally(() => setLoading(false));
+      return;
+    }
+    // Fallback: fixture data for the non-Tauri / pre-built-corpus case.
     window.setTimeout(() => {
       const hits = pickHits(activeCorpus.id, term.trim(), layer);
       const elapsedMs = 0.2 + Math.random() * 1.6;

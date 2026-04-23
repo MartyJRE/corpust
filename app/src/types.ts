@@ -102,6 +102,9 @@ export interface BuildRequest {
   sourcePath: string;
   outPath: string;
   annotate: boolean;
+  /** Display name for the resulting corpus. Falls back to the folder
+   *  name on the Rust side when empty. */
+  name?: string;
 }
 
 export interface BuildProgress {

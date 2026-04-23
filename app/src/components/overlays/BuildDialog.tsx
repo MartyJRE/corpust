@@ -1,6 +1,7 @@
 import { X } from "lucide-react";
 import { useState } from "react";
 import type { CorpusMeta } from "@/types";
+import { buildIndex, inTauri } from "@/lib/tauri";
 
 export interface BuildDialogProps {
   open: boolean;
@@ -8,21 +9,59 @@ export interface BuildDialogProps {
   onBuilt: (corpus: CorpusMeta) => void;
 }
 
-type Phase = "idle" | "reading" | "indexing" | "annotating" | "done";
+type Phase = "idle" | "reading" | "indexing" | "annotating" | "done" | "failed";
 
 const TOTAL_DOCS = 544;
 
 export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
-  const [path, setPath] = useState("~/corpora/new-corpus");
+  const [path, setPath] = useState("testdata/gutenberg");
   const [annotate, setAnnotate] = useState(true);
   const [name, setName] = useState("");
   const [phase, setPhase] = useState<Phase>("idle");
   const [progress, setProgress] = useState(0);
   const [docIdx, setDocIdx] = useState(0);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   if (!open) return null;
 
-  const start = () => {
+  // Default the output path to `<source>.index/` so the user doesn't
+  // have to think about a second location. Real apps will want a
+  // settings-managed `<data_dir>/corpust/corpora/` — tracked in
+  // issue #1.
+  const outPath = path.replace(/\/+$/, "") + ".index";
+
+  const runRealBuild = async () => {
+    setErrorMsg(null);
+    setPhase("reading");
+    setProgress(0.05);
+    setDocIdx(0);
+    // Cheap animated progress while the (synchronous) Rust call
+    // runs. Real event-driven progress is a follow-up.
+    const ticker = setInterval(() => {
+      setProgress((p) => Math.min(0.92, p + 0.01));
+      setDocIdx((n) => Math.min(TOTAL_DOCS - 10, n + 6));
+      setPhase((ph) => (ph === "reading" ? "indexing" : ph));
+    }, 120);
+    try {
+      const meta = await buildIndex({
+        sourcePath: path,
+        outPath,
+        annotate,
+        name: name.trim() || undefined,
+      });
+      clearInterval(ticker);
+      setPhase("done");
+      setProgress(1);
+      setDocIdx(meta.docCount || TOTAL_DOCS);
+      onBuilt(meta);
+    } catch (e) {
+      clearInterval(ticker);
+      setPhase("failed");
+      setErrorMsg(String(e));
+    }
+  };
+
+  const runFakeBuild = () => {
     setPhase("reading");
     setProgress(0.05);
     setTimeout(() => {
@@ -55,7 +94,7 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
         id: "new-" + Date.now(),
         kind: "mixed",
         name: name.trim() || path.split("/").pop() || "new corpus",
-        indexPath: path + "/index",
+        indexPath: outPath,
         sourcePath: path,
         annotated: annotate,
         docCount: TOTAL_DOCS,
@@ -63,13 +102,21 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
         types: 412_908,
         avgDocLen: 146_083,
         builtAt: new Date().toISOString(),
-        buildMs: annotate ? 211_000 : 17_500,
+        buildMs: annotate ? 55_500 : 17_500,
         languages: ["en"],
         tokeniser: "corpust-v0.6 · default",
-        annotator: annotate ? "TreeTagger · english-utf8.par" : null,
-        sizeOnDisk: annotate ? 612_000_000 : 188_000_000,
+        annotator: annotate ? "treetagger-rs-english" : null,
+        sizeOnDisk: annotate ? 1_100_000_000 : 188_000_000,
       });
     }, 2800);
+  };
+
+  const start = () => {
+    if (inTauri()) {
+      void runRealBuild();
+    } else {
+      runFakeBuild();
+    }
   };
 
   const phaseMsg =
@@ -140,16 +187,21 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
         {phase !== "idle" && (
           <div className="cx-progress">
             <div className="cx-progress-head">
-              <span>{phaseMsg}</span>
+              <span>{phase === "failed" ? "build failed" : phaseMsg}</span>
               <span>{Math.round(progress * 100)}%</span>
             </div>
             <div className="cx-progress-bar">
               <div style={{ width: `${progress * 100}%` }} />
             </div>
             <div className="cx-progress-meta">
-              <span>eta {phase === "done" ? "—" : `${Math.max(1, Math.round((1 - progress) * (annotate ? 210 : 18)))} s`}</span>
+              <span>eta {phase === "done" || phase === "failed" ? "—" : `${Math.max(1, Math.round((1 - progress) * (annotate ? 55 : 18)))} s`}</span>
               <span>peak mem {phase === "done" ? "428 MB" : `${Math.round(120 + progress * 300)} MB`}</span>
             </div>
+            {errorMsg && phase === "failed" && (
+              <div className="cx-progress-meta" style={{ color: "var(--danger, #c33)", marginTop: 8 }}>
+                <span style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{errorMsg}</span>
+              </div>
+            )}
           </div>
         )}
 

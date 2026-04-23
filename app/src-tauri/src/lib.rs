@@ -6,12 +6,37 @@
 //! comes first; command bodies get fleshed out once the layout is
 //! locked in.
 
+use corpust_index::CorpusIndex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 mod commands;
 
+/// Process-local registry of opened corpora, keyed by the
+/// `corpusId` string we hand back to the frontend.
+pub struct AppState {
+    pub corpora: Mutex<HashMap<String, OpenedCorpus>>,
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        Self {
+            corpora: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+/// One corpus loaded into the current process — the Tantivy handle
+/// plus the metadata we've serialized to the frontend.
+pub struct OpenedCorpus {
+    pub index: CorpusIndex,
+    pub meta: CorpusMeta,
+}
+
 pub fn run() {
     tauri::Builder::default()
+        .manage(AppState::new())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -33,14 +58,51 @@ pub fn run() {
 pub struct CorpusMeta {
     pub id: String,
     pub name: String,
+    /// One of "literary" / "legal" / "news" / "mixed". We don't
+    /// classify yet, so always "mixed".
+    pub kind: String,
     pub index_path: String,
     pub source_path: String,
     pub annotated: bool,
     pub doc_count: u64,
     pub token_count: u64,
+    /// Unique-type count — 0 until we land a counting pass.
+    pub types: u64,
+    pub avg_doc_len: u64,
     pub built_at: String,
+    pub build_ms: u64,
+    pub languages: Vec<String>,
+    pub tokeniser: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotator: Option<String>,
+    pub size_on_disk: u64,
+    /// Backend-only identifier for the tagger used at build time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tagger_id: Option<String>,
+}
+
+impl CorpusMeta {
+    pub fn stub(id: String, name: String, index_path: String) -> Self {
+        Self {
+            id,
+            name,
+            kind: "mixed".to_owned(),
+            index_path: index_path.clone(),
+            source_path: index_path,
+            annotated: false,
+            doc_count: 0,
+            token_count: 0,
+            types: 0,
+            avg_doc_len: 0,
+            built_at: String::new(),
+            build_ms: 0,
+            languages: vec!["en".to_owned()],
+            tokeniser: "corpust".to_owned(),
+            annotator: None,
+            size_on_disk: 0,
+            tagger_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -95,4 +157,8 @@ pub struct BuildRequest {
     pub source_path: String,
     pub out_path: String,
     pub annotate: bool,
+    /// Display name for the resulting corpus. Optional — we fall
+    /// back to the source directory's basename.
+    #[serde(default)]
+    pub name: Option<String>,
 }
