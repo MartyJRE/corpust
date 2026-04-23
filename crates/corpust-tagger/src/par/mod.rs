@@ -17,6 +17,7 @@
 pub mod dtree;
 pub mod header;
 pub mod lexicon;
+pub mod tries;
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -30,14 +31,18 @@ use std::path::Path;
 pub struct Model {
     pub header: header::Header,
     pub lexicon: lexicon::Lexicon,
+    /// Affix tries + shared prob-tag array (the 170 KB slab between
+    /// lexicon and dtree). Best-effort: populated when the slab
+    /// parses cleanly, currently gated on `english.par`'s known
+    /// shape. Structural decode only — linking trie nodes to their
+    /// prob distributions is still open.
+    pub tries: Option<tries::Tries>,
     /// Decision-tree section — records in file order, kind-tagged.
     /// Populated when the file's tail parses cleanly as a dtree
     /// section; a load that succeeds without this field means the
     /// walker found unrecognised bytes and we've stored the error so
     /// callers can keep using the header/lexicon while archaeology
-    /// continues. Intentional looseness: the tries between the lexicon
-    /// and the dtree are still undecoded, so we *can't* seek straight
-    /// to the dtree from the lexicon's end cursor yet.
+    /// continues.
     pub dtree: Option<dtree::DecisionTree>,
 }
 
@@ -52,14 +57,35 @@ pub fn load(path: &Path) -> Result<Model> {
     let mut cur = Cursor::new(&bytes);
     let header = header::read(&mut cur).context("parsing .par header")?;
     let lexicon = lexicon::read(&mut cur, &header).context("parsing .par lexicon")?;
-    // Dtree loader is stand-alone: it takes a cursor already
-    // positioned at the dtree start. For `english.par` that's
-    // `0xd231bb`, a known constant until the tries get a proper
-    // reader. Other `.par` files would need their own positioning.
-    // Gated on `english.par`'s known offset so other files don't
-    // silently pull garbage through the dtree walker.
+    // Tries + dtree loaders: stand-alone readers that take a cursor
+    // already positioned at their section start. For `english.par`
+    // those offsets are known constants. Other `.par` files would
+    // need their own positioning once the pre-slab prelude is
+    // decoded.
+    let tries = try_read_english_tries(&bytes, &header);
     let dtree = try_read_english_dtree(&bytes, &header);
-    Ok(Model { header, lexicon, dtree })
+    Ok(Model {
+        header,
+        lexicon,
+        tries,
+        dtree,
+    })
+}
+
+/// Best-effort tries load for the bundled `english.par`. Returns
+/// `None` for any other shape of file.
+fn try_read_english_tries(
+    bytes: &[u8],
+    header: &header::Header,
+) -> Option<tries::Tries> {
+    const ENGLISH_TRIES_START: usize = 0xcf9cc3;
+    const ENGLISH_DTREE_START: usize = 0xd231bb;
+    if header.tags.len() != 58 || bytes.len() <= ENGLISH_DTREE_START {
+        return None;
+    }
+    let mut cur = Cursor::new(bytes);
+    cur.advance(ENGLISH_TRIES_START).ok()?;
+    tries::read(&mut cur, ENGLISH_DTREE_START).ok()
 }
 
 /// Best-effort dtree load for the bundled `english.par`. Returns
