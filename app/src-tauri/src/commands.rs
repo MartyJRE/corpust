@@ -211,7 +211,7 @@ fn build_index_inner(
     let (tagger, tagger_id) = if req.annotate {
         match req.tagger {
             TaggerKind::Rust => {
-                let (par, abbr_path) = resolve_treetagger_bundle("english")?;
+                let (par, abbr_path) = resolve_treetagger_bundle(app, "english")?;
                 let abbr = if abbr_path.exists() {
                     std::fs::read_to_string(&abbr_path)
                         .map_err(|e| format!("reading {}: {e}", abbr_path.display()))?
@@ -231,7 +231,7 @@ fn build_index_inner(
                 (Some(Box::new(tg) as Box<dyn Annotator + Sync>), Some(id))
             }
             TaggerKind::Subprocess => {
-                let bundle_root = resolve_treetagger_bundle_root()?;
+                let bundle_root = resolve_treetagger_bundle_root(app)?;
                 let tg = TreeTagger::from_bundle(&bundle_root, "english").map_err(|e| {
                     format!(
                         "loading subprocess tagger from {}: {e:#}",
@@ -367,8 +367,11 @@ fn iso_now() -> String {
 /// apps can land elsewhere, so try a few common relative paths. Users
 /// running a packaged build will eventually need a settings pane to
 /// point us at the right location — tracked for the polish pass.
-fn resolve_treetagger_bundle(language: &str) -> Result<(PathBuf, PathBuf), String> {
-    let bundle = resolve_treetagger_bundle_root()?;
+fn resolve_treetagger_bundle(
+    app: &AppHandle,
+    language: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    let bundle = resolve_treetagger_bundle_root(app)?;
     let par = bundle.join("lib").join(format!("{language}.par"));
     if !par.exists() {
         return Err(format!(
@@ -383,22 +386,91 @@ fn resolve_treetagger_bundle(language: &str) -> Result<(PathBuf, PathBuf), Strin
     Ok((par, abbr))
 }
 
-fn resolve_treetagger_bundle_root() -> Result<PathBuf, String> {
-    let candidates = [
-        PathBuf::from("resources/treetagger"),
-        PathBuf::from("../resources/treetagger"),
-        PathBuf::from("../../resources/treetagger"),
-    ];
-    for bundle in candidates {
-        if bundle.join("lib").exists() {
-            return Ok(bundle);
+/// Locate the TreeTagger bundle across dev and packaged modes.
+///
+/// Search order:
+///   1. `$CORPUST_TREETAGGER_BUNDLE` — explicit override.
+///   2. Tauri's resource directory (`.app/Contents/Resources/` on
+///      macOS), including the `_up_`-mangled path the bundler
+///      generates for resources declared with `..` in tauri.conf.json.
+///   3. Directories adjacent to or above the running binary
+///      (`target/debug/corpust-ui` → up to the repo root).
+///   4. Paths relative to the process cwd (works for `cargo run`
+///      from the repo root).
+fn resolve_treetagger_bundle_root(app: &AppHandle) -> Result<PathBuf, String> {
+    use tauri::Manager;
+
+    let mut tried: Vec<PathBuf> = Vec::new();
+    let try_path = |p: PathBuf, tried: &mut Vec<PathBuf>| -> Option<PathBuf> {
+        let has_lib = p.join("lib").exists();
+        tried.push(p.clone());
+        has_lib.then_some(p)
+    };
+
+    // 1. Env var
+    if let Ok(v) = std::env::var("CORPUST_TREETAGGER_BUNDLE") {
+        let candidate = PathBuf::from(v);
+        if let Some(found) = try_path(candidate, &mut tried) {
+            return Ok(found);
         }
     }
+
+    // 2. Tauri resource dir (packaged .app). The bundler rewrites
+    // `../../resources/treetagger` in tauri.conf.json to
+    // `_up_/_up_/resources/treetagger` under Contents/Resources.
+    if let Ok(resource_root) = app.path().resource_dir() {
+        for sub in [
+            "resources/treetagger",
+            "_up_/_up_/resources/treetagger",
+            "_up_/resources/treetagger",
+        ] {
+            let candidate = resource_root.join(sub);
+            if let Some(found) = try_path(candidate, &mut tried) {
+                return Ok(found);
+            }
+        }
+    }
+
+    // 3. Relative to the running binary. On macOS `.app`s the
+    // layout is `<app>.app/Contents/MacOS/<bin>` and resources live
+    // at `<app>.app/Contents/Resources/`; for dev builds the binary
+    // sits at `target/{debug,release}/<bin>` and the repo's
+    // `resources/treetagger/` is a few levels up.
+    if let Ok(exe) = std::env::current_exe() {
+        let mut cursor = exe.parent().map(|p| p.to_path_buf());
+        for _ in 0..8 {
+            let Some(dir) = cursor.clone() else { break };
+            for sub in [
+                "resources/treetagger",
+                "../Resources/resources/treetagger",
+                "../Resources/_up_/_up_/resources/treetagger",
+            ] {
+                let candidate = dir.join(sub);
+                if let Some(found) = try_path(candidate, &mut tried) {
+                    return Ok(found);
+                }
+            }
+            cursor = dir.parent().map(|p| p.to_path_buf());
+        }
+    }
+
+    // 4. cwd-relative — last-chance fallback, useful for
+    // `cargo run` from the repo root.
+    for rel in ["resources/treetagger", "../resources/treetagger", "../../resources/treetagger"] {
+        if let Some(found) = try_path(PathBuf::from(rel), &mut tried) {
+            return Ok(found);
+        }
+    }
+
+    let tried_list = tried
+        .iter()
+        .map(|p| format!("  - {}", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
     Err(format!(
-        "no TreeTagger bundle found; tried './resources/treetagger', \
-         '../resources/treetagger', '../../resources/treetagger' from cwd {}",
-        std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "<unknown>".to_owned())
+        "no TreeTagger bundle found. Tried:\n{tried_list}\n\nSet \
+         CORPUST_TREETAGGER_BUNDLE to point at the bundle root \
+         explicitly (e.g. export \
+         CORPUST_TREETAGGER_BUNDLE=/path/to/resources/treetagger)."
     ))
 }
