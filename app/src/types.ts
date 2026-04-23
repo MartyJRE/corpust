@@ -124,5 +124,6 @@ export interface BuildProgress {
 export type MainView = "search" | "corpus" | "settings";
 export type SubView = "kwic" | "coll" | "freq";
 export type SortMode = "left1" | "right1" | "doc";
+export type SortDir = "asc" | "desc";
 export type CollMetric = "logDice" | "mi" | "z";
 export type FreqBy = "word" | "pos";

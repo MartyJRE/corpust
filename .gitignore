@@ -2,6 +2,8 @@
 /testdata/index
 /testdata/gutenberg/
 /testdata/gutenberg-index/
+/testdata/gutenberg.index/
+/app/src-tauri/testdata/
 .DS_Store
 .idea/
 CLAUDE.local.md

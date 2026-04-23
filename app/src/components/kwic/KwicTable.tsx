@@ -1,6 +1,6 @@
-import { Download } from "lucide-react";
+import { ArrowDown, ArrowUp, Download } from "lucide-react";
 import { useMemo } from "react";
-import type { KwicHit, KwicResult, QueryLayer, SortMode } from "@/types";
+import type { KwicHit, KwicResult, QueryLayer, SortDir, SortMode } from "@/types";
 import { formatDuration } from "@/lib/utils";
 
 export interface KwicTableProps {
@@ -8,25 +8,44 @@ export interface KwicTableProps {
   loading?: boolean;
   layer: QueryLayer;
   sortMode: SortMode;
-  onSort: (s: SortMode) => void;
+  sortDir: SortDir;
+  /** Called when the user clicks a sort header. Same column
+   *  toggles direction; different column resets to the default
+   *  (asc). The caller is expected to own both values. */
+  onSort: (mode: SortMode) => void;
   selected: KwicHit | null;
   onSelect: (h: KwicHit) => void;
 }
 
-function sortHits(hits: KwicHit[], mode: SortMode): KwicHit[] {
+function sortHits(hits: KwicHit[], mode: SortMode, dir: SortDir): KwicHit[] {
   const h = [...hits];
   const tail = (s: string, n: number) =>
     (s || "").split(/\s+/).slice(-n).join(" ").toLowerCase();
   const head = (s: string, n: number) =>
     (s || "").split(/\s+/).slice(0, n).join(" ").toLowerCase();
-  if (mode === "left1") h.sort((a, b) => tail(a.left, 1).localeCompare(tail(b.left, 1)));
-  if (mode === "right1") h.sort((a, b) => head(a.right, 1).localeCompare(head(b.right, 1)));
-  if (mode === "doc") h.sort((a, b) => a.docId.localeCompare(b.docId));
+  let cmp: (a: KwicHit, b: KwicHit) => number;
+  if (mode === "left1") cmp = (a, b) => tail(a.left, 1).localeCompare(tail(b.left, 1));
+  else if (mode === "right1") cmp = (a, b) => head(a.right, 1).localeCompare(head(b.right, 1));
+  else cmp = (a, b) => a.docId.localeCompare(b.docId);
+  h.sort(cmp);
+  if (dir === "desc") h.reverse();
   return h;
 }
 
-export function KwicTable({ result, loading, layer, sortMode, onSort, selected, onSelect }: KwicTableProps) {
-  const sortedHits = useMemo(() => (result ? sortHits(result.hits, sortMode) : []), [result, sortMode]);
+export function KwicTable({
+  result,
+  loading,
+  layer,
+  sortMode,
+  sortDir,
+  onSort,
+  selected,
+  onSelect,
+}: KwicTableProps) {
+  const sortedHits = useMemo(
+    () => (result ? sortHits(result.hits, sortMode, sortDir) : []),
+    [result, sortMode, sortDir],
+  );
 
   if (loading && !result) {
     return (
@@ -58,27 +77,29 @@ export function KwicTable({ result, loading, layer, sortMode, onSort, selected, 
     <div className="cx-kwic-col">
       <div className="cx-kwic-sort-bar">
         <span>sort</span>
-        <button
-          type="button"
-          className={`cx-sort-btn ${sortMode === "left1" ? "is-on" : ""}`}
-          onClick={() => onSort("left1")}
-        >
-          left-1 <span className="cx-sort-arrow">↑</span>
-        </button>
-        <button
-          type="button"
-          className={`cx-sort-btn ${sortMode === "right1" ? "is-on" : ""}`}
-          onClick={() => onSort("right1")}
-        >
-          right+1 <span className="cx-sort-arrow">↑</span>
-        </button>
-        <button
-          type="button"
-          className={`cx-sort-btn ${sortMode === "doc" ? "is-on" : ""}`}
-          onClick={() => onSort("doc")}
-        >
-          doc <span className="cx-sort-arrow">↑</span>
-        </button>
+        {(
+          [
+            ["left1", "left-1"],
+            ["right1", "right+1"],
+            ["doc", "doc"],
+          ] as const
+        ).map(([mode, label]) => {
+          const active = sortMode === mode;
+          return (
+            <button
+              key={mode}
+              type="button"
+              className={`cx-sort-btn ${active ? "is-on" : ""}`}
+              onClick={() => onSort(mode)}
+              title={active ? `click to toggle ${sortDir === "asc" ? "asc→desc" : "desc→asc"}` : `sort by ${label}`}
+            >
+              {label}{" "}
+              <span className="cx-sort-arrow" style={{ opacity: active ? 1 : 0.35 }}>
+                {active && sortDir === "desc" ? <ArrowDown size={10} /> : <ArrowUp size={10} />}
+              </span>
+            </button>
+          );
+        })}
         <span className="sep">·</span>
         <span>{result.hits.length.toLocaleString()} hits</span>
         <span className="sep">·</span>

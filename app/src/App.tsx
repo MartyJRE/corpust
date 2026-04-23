@@ -49,6 +49,18 @@ export function App() {
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<KwicHit | null>(null);
   const [sortMode, setSortMode] = useState<SortMode>("right1");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  const onSortChange = useCallback(
+    (mode: SortMode) => {
+      if (mode === sortMode) {
+        setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+      } else {
+        setSortMode(mode);
+        setSortDir("asc");
+      }
+    },
+    [sortMode],
+  );
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [buildOpen, setBuildOpen] = useState(false);
   const [filters, setFilters] = useState<Filter[]>([{ key: "year", label: "year: 1800–1950" }]);
@@ -290,7 +302,8 @@ export function App() {
                 loading={loading}
                 layer={layer}
                 sortMode={sortMode}
-                onSort={setSortMode}
+                sortDir={sortDir}
+                onSort={onSortChange}
                 selected={selected}
                 onSelect={setSelected}
               />

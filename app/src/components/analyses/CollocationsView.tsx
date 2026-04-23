@@ -73,6 +73,8 @@ export interface CollocationsViewProps {
 
 const WINDOW_CHOICES = [0, 1, 2, 3, 5, 7, 10] as const;
 
+type CollSortKey = "word" | "pos" | "leftCount" | "rightCount" | "total" | "logDice" | "mi" | "z";
+
 export function CollocationsView({
   term,
   data: dataProp,
@@ -82,11 +84,33 @@ export function CollocationsView({
 }: CollocationsViewProps) {
   const [metric, setMetric] = useState<CollMetric>("logDice");
   const [hover, setHover] = useState<string | null>(null);
+  const [sortKey, setSortKey] = useState<CollSortKey>("total");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
-  const data = useMemo(
+  const toggleSort = (key: CollSortKey, defaultDir: "asc" | "desc" = "desc") => {
+    if (sortKey === key) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir(defaultDir);
+    }
+  };
+
+  const rawData = useMemo(
     () => (dataProp && dataProp.length > 0 ? dataProp : COLLOCATIONS),
     [dataProp],
   );
+  const data = useMemo(() => {
+    const copy = [...rawData];
+    copy.sort((a, b) => {
+      const av = a[sortKey] as unknown as number | string;
+      const bv = b[sortKey] as unknown as number | string;
+      if (typeof av === "number" && typeof bv === "number") return av - bv;
+      return String(av).localeCompare(String(bv));
+    });
+    if (sortDir === "desc") copy.reverse();
+    return copy;
+  }, [rawData, sortKey, sortDir]);
   const maxScore = useMemo(() => Math.max(1e-6, ...data.map((d) => d[metric])), [data, metric]);
   const maxTotal = useMemo(() => Math.max(1, ...data.map((d) => d.total)), [data]);
 
@@ -380,14 +404,14 @@ export function CollocationsView({
         <table className="cx-coll-table">
           <thead>
             <tr>
-              <th>collocate</th>
-              <th>pos</th>
-              <th className="num">L</th>
-              <th className="num">R</th>
-              <th className="num">total</th>
-              <th className="num">logDice</th>
-              <th className="num">MI</th>
-              <th className="num">z-score</th>
+              <SortTh label="collocate" skey="word" align="left" sortKey={sortKey} sortDir={sortDir} onClick={() => toggleSort("word", "asc")} />
+              <SortTh label="pos" skey="pos" align="left" sortKey={sortKey} sortDir={sortDir} onClick={() => toggleSort("pos", "asc")} />
+              <SortTh label="L" skey="leftCount" align="right" sortKey={sortKey} sortDir={sortDir} onClick={() => toggleSort("leftCount")} />
+              <SortTh label="R" skey="rightCount" align="right" sortKey={sortKey} sortDir={sortDir} onClick={() => toggleSort("rightCount")} />
+              <SortTh label="total" skey="total" align="right" sortKey={sortKey} sortDir={sortDir} onClick={() => toggleSort("total")} />
+              <SortTh label="logDice" skey="logDice" align="right" sortKey={sortKey} sortDir={sortDir} onClick={() => toggleSort("logDice")} />
+              <SortTh label="MI" skey="mi" align="right" sortKey={sortKey} sortDir={sortDir} onClick={() => toggleSort("mi")} />
+              <SortTh label="z-score" skey="z" align="right" sortKey={sortKey} sortDir={sortDir} onClick={() => toggleSort("z")} />
               <th className="num">strength</th>
             </tr>
           </thead>
@@ -421,5 +445,30 @@ export function CollocationsView({
         </table>
       </div>
     </div>
+  );
+}
+
+interface SortThProps {
+  label: string;
+  skey: CollSortKey;
+  align: "left" | "right";
+  sortKey: CollSortKey;
+  sortDir: "asc" | "desc";
+  onClick: () => void;
+}
+
+function SortTh({ label, skey, align, sortKey, sortDir, onClick }: SortThProps) {
+  const active = sortKey === skey;
+  const arrow = active ? (sortDir === "asc" ? "↑" : "↓") : "";
+  return (
+    <th
+      className={align === "right" ? "num" : undefined}
+      onClick={onClick}
+      style={{ cursor: "pointer", userSelect: "none" }}
+      title={active ? `click to toggle ${sortDir === "asc" ? "asc→desc" : "desc→asc"}` : `sort by ${label}`}
+    >
+      {label}
+      <span style={{ opacity: active ? 1 : 0.3, marginLeft: 4 }}>{arrow || "↕"}</span>
+    </th>
   );
 }
