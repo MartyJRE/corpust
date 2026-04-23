@@ -246,6 +246,70 @@ mod tests {
         }
     }
 
+    /// Speed bench — pure-Rust `Tagger` vs the subprocess Oracle on
+    /// the same Gutenberg sample. Loads both once, warms up, then
+    /// measures per-call wall clock over N iterations on the same
+    /// text. `#[ignore]` because it runs the subprocess N+1 times
+    /// and is expensive.
+    ///
+    /// Run with `cargo test -p corpust-tagger --release --lib
+    /// tests::speed_bench -- --nocapture --ignored`.
+    #[test]
+    #[ignore]
+    fn speed_bench() {
+        use std::time::Instant;
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap();
+        let text_path = repo.join("testdata/gutenberg/1251.txt");
+        if !text_path.exists() { return }
+        let sample: String = std::fs::read_to_string(&text_path).unwrap()
+            .chars().take(10_000).collect();
+        let token_estimate = sample.split_whitespace().count();
+
+        let t0 = Instant::now();
+        let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
+        let oracle_load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t0 = Instant::now();
+        let subject = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        let subject_load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        eprintln!("Load time:");
+        eprintln!("  oracle  (subprocess, no persistent state): {oracle_load_ms:7.2} ms");
+        eprintln!("  subject (in-process, loads .par):          {subject_load_ms:7.2} ms");
+
+        // Warm up (JIT caches, disk caches).
+        let _ = oracle.annotate(&sample).unwrap();
+        let _ = subject.annotate(&sample).unwrap();
+
+        let iterations = 5;
+        let t0 = Instant::now();
+        let mut tokens_o = 0;
+        for _ in 0..iterations {
+            tokens_o = oracle.annotate(&sample).unwrap().len();
+        }
+        let oracle_total = t0.elapsed();
+
+        let t0 = Instant::now();
+        let mut tokens_s = 0;
+        for _ in 0..iterations {
+            tokens_s = subject.annotate(&sample).unwrap().len();
+        }
+        let subject_total = t0.elapsed();
+
+        let o_per = oracle_total.as_secs_f64() * 1000.0 / iterations as f64;
+        let s_per = subject_total.as_secs_f64() * 1000.0 / iterations as f64;
+        let speedup = o_per / s_per;
+
+        eprintln!();
+        eprintln!("Per-call .annotate() on {} tokens (~{} whitespace words):", tokens_o, token_estimate);
+        eprintln!("  oracle:   {o_per:8.2} ms/call  ({:.2} tokens/ms)", tokens_o as f64 / o_per);
+        eprintln!("  subject:  {s_per:8.2} ms/call  ({:.2} tokens/ms)", tokens_s as f64 / s_per);
+        eprintln!("  speedup:  {speedup:.1}× (pure-Rust vs spawn-per-call subprocess)");
+    }
+
     /// Sample 20 remaining unknown-word POS errors so we can see the
     /// kind of word where the suffix-trie guess still disagrees with
     /// the oracle.
