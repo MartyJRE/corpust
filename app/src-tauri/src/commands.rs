@@ -119,34 +119,48 @@ pub fn run_collocates(
         .get(&req.corpus_id)
         .ok_or_else(|| format!("no open corpus with id {}", req.corpus_id))?;
 
-    // Pull a large KWIC result with the caller's window as context,
-    // then aggregate collocates from the left/right strings. For now
-    // we cap at 5000 hits — enough for meaningful collocations on
-    // common terms without blowing up on "the".
+    // Pull a large KWIC result with enough context to cover both
+    // window sides, then aggregate collocates. Cap hits at 5000 —
+    // enough for meaningful collocations on common terms without
+    // blowing up on "the".
     const HIT_CAP: usize = 5000;
-    let window = req.window.max(1).min(30);
+    let lw = req.left_window.min(30);
+    let rw = req.right_window.min(30);
+    if lw == 0 && rw == 0 {
+        return Err("collocation window must include at least one side".to_owned());
+    }
+    let context = lw.max(rw).max(1);
     let kreq = CoreKwicRequest::new(&req.term)
         .layer(req.layer.into())
-        .context(window)
+        .context(context)
         .limit(HIT_CAP);
     let t0 = Instant::now();
     let hits = run_core_kwic(&opened.index, kreq)
         .map_err(|e| format!("kwic failed: {e:#}"))?;
 
-    // Count word occurrences per side.
+    // Count word occurrences per side, honoring asymmetric L/R
+    // windows. The KWIC call fetched `context` tokens of each side,
+    // so we now trim each side's stream to the requested L or R
+    // window (left: last N tokens; right: first N tokens).
     use std::collections::HashMap;
     let mut left_counts: HashMap<String, u32> = HashMap::new();
     let mut right_counts: HashMap<String, u32> = HashMap::new();
     let mut window_tokens: u32 = 0;
 
     for h in &hits {
-        for w in tokenize_for_collocates(&h.left) {
-            *left_counts.entry(w.to_owned()).or_default() += 1;
-            window_tokens += 1;
+        if lw > 0 {
+            let left_toks: Vec<String> = tokenize_for_collocates(&h.left).collect();
+            let start = left_toks.len().saturating_sub(lw);
+            for w in &left_toks[start..] {
+                *left_counts.entry(w.clone()).or_default() += 1;
+                window_tokens += 1;
+            }
         }
-        for w in tokenize_for_collocates(&h.right) {
-            *right_counts.entry(w.to_owned()).or_default() += 1;
-            window_tokens += 1;
+        if rw > 0 {
+            for w in tokenize_for_collocates(&h.right).take(rw) {
+                *right_counts.entry(w).or_default() += 1;
+                window_tokens += 1;
+            }
         }
     }
 

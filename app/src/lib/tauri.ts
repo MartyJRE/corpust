@@ -17,7 +17,10 @@ export interface CollocatesRequest {
   corpusId: string;
   term: string;
   layer: QueryLayer;
-  window: number;
+  /** Tokens to consider on the left of the node. 0 = skip left. */
+  leftWindow: number;
+  /** Tokens to consider on the right of the node. 0 = skip right. */
+  rightWindow: number;
   limit: number;
 }
 

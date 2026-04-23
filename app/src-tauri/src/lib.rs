@@ -158,8 +158,11 @@ pub struct CollocatesRequest {
     pub corpus_id: String,
     pub term: String,
     pub layer: QueryLayer,
-    /// ±N tokens around the node to consider as the window.
-    pub window: usize,
+    /// Number of tokens to consider on the left of the node.
+    /// 0 = ignore the left context entirely.
+    pub left_window: usize,
+    /// Number of tokens to consider on the right of the node.
+    pub right_window: usize,
     /// Max number of collocate candidates to return.
     pub limit: usize,
 }

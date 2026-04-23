@@ -44,6 +44,8 @@ export function App() {
   const [term, setTerm] = useState("linguistic");
   const [result, setResult] = useState<KwicResult | null>(null);
   const [collocates, setCollocates] = useState<Collocate[] | null>(null);
+  const [collLeft, setCollLeft] = useState(5);
+  const [collRight, setCollRight] = useState(5);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<KwicHit | null>(null);
   const [sortMode, setSortMode] = useState<SortMode>("right1");
@@ -121,7 +123,8 @@ export function App() {
       corpusId: activeCorpus.id,
       term: term.trim(),
       layer,
-      window: 5,
+      leftWindow: collLeft,
+      rightWindow: collRight,
       limit: 60,
     })
       .then((r) => {
@@ -134,7 +137,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [subview, activeCorpus, term, layer]);
+  }, [subview, activeCorpus, term, layer, collLeft, collRight]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -304,7 +307,17 @@ export function App() {
             </>
           )}
           {subview === "coll" && activeCorpus && (
-            <CollocationsView corpus={activeCorpus} term={term} data={collocates} />
+            <CollocationsView
+              corpus={activeCorpus}
+              term={term}
+              data={collocates}
+              leftWindow={collLeft}
+              rightWindow={collRight}
+              onWindowChange={(l, r) => {
+                setCollLeft(l);
+                setCollRight(r);
+              }}
+            />
           )}
           {subview === "freq" && activeCorpus && (
             <FrequencyView corpus={activeCorpus} term={term} />

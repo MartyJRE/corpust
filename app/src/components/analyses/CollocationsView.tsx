@@ -64,11 +64,23 @@ export interface CollocationsViewProps {
    *  fixture `COLLOCATIONS` so the view still looks populated in
    *  demos / non-Tauri preview. */
   data?: Collocate[] | null;
+  /** Tokens on the left of the node to consider (0 = skip). Lifted
+   *  to App so the backend refetch uses the same values the UI shows. */
+  leftWindow?: number;
+  rightWindow?: number;
+  onWindowChange?: (left: number, right: number) => void;
 }
 
-export function CollocationsView({ term, data: dataProp }: CollocationsViewProps) {
+const WINDOW_CHOICES = [0, 1, 2, 3, 5, 7, 10] as const;
+
+export function CollocationsView({
+  term,
+  data: dataProp,
+  leftWindow = 5,
+  rightWindow = 5,
+  onWindowChange,
+}: CollocationsViewProps) {
   const [metric, setMetric] = useState<CollMetric>("logDice");
-  const [win, setWin] = useState<3 | 5 | 10>(5);
   const [hover, setHover] = useState<string | null>(null);
 
   const data = useMemo(
@@ -95,16 +107,33 @@ export function CollocationsView({ term, data: dataProp }: CollocationsViewProps
             collocates of <span className="kw">{term}</span>
           </h2>
           <div className="cx-coll-controls">
-            <span>window</span>
+            <span>L</span>
             <div className="cx-coll-segbtn">
-              {([3, 5, 10] as const).map((w) => (
+              {WINDOW_CHOICES.map((w) => (
                 <button
-                  key={w}
+                  key={`l-${w}`}
                   type="button"
-                  className={w === win ? "is-on" : ""}
-                  onClick={() => setWin(w)}
+                  className={w === leftWindow ? "is-on" : ""}
+                  onClick={() => onWindowChange?.(w, rightWindow)}
+                  disabled={!onWindowChange}
+                  title={w === 0 ? "skip left context" : `±${w} tokens left`}
                 >
-                  ±{w}
+                  {w}
+                </button>
+              ))}
+            </div>
+            <span style={{ marginLeft: 12 }}>R</span>
+            <div className="cx-coll-segbtn">
+              {WINDOW_CHOICES.map((w) => (
+                <button
+                  key={`r-${w}`}
+                  type="button"
+                  className={w === rightWindow ? "is-on" : ""}
+                  onClick={() => onWindowChange?.(leftWindow, w)}
+                  disabled={!onWindowChange}
+                  title={w === 0 ? "skip right context" : `±${w} tokens right`}
+                >
+                  {w}
                 </button>
               ))}
             </div>
