@@ -141,12 +141,35 @@ impl CorpusIndex {
         documents: impl IntoIterator<Item = Document>,
         annotator: Option<&(dyn Annotator + Sync)>,
     ) -> Result<()> {
+        self.add_documents_with_progress(documents, annotator, |_| {})
+    }
+
+    /// Like [`Self::add_documents`] but reports each document written
+    /// to the callback. `on_progress(n)` is invoked with the
+    /// cumulative doc count after each write (1-based), so callers can
+    /// drive a progress bar or emit UI events.
+    ///
+    /// The callback runs on the main thread (between Tantivy writes),
+    /// never concurrently — safe to capture a non-`Sync` event bus.
+    pub fn add_documents_with_progress<F>(
+        &self,
+        documents: impl IntoIterator<Item = Document>,
+        annotator: Option<&(dyn Annotator + Sync)>,
+        on_progress: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize),
+    {
         let mut writer = self.index.writer(50_000_000)?;
+        let mut on_progress = on_progress;
+        let mut done = 0usize;
 
         match annotator {
             None => {
                 for document in documents {
                     self.add_unannotated(&mut writer, &document)?;
+                    done += 1;
+                    on_progress(done);
                 }
             }
             Some(a) => {
@@ -169,6 +192,8 @@ impl CorpusIndex {
                     ordered.sort_by_key(|(i, _)| *i);
                     for (i, tokens) in ordered {
                         self.add_annotated(&mut writer, &chunk[i], &tokens)?;
+                        done += 1;
+                        on_progress(done);
                     }
                 }
             }

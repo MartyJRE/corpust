@@ -13,10 +13,56 @@ use corpust_annotate::Annotator;
 use corpust_index::{CorpusIndex, DEFAULT_CONTEXT};
 use corpust_query::{KwicRequest as CoreKwicRequest, kwic as run_core_kwic};
 use corpust_tagger::Tagger as RustTagger;
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
+
+const PROGRESS_EVENT: &str = "build:progress";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildProgress {
+    phase: &'static str,
+    docs_seen: u64,
+    docs_total: Option<u64>,
+    elapsed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn emit_progress(
+    app: &AppHandle,
+    started: Instant,
+    phase: &'static str,
+    seen: u64,
+    total: Option<u64>,
+) {
+    let _ = app.emit(
+        PROGRESS_EVENT,
+        BuildProgress {
+            phase,
+            docs_seen: seen,
+            docs_total: total,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            error: None,
+        },
+    );
+}
+
+fn emit_failure(app: &AppHandle, started: Instant, message: &str) {
+    let _ = app.emit(
+        PROGRESS_EVENT,
+        BuildProgress {
+            phase: "failed",
+            docs_seen: 0,
+            docs_total: None,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            error: Some(message.to_owned()),
+        },
+    );
+}
 
 #[tauri::command]
 pub fn list_corpora(state: State<'_, AppState>) -> Vec<CorpusMeta> {
@@ -102,8 +148,23 @@ pub fn run_kwic(
 
 #[tauri::command]
 pub fn build_index(
+    app: AppHandle,
     state: State<'_, AppState>,
     req: BuildRequest,
+) -> Result<CorpusMeta, String> {
+    let started = Instant::now();
+    let result = build_index_inner(&app, &state, &req, started);
+    if let Err(ref msg) = result {
+        emit_failure(&app, started, msg);
+    }
+    result
+}
+
+fn build_index_inner(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    req: &BuildRequest,
+    started: Instant,
 ) -> Result<CorpusMeta, String> {
     let source_path = PathBuf::from(&req.source_path);
     let out_path = PathBuf::from(&req.out_path);
@@ -121,6 +182,7 @@ pub fn build_index(
         return Err(format!("{} is not a directory", source_path.display()));
     }
 
+    emit_progress(app, started, "reading", 0, None);
     let docs = corpust_io::read_text_dir(&source_path)
         .map_err(|e| format!("reading {}: {e:#}", source_path.display()))?;
     let doc_count = docs.len();
@@ -157,26 +219,52 @@ pub fn build_index(
         (None, None)
     };
 
+    let indexing_phase = if req.annotate { "annotating" } else { "indexing" };
+    emit_progress(app, started, indexing_phase, 0, Some(doc_count as u64));
+
     let t_build = Instant::now();
     let index = CorpusIndex::create(&out_path)
         .map_err(|e| format!("creating index {}: {e:#}", out_path.display()))?;
+
+    // Throttle event emission: the indexer fires the callback per
+    // document. On fast workloads that's thousands of events per
+    // second — emit only when the count meaningfully advances or
+    // enough wall-clock has passed.
+    let mut last_emitted = 0usize;
+    let mut last_instant = Instant::now();
     index
-        .add_documents(docs, tagger.as_deref())
+        .add_documents_with_progress(docs, tagger.as_deref(), |seen| {
+            let elapsed = last_instant.elapsed();
+            if seen == doc_count
+                || seen - last_emitted >= (doc_count / 200).max(1)
+                || elapsed.as_millis() >= 100
+            {
+                emit_progress(app, started, indexing_phase, seen as u64, Some(doc_count as u64));
+                last_emitted = seen;
+                last_instant = Instant::now();
+            }
+        })
         .map_err(|e| format!("indexing failed: {e:#}"))?;
     let build_ms = t_build.elapsed().as_millis() as u64;
+    emit_progress(app, started, "committing", doc_count as u64, Some(doc_count as u64));
 
     let id = fresh_id();
+    let name = req
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            source_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("corpus")
+                .to_owned()
+        });
     let mut meta = CorpusMeta::stub(
         id.clone(),
-        req.name
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| {
-                source_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("corpus")
-                    .to_owned()
-            }),
+        name,
         out_path.to_string_lossy().into_owned(),
     );
     meta.source_path = source_path.to_string_lossy().into_owned();
@@ -192,6 +280,7 @@ pub fn build_index(
     meta.size_on_disk = dir_size(&out_path).unwrap_or(0);
     meta.annotator = tagger_id.clone();
     meta.tagger_id = tagger_id;
+    emit_progress(app, started, "done", doc_count as u64, Some(doc_count as u64));
     state
         .corpora
         .lock()

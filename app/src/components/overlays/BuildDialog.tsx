@@ -1,5 +1,5 @@
 import { FolderOpen, X } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { CorpusMeta } from "@/types";
 import { buildIndex, inTauri } from "@/lib/tauri";
 
@@ -9,13 +9,29 @@ async function pickDirectory(): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
+interface ProgressEvent {
+  phase: "idle" | "reading" | "indexing" | "annotating" | "committing" | "done" | "failed";
+  docsSeen: number;
+  docsTotal: number | null;
+  elapsedMs: number;
+  error?: string;
+}
+
+async function subscribeBuildProgress(
+  onEvent: (p: ProgressEvent) => void,
+): Promise<() => void> {
+  const { listen } = await import("@tauri-apps/api/event");
+  const unlisten = await listen<ProgressEvent>("build:progress", (e) => onEvent(e.payload));
+  return unlisten;
+}
+
 export interface BuildDialogProps {
   open: boolean;
   onClose: () => void;
   onBuilt: (corpus: CorpusMeta) => void;
 }
 
-type Phase = "idle" | "reading" | "indexing" | "annotating" | "done" | "failed";
+type Phase = "idle" | "reading" | "indexing" | "annotating" | "committing" | "done" | "failed";
 
 const TOTAL_DOCS = 544;
 
@@ -26,7 +42,9 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [progress, setProgress] = useState(0);
   const [docIdx, setDocIdx] = useState(0);
+  const [docTotal, setDocTotal] = useState<number | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const unlistenRef = useRef<null | (() => void)>(null);
 
   if (!open) return null;
 
@@ -39,15 +57,34 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
   const runRealBuild = async () => {
     setErrorMsg(null);
     setPhase("reading");
-    setProgress(0.05);
+    setProgress(0.02);
     setDocIdx(0);
-    // Cheap animated progress while the (synchronous) Rust call
-    // runs. Real event-driven progress is a follow-up.
-    const ticker = setInterval(() => {
-      setProgress((p) => Math.min(0.92, p + 0.01));
-      setDocIdx((n) => Math.min(TOTAL_DOCS - 10, n + 6));
-      setPhase((ph) => (ph === "reading" ? "indexing" : ph));
-    }, 120);
+    setDocTotal(null);
+
+    // Subscribe to build:progress events so the bar reflects real
+    // per-document progress from the Rust side instead of an
+    // animation that has nothing to do with the actual work.
+    if (unlistenRef.current) {
+      unlistenRef.current();
+      unlistenRef.current = null;
+    }
+    unlistenRef.current = await subscribeBuildProgress((p) => {
+      // "committing"/"done" arrive as synthetic 100% events from Rust.
+      if (p.phase !== "failed") setPhase(p.phase);
+      if (p.docsTotal) setDocTotal(p.docsTotal);
+      setDocIdx(p.docsSeen);
+      if (p.phase === "reading") {
+        // Reading phase doesn't have a total yet; use a tiny bump.
+        setProgress(0.05);
+      } else if (p.docsTotal && p.docsTotal > 0) {
+        setProgress(p.docsSeen / p.docsTotal);
+      }
+      if (p.phase === "failed" && p.error) {
+        setErrorMsg(p.error);
+        setPhase("failed");
+      }
+    });
+
     try {
       const meta = await buildIndex({
         sourcePath: path,
@@ -55,15 +92,19 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
         annotate,
         name: name.trim() || undefined,
       });
-      clearInterval(ticker);
       setPhase("done");
       setProgress(1);
-      setDocIdx(meta.docCount || TOTAL_DOCS);
+      setDocIdx(meta.docCount || docIdx);
+      setDocTotal(meta.docCount || docTotal);
       onBuilt(meta);
     } catch (e) {
-      clearInterval(ticker);
       setPhase("failed");
-      setErrorMsg(String(e));
+      setErrorMsg((prev) => prev ?? String(e));
+    } finally {
+      if (unlistenRef.current) {
+        unlistenRef.current();
+        unlistenRef.current = null;
+      }
     }
   };
 
@@ -125,16 +166,21 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
     }
   };
 
+  const total = docTotal ?? TOTAL_DOCS;
   const phaseMsg =
     phase === "reading"
       ? "reading documents…"
       : phase === "indexing"
-        ? `indexing · ${docIdx} / ${TOTAL_DOCS} docs · ${Math.round(4_500_000 * (progress + 0.1)).toLocaleString()} wps`
+        ? `indexing · ${docIdx.toLocaleString()} / ${total.toLocaleString()} docs`
         : phase === "annotating"
-          ? `annotating · TreeTagger · ${docIdx} / ${TOTAL_DOCS} docs`
-          : phase === "done"
-            ? `built · ${annotate ? "3:31" : "17.5 s"} · 79,467,311 tokens`
-            : "";
+          ? `annotating · ${docIdx.toLocaleString()} / ${total.toLocaleString()} docs`
+          : phase === "committing"
+            ? `committing index…`
+            : phase === "done"
+              ? `built · ${total.toLocaleString()} docs`
+              : phase === "failed"
+                ? "build failed"
+                : "";
 
   return (
     <div className="cx-modal-backdrop" onClick={phase === "idle" ? onClose : undefined}>
