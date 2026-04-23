@@ -1,7 +1,13 @@
-import { X } from "lucide-react";
+import { FolderOpen, X } from "lucide-react";
 import { useState } from "react";
 import type { CorpusMeta } from "@/types";
 import { buildIndex, inTauri } from "@/lib/tauri";
+
+async function pickDirectory(): Promise<string | null> {
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({ directory: true, multiple: false });
+  return typeof selected === "string" ? selected : null;
+}
 
 export interface BuildDialogProps {
   open: boolean;
@@ -14,7 +20,7 @@ type Phase = "idle" | "reading" | "indexing" | "annotating" | "done" | "failed";
 const TOTAL_DOCS = 544;
 
 export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
-  const [path, setPath] = useState("testdata/gutenberg");
+  const [path, setPath] = useState("");
   const [annotate, setAnnotate] = useState(true);
   const [name, setName] = useState("");
   const [phase, setPhase] = useState<Phase>("idle");
@@ -149,13 +155,31 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
           <label className="cx-form-label">
             Source directory <span className="cx-form-hint">recursive</span>
           </label>
-          <input
-            className="cx-input cx-input-mono"
-            value={path}
-            onChange={(e) => setPath(e.target.value)}
-            disabled={phase !== "idle"}
-            style={{ paddingLeft: 12 }}
-          />
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              className="cx-input cx-input-mono"
+              value={path}
+              onChange={(e) => setPath(e.target.value)}
+              disabled={phase !== "idle"}
+              placeholder={inTauri() ? "click browse, or paste an absolute path" : "/path/to/corpus"}
+              style={{ paddingLeft: 12, flex: 1 }}
+            />
+            {inTauri() && (
+              <button
+                type="button"
+                className="cx-btn cx-btn-outline"
+                onClick={async () => {
+                  const picked = await pickDirectory();
+                  if (picked) setPath(picked);
+                }}
+                disabled={phase !== "idle"}
+                title="pick a directory"
+              >
+                <FolderOpen size={13} />
+                <span style={{ marginLeft: 6 }}>browse</span>
+              </button>
+            )}
+          </div>
         </div>
         <div className="cx-form-row">
           <label className="cx-form-label">
@@ -210,8 +234,26 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
             {phase === "done" ? "Close" : "Cancel"}
           </button>
           {phase === "idle" && (
-            <button type="button" className="cx-btn cx-btn-primary" onClick={start}>
+            <button
+              type="button"
+              className="cx-btn cx-btn-primary"
+              onClick={start}
+              disabled={!path.trim()}
+            >
               Build
+            </button>
+          )}
+          {phase === "failed" && (
+            <button
+              type="button"
+              className="cx-btn cx-btn-primary"
+              onClick={() => {
+                setPhase("idle");
+                setErrorMsg(null);
+                setProgress(0);
+              }}
+            >
+              Retry
             </button>
           )}
         </div>

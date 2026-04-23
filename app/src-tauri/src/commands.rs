@@ -108,10 +108,32 @@ pub fn build_index(
     let source_path = PathBuf::from(&req.source_path);
     let out_path = PathBuf::from(&req.out_path);
 
+    if !source_path.exists() {
+        return Err(format!(
+            "source path {} does not exist (cwd is {})",
+            source_path.display(),
+            std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<unknown>".to_owned())
+        ));
+    }
+    if !source_path.is_dir() {
+        return Err(format!("{} is not a directory", source_path.display()));
+    }
+
     let docs = corpust_io::read_text_dir(&source_path)
         .map_err(|e| format!("reading {}: {e:#}", source_path.display()))?;
     let doc_count = docs.len();
     let byte_count: usize = docs.iter().map(|d| d.text.len()).sum();
+    if doc_count == 0 {
+        return Err(format!(
+            "no .txt files found under {} (cwd {})",
+            source_path.display(),
+            std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<unknown>".to_owned())
+        ));
+    }
 
     let (tagger, tagger_id) = if req.annotate {
         let (par, abbr_path) = resolve_treetagger_bundle("english")?;
