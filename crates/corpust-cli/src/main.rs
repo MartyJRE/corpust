@@ -9,10 +9,24 @@ use clap::{Parser, Subcommand, ValueEnum};
 use corpust_annotate::{Annotator, treetagger::TreeTagger};
 use corpust_index::{CorpusIndex, DEFAULT_CONTEXT, DEFAULT_LIMIT, QueryLayer};
 use corpust_query::{KwicRequest, kwic};
+use corpust_tagger::Tagger as RustTagger;
 use std::path::PathBuf;
 use std::time::Instant;
 
 const DEFAULT_TAGGER_BUNDLE: &str = "./resources/treetagger";
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TaggerArg {
+    /// Bundled `tree-tagger` binary — spawns one subprocess per
+    /// document and reloads the .par each time. Accurate (LancsBox
+    /// parity) but slow.
+    Subprocess,
+    /// Pure-Rust in-process tagger (`corpust-tagger::Tagger`).
+    /// ~200× faster per call, currently at ~92% POS accuracy
+    /// because dtree Viterbi hasn't landed. Use for indexing where
+    /// throughput matters more than exact parity.
+    Rust,
+}
 
 #[derive(Parser)]
 #[command(name = "corpust", version, about = "Corpus-linguistics CLI")]
@@ -30,10 +44,14 @@ enum Command {
         /// Where to write the index.
         #[arg(long)]
         out: PathBuf,
-        /// Enable POS + lemma annotation via TreeTagger during indexing.
-        /// Substantially slower — reloads the language model per document.
+        /// Enable POS + lemma annotation during indexing.
         #[arg(long)]
         annotate: bool,
+        /// Which tagger implementation to use when `--annotate` is
+        /// set. Default is the pure-Rust in-process tagger, which is
+        /// orders of magnitude faster than the subprocess.
+        #[arg(long, value_enum, default_value_t = TaggerArg::Rust)]
+        tagger: TaggerArg,
         /// Path to the TreeTagger bundle. Defaults to `./resources/treetagger`
         /// relative to the current working directory (repo layout).
         #[arg(long, default_value = DEFAULT_TAGGER_BUNDLE)]
@@ -88,9 +106,10 @@ fn main() -> Result<()> {
             input,
             out,
             annotate,
+            tagger,
             tagger_bundle,
             language,
-        } => run_index(input, out, annotate, tagger_bundle, language),
+        } => run_index(input, out, annotate, tagger, tagger_bundle, language),
         Command::Kwic {
             index,
             term,
@@ -105,6 +124,7 @@ fn run_index(
     input: PathBuf,
     out: PathBuf,
     annotate: bool,
+    tagger_kind: TaggerArg,
     tagger_bundle: PathBuf,
     language: String,
 ) -> Result<()> {
@@ -118,28 +138,19 @@ fn run_index(
     // Leak the string so we can keep the Annotator's `'static` constraint
     // satisfied — the value lives until process exit anyway.
     let lang_static: &'static str = Box::leak(language.into_boxed_str());
-    let tagger = if annotate {
-        let tt = TreeTagger::from_bundle(&tagger_bundle, lang_static).with_context(|| {
-            format!(
-                "locating TreeTagger bundle at {}",
-                tagger_bundle.display()
-            )
-        })?;
-        println!("annotation enabled: {}", tt.id());
-        Some(tt)
+    let tagger: Option<Box<dyn Annotator + Sync>> = if annotate {
+        Some(build_tagger(tagger_kind, &tagger_bundle, lang_static)?)
     } else {
         None
     };
+    if let Some(t) = tagger.as_deref() {
+        println!("annotation enabled: {}", t.id());
+    }
 
     let t1 = Instant::now();
     let index = CorpusIndex::create(&out)
         .with_context(|| format!("creating index at {}", out.display()))?;
-    index.add_documents(
-        docs,
-        tagger
-            .as_ref()
-            .map(|t| t as &(dyn corpust_annotate::Annotator + Sync)),
-    )?;
+    index.add_documents(docs, tagger.as_deref())?;
     let index_elapsed = t1.elapsed();
 
     println!(
@@ -150,6 +161,40 @@ fn run_index(
     );
     println!("index written to {}", out.display());
     Ok(())
+}
+
+fn build_tagger(
+    kind: TaggerArg,
+    bundle_root: &PathBuf,
+    language: &'static str,
+) -> Result<Box<dyn Annotator + Sync>> {
+    match kind {
+        TaggerArg::Subprocess => {
+            let tt = TreeTagger::from_bundle(bundle_root, language).with_context(|| {
+                format!("locating TreeTagger bundle at {}", bundle_root.display())
+            })?;
+            Ok(Box::new(tt))
+        }
+        TaggerArg::Rust => {
+            let par = bundle_root.join("lib").join(format!("{language}.par"));
+            let abbr_path = bundle_root.join("lib").join(format!("{language}-abbreviations"));
+            let abbr: Vec<String> = if abbr_path.exists() {
+                std::fs::read_to_string(&abbr_path)
+                    .with_context(|| format!("reading {}", abbr_path.display()))?
+                    .lines()
+                    .filter_map(|l| {
+                        let t = l.trim();
+                        (!t.is_empty() && !t.starts_with('#')).then(|| t.to_owned())
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let tagger = RustTagger::load(&par, language, abbr)
+                .with_context(|| format!("loading {}", par.display()))?;
+            Ok(Box::new(tagger))
+        }
+    }
 }
 
 fn run_kwic(
