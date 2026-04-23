@@ -210,6 +210,43 @@ mod tests {
         }
     }
 
+    /// Larger-corpus accuracy snapshot — ignored by default because it
+    /// runs the subprocess Oracle over a ~10 KB Gutenberg sample. Run
+    /// with `cargo test -p corpust-tagger --lib -- --nocapture --ignored`
+    /// to print the number; useful when validating a proposed Viterbi
+    /// change against the current lexicon-first baseline.
+    #[test]
+    #[ignore]
+    fn baseline_vs_oracle_on_gutenberg_sample() {
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let text_path = repo.join("testdata/gutenberg/1251.txt");
+        if !text_path.exists() {
+            return;
+        }
+        let full = std::fs::read_to_string(&text_path).unwrap();
+        let sample: String = full.chars().take(10_000).collect();
+        let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
+        let subject = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        let report = testkit::diff(&oracle, &subject, &sample).unwrap();
+        eprintln!(
+            "gutenberg sample: {} oracle / {} subject tokens, {} exact, \
+             {} word-err, {} POS-err, {} lemma-err, pos_acc={:.4}",
+            report.oracle_tokens,
+            report.subject_tokens,
+            report.matches,
+            report.word_errors(),
+            report.pos_errors(),
+            report.lemma_errors(),
+            report.pos_accuracy()
+        );
+    }
+
     /// Diff the pure-Rust lexicon-first tagger against the subprocess
     /// oracle on a short English sample. We don't expect parity yet —
     /// but the POS-accuracy number is the baseline we have to beat
