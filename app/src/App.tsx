@@ -124,6 +124,11 @@ export function App() {
   // Fetch real collocates when the Collocations view is active on a
   // real (backend-registered) corpus. Fixture corpora keep whatever
   // data.ts ships.
+  //
+  // Debounced by 300 ms so typing in the query bar doesn't kick off
+  // a fresh 5000-hit KWIC + aggregation on every keystroke —
+  // previous version made the UI lag badly while typing common
+  // words like "the".
   useEffect(() => {
     if (subview !== "coll" || !activeCorpus || !term.trim()) return;
     if (!inTauri() || !activeCorpus.id.startsWith("corpus-")) {
@@ -131,23 +136,27 @@ export function App() {
       return;
     }
     let cancelled = false;
-    runCollocates({
-      corpusId: activeCorpus.id,
-      term: term.trim(),
-      layer,
-      leftWindow: collLeft,
-      rightWindow: collRight,
-      limit: 60,
-    })
-      .then((r) => {
-        if (!cancelled) setCollocates(r.collocates);
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      runCollocates({
+        corpusId: activeCorpus.id,
+        term: term.trim(),
+        layer,
+        leftWindow: collLeft,
+        rightWindow: collRight,
+        limit: 60,
       })
-      .catch((e) => {
-        console.error("runCollocates failed:", e);
-        if (!cancelled) setCollocates([]);
-      });
+        .then((r) => {
+          if (!cancelled) setCollocates(r.collocates);
+        })
+        .catch((e) => {
+          console.error("runCollocates failed:", e);
+          if (!cancelled) setCollocates([]);
+        });
+    }, 300);
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
   }, [subview, activeCorpus, term, layer, collLeft, collRight]);
 
