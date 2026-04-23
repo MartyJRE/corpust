@@ -85,7 +85,7 @@ fn try_read_english_tries(
     }
     let mut cur = Cursor::new(bytes);
     cur.advance(ENGLISH_TRIES_START).ok()?;
-    tries::read(&mut cur, ENGLISH_DTREE_START).ok()
+    tries::read(&mut cur, header, ENGLISH_DTREE_START).ok()
 }
 
 /// Best-effort dtree load for the bundled `english.par`. Returns

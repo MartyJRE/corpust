@@ -84,12 +84,11 @@ impl Tagger {
     }
 
     /// Choose `(pos, lemma)` for a single token in isolation. Pure
-    /// lexicon lookup with Default-distribution fallback for unknowns.
-    /// No context from surrounding tokens yet (sub-task 2/3).
+    /// lexicon lookup, with suffix-trie guessing for unknowns and a
+    /// final Default-distribution fallback. No context from
+    /// surrounding tokens yet.
     fn tag_token(&self, word: &str) -> (Option<String>, Option<String>) {
         if let Some(entry) = self.model.lexicon.lookup(word) {
-            // Max-prob candidate. Lexicon candidates are never empty on
-            // a well-formed .par file.
             if let Some(best) = entry
                 .candidates
                 .iter()
@@ -100,22 +99,46 @@ impl Tagger {
                 return (pos, lemma);
             }
         }
-        // Unknown: use the peak tag of the Default distribution as a
-        // rough prior. Lemma defaults to the surface form, matching
-        // the TreeTagger convention for words with `<unknown>` lemma.
-        let peak_tag = self
-            .model
-            .dtree
-            .as_ref()
-            .and_then(|dt| {
-                dt.default()
-                    .distribution
-                    .probs
-                    .iter()
-                    .max_by(|a, b| a.prob.partial_cmp(&b.prob).unwrap_or(std::cmp::Ordering::Equal))
-            })
-            .and_then(|tp| self.model.header.tag(tp.tag_id).map(str::to_owned));
-        (peak_tag, Some(word.to_owned()))
+        // Unknown word: walk the suffix trie (capitalized words also
+        // try the prefix trie) for P(tag | affix), then fall back to
+        // the dtree Default. Lemma stays `None` — matches the
+        // subprocess oracle's `<unknown>` → None convention, so we
+        // don't falsely disagree on lemmas.
+        let peak_tag_id = self.guess_unknown_tag(word);
+        let pos = peak_tag_id.and_then(|t| self.model.header.tag(t.into()).map(str::to_owned));
+        (pos, None)
+    }
+
+    /// Guess the best POS tag ID for a word missing from the lexicon.
+    /// Tries the suffix trie first (words we've seen with this
+    /// ending), then the prefix trie for capitalized words, then the
+    /// dtree Default as an unconditional prior.
+    fn guess_unknown_tag(&self, word: &str) -> Option<u8> {
+        let tries = self.model.tries.as_ref()?;
+        // Suffix trie: iterate chars last-to-first.
+        if let Some(dist) = tries.suffix.lookup(word.chars().rev()) {
+            if let Some(tp) = dist.peak() {
+                return Some(tp.tag_id);
+            }
+        }
+        // Capitalized? Try prefix trie.
+        let first = word.chars().next();
+        if matches!(first, Some(c) if c.is_uppercase()) {
+            if let Some(dist) = tries.prefix.lookup(word.chars()) {
+                if let Some(tp) = dist.peak() {
+                    return Some(tp.tag_id);
+                }
+            }
+        }
+        // Final fallback: peak of the dtree Default distribution.
+        self.model.dtree.as_ref().and_then(|dt| {
+            dt.default()
+                .distribution
+                .probs
+                .iter()
+                .max_by(|a, b| a.prob.partial_cmp(&b.prob).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|tp| tp.tag_id as u8)
+        })
     }
 }
 
@@ -208,6 +231,50 @@ mod tests {
             assert!(t.pos.is_some(), "{}: should have a POS tag", t.word);
             assert!(t.lemma.is_some(), "{}: should have a lemma", t.word);
         }
+    }
+
+    /// Same #[ignored] baseline but broken down by error source
+    /// (unknown vs ambiguous-known) so we can see where the remaining
+    /// POS errors live. Informs where to invest next: trie-based
+    /// unknown-word guessing vs dtree-based context disambiguation.
+    #[test]
+    #[ignore]
+    fn baseline_error_breakdown_on_gutenberg_sample() {
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap();
+        let text_path = repo.join("testdata/gutenberg/1251.txt");
+        if !text_path.exists() { return }
+        let sample: String = std::fs::read_to_string(&text_path).unwrap().chars().take(10_000).collect();
+        let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
+        let subject = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        let report = testkit::diff(&oracle, &subject, &sample).unwrap();
+
+        let mut unknown_pos_err = 0;
+        let mut ambig_known_pos_err = 0;
+        let mut single_known_pos_err = 0;
+        for m in &report.mismatches {
+            if m.kind != testkit::MismatchKind::Pos { continue }
+            match subject.model.lexicon.lookup(&m.subject_word) {
+                None => unknown_pos_err += 1,
+                Some(entry) => {
+                    if entry.candidates.len() <= 1 {
+                        single_known_pos_err += 1;
+                    } else {
+                        ambig_known_pos_err += 1;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "POS-error breakdown on {}-token sample (total POS err = {}):\n\
+             \t{} unknown-word errors (fixable by trie prob linkage)\n\
+             \t{} ambiguous known-word errors (fixable by dtree Viterbi)\n\
+             \t{} single-candidate known errors (impossible without context or bug)",
+            report.oracle_tokens, report.pos_errors(),
+            unknown_pos_err, ambig_known_pos_err, single_known_pos_err,
+        );
     }
 
     /// Larger-corpus accuracy snapshot — ignored by default because it

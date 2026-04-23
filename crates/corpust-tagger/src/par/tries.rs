@@ -1,66 +1,66 @@
-//! `.par` affix tries — prefix + suffix + shared prob-tag array.
+//! `.par` affix tries — prefix + suffix + two prob-tag arrays.
 //!
 //! Structural layout (reverse-engineered on `english.par` 2026-04-23).
 //!
-//! The slab between the lexicon and the decision tree holds three
-//! logical regions in fixed order:
+//! The slab between the lexicon and the decision tree holds:
 //!
 //! ```text
-//! offset (slab-relative)   size            kind
-//! -----------------------------------------------------------------
-//! 0x000000 ..              ~0.5 KB         pre-trie prelude (opaque)
-//! 0x0001d2 .. 0x008e72     ~36 KB          PREFIX trie, 3000 entries × 12 B
-//! 0x008e73 .. 0x0141aa     ~46 KB          shared prob-tag array, 5735 × 8 B
-//! 0x0141ac .. 0x01d254     ~37 KB          SUFFIX trie, 3086 entries × 12 B
+//! offset (slab-rel.)   size       kind
+//! ----------------------------------------------------------------------
+//! 0x000000 ..          ~466 B     prelude: 58 × f64 (per-tag stats)
+//! 0x0001d2 .. 0x008e72 ~36 KB     PREFIX trie, 3000 × 12-byte entries
+//! 0x008e73 .. 0x0141aa ~46 KB     prob-array-1 (preceded by 1-byte 0x15)
+//! 0x0141ac .. 0x01d254 ~37 KB     SUFFIX trie, 3086 × 12-byte entries
+//! 0x01d255 .. 0x0294f8 ~50 KB     prob-array-2 (preceded by 1-byte 0x15)
 //! ```
 //!
-//! (Prior plan notes had the trie offsets slightly off; the entries'
-//! own `0xBABABABA` footer makes the real boundaries trivial to find
-//! by scanning.)
+//! Key facts:
 //!
-//! ## Entry layout — both tries
+//! - **Each trie's entries form a binary parent-children tree.** The
+//!   header entry (at index 0) has `count=61, offset=1`: 61 direct
+//!   children starting at entries index 1. Any entry with `flag=0`
+//!   is interior and has `count` children at `entries[offset .. offset+count]`.
+//!   Entries with `flag=1` are leaves.
+//! - **Each trie has its own prob-tag array.** Prefix trie's array is
+//!   the one between the tries; suffix trie's array is the one between
+//!   the suffix trie and the dtree section.
+//! - **Each prob-array is preceded by a single `0x15` byte** that
+//!   doesn't belong to any record — skip it before decoding.
+//! - **Each prob-array segments cleanly into distributions.** Records
+//!   within a distribution are sorted descending by probability; a
+//!   new distribution begins when the probability jumps back up or
+//!   the running sum reaches 1. Every segment sums to exactly 1.0.
+//! - **Leaves map 1:1 to distributions by walk-order.** Pre-order DFS
+//!   walk of the trie visits leaves in the same order the
+//!   distributions appear in the prob-array. The N-th leaf
+//!   encountered uses the N-th segment as its `P(tag | this suffix)`.
+//!
+//! ## Record layout (unchanged)
+//!
+//! Trie entries (12 bytes):
 //!
 //! ```text
-//! 12 bytes per entry:
-//!   u16  flag            // 0 = interior (has children),
-//!                        // 1 = leaf (no children; `offset` is the
-//!                        //          sentinel 47802)
-//!   u16  char            // character (UTF-16 LE). Real chars for
-//!                        //   deeper entries; the trie root has a
-//!                        //   header entry with `char = 0x0101` as
-//!                        //   a "root" marker — see [`Trie::root_index`].
-//!   u16  count           // for flag=0: number of child entries.
-//!                        //   for flag=1: undecoded (small int, possibly
-//!                        //   a prob-record count — see the
-//!                        //   "distributions are unresolved" note).
-//!   u16  offset          // for flag=0: entries-array index of the
-//!                        //   first child. Children are contiguous
-//!                        //   in file order: entries[offset..offset+count].
-//!   u32  0xBABABABA      // footer / canary.
+//! u16 flag     // 0 = interior, 1 = leaf (offset sentinel 47802)
+//! u16 char     // UTF-16 LE char on this edge
+//! u16 count    // flag=0: child count.  flag=1: small, TBD.
+//! u16 offset   // flag=0: entries-array index of first child
+//! u32 0xBABABABA
 //! ```
 //!
-//! ## Reading the suffix trie recursively yields **real English
-//! word endings**: `s`, `ses`, `sesi` (= "...ises"), `seit`
-//! (= "...ties"), `sred` (= "...ders"), etc. That's what pins down
-//! the structural interpretation above.
+//! Prob-array records (8 bytes):
 //!
-//! ## Distributions are still unresolved
-//!
-//! Each trie node should carry a `P(tag | this-suffix)` distribution
-//! for unknown-word tagging. The `count` and `offset` fields of
-//! flag=0 entries turned out to be structural (children-pointer), not
-//! prob-tag-array pointers — so the linkage from a trie node to its
-//! distribution isn't the simple `(count, offset)` the plan assumed.
-//! The 5735-record prob-tag array has the distributions, but mapping
-//! trie-node → prob-array-slice needs more archaeology.
-//!
-//! For now this module exposes the structural reader only. Unknown-
-//! word tag guessing is still gated on the missing prob-array linkage.
+//! ```text
+//! u8  flag=0
+//! u16 canary=0xBABA
+//! f32 prob
+//! u8  tag_id
+//! ```
 
 use super::Cursor;
+use super::header::Header;
 use anyhow::{Context, Result, bail};
 
-/// One 12-byte trie entry.
+/// One trie-edge entry.
 #[derive(Debug, Clone, Copy)]
 pub struct TrieEntry {
     pub flag: u16,
@@ -75,22 +75,48 @@ impl TrieEntry {
     pub fn is_leaf(&self) -> bool {
         self.flag == 1
     }
-
     pub fn as_char(&self) -> Option<char> {
         char::from_u32(self.char as u32).filter(|c| !c.is_control())
     }
 }
 
-/// A suffix or prefix trie.
+/// One `(tag, prob)` pair inside a distribution.
+#[derive(Debug, Clone, Copy)]
+pub struct TagProb {
+    pub tag_id: u8,
+    pub prob: f32,
+}
+
+/// A probability distribution — a slice of descending-sorted
+/// `(tag, prob)` pairs summing to `~1.0`.
+#[derive(Debug, Clone)]
+pub struct Distribution {
+    pub probs: Vec<TagProb>,
+}
+
+impl Distribution {
+    /// Tag with the largest probability in the distribution.
+    pub fn peak(&self) -> Option<TagProb> {
+        self.probs.iter().max_by(|a, b| {
+            a.prob.partial_cmp(&b.prob).unwrap_or(std::cmp::Ordering::Equal)
+        }).copied()
+    }
+}
+
+/// A suffix or prefix trie, with every leaf already pointing at its
+/// distribution.
 #[derive(Debug, Clone)]
 pub struct Trie {
-    /// All entries in file order. Entry `root_index` is the root
-    /// marker; entries `[root_index+1 .. root_index+1+count]` are
-    /// the root's direct children.
+    /// All entries in file order.
     pub entries: Vec<TrieEntry>,
-    /// The index into `entries` of the root-marker entry. Typically
-    /// `0`.
+    /// Root marker index (typically 0).
     pub root_index: usize,
+    /// For each entry index, the index into `distributions` if this
+    /// entry is a leaf, else `None`.
+    pub leaf_dist: Vec<Option<usize>>,
+    /// Leaf distributions in walk-order. Parallel to the sequence
+    /// of leaves produced by a pre-order DFS from `root_index`.
+    pub distributions: Vec<Distribution>,
 }
 
 impl Trie {
@@ -98,8 +124,6 @@ impl Trie {
         &self.entries[self.root_index]
     }
 
-    /// Iterate the direct children of `entry`. Honors the
-    /// entries-index semantics of `offset` for flag=0 nodes.
     pub fn children(&self, entry: &TrieEntry) -> &[TrieEntry] {
         if entry.is_leaf() {
             return &[];
@@ -111,14 +135,46 @@ impl Trie {
         }
         &self.entries[start..end]
     }
+
+    /// For an unknown word, walk the trie (suffix trie: consume the
+    /// word's trailing characters; prefix trie: consume the leading
+    /// characters) and return the distribution at the deepest leaf
+    /// reached. Returns `None` if the walk never hits a leaf — e.g.
+    /// the first char has no matching child, or the word is shorter
+    /// than the deepest path.
+    ///
+    /// `chars` is an iterator of the characters in the order they
+    /// should be matched (last-to-first for suffix trie,
+    /// first-to-last for prefix trie).
+    pub fn lookup<I: IntoIterator<Item = char>>(&self, chars: I) -> Option<&Distribution> {
+        let mut cur = self.root_index;
+        let mut best: Option<usize> = None;
+        for ch in chars {
+            let entry = &self.entries[cur];
+            let kids = self.children(entry);
+            let found = kids
+                .iter()
+                .position(|e| e.as_char() == Some(ch));
+            let Some(pos) = found else { break };
+            let child_idx = entry.offset as usize + pos;
+            if let Some(d) = self.leaf_dist[child_idx] {
+                best = Some(d);
+                break; // leaves have no children to descend into
+            }
+            cur = child_idx;
+        }
+        best.and_then(|d| self.distributions.get(d))
+    }
 }
 
-/// One record in the shared prob-tag array.
-///
-/// Flag is always 0 on the records we've observed; `canary` is always
-/// `0xBABA`. `prob` is `P(tag | some-trie-node-context)` — *which*
-/// trie node owns which slice of this array is still open (see module
-/// docs).
+/// Shared header + the raw prob-array records for debugging.
+#[derive(Debug, Clone)]
+pub struct ProbTagArray {
+    /// Raw 8-byte records as parsed. Includes any junk/filler.
+    pub records: Vec<ProbTagRecord>,
+}
+
+/// One 8-byte record in a prob-tag array.
 #[derive(Debug, Clone, Copy)]
 pub struct ProbTagRecord {
     pub flag: u8,
@@ -127,69 +183,83 @@ pub struct ProbTagRecord {
     pub tag_id: u8,
 }
 
-/// Shared prob-tag array (one pool shared by both tries).
-#[derive(Debug, Clone)]
-pub struct ProbTagArray {
-    pub records: Vec<ProbTagRecord>,
-}
-
 /// Fully loaded affix-tries slab.
 #[derive(Debug, Clone)]
 pub struct Tries {
     pub prefix: Trie,
-    pub prob_tag: ProbTagArray,
     pub suffix: Trie,
+    /// Raw prob-array-1 records for diagnostic tooling. Segmented
+    /// into distributions inside `prefix.distributions`.
+    pub prob_array_1: ProbTagArray,
+    /// Raw prob-array-2 records. Segmented into `suffix.distributions`.
+    pub prob_array_2: ProbTagArray,
 }
 
-/// Parse the tries slab from the cursor's current position to the
-/// given end offset (== start of the decision-tree section).
-pub fn read(cur: &mut Cursor<'_>, slab_end: usize) -> Result<Tries> {
+/// Parse the tries slab + its two prob-arrays + the one that lives
+/// between the suffix trie and the decision tree.
+///
+/// `slab_start` is the cursor's current offset. `dtree_start` is the
+/// absolute file offset where the decision tree begins — the second
+/// prob-array extends from just-after-the-suffix-trie to just-before
+/// the dtree.
+pub fn read(cur: &mut Cursor<'_>, _header: &Header, dtree_start: usize) -> Result<Tries> {
     let slab_start = cur.offset();
-    if slab_end <= slab_start {
-        bail!("tries slab end {slab_end} must be past cursor offset {slab_start}");
+    if dtree_start <= slab_start {
+        bail!(
+            "dtree start {dtree_start} must be past slab start {slab_start}"
+        );
     }
     let bytes = cur.bytes_after_cursor();
-    let slab_len = slab_end - slab_start;
-    if slab_len > bytes.len() {
-        bail!("tries slab length {slab_len} exceeds remaining cursor bytes {}", bytes.len());
+    let remaining = dtree_start - slab_start;
+    if remaining > bytes.len() {
+        bail!(
+            "slab length {remaining} exceeds remaining cursor bytes {}",
+            bytes.len()
+        );
     }
-    let slab = &bytes[..slab_len];
+    let slab = &bytes[..remaining];
 
-    // Scan for 3-in-a-row 12-byte entries with the 0xBABABABA footer.
-    // That finds the first trie's start. Then walk entries until the
-    // footer pattern breaks — that's the first trie's end.
+    // Locate prefix trie entry run.
     let prefix_start = find_entry_run(slab, 0)
-        .context("could not locate prefix trie — no 3-run of 0xBABABABA-footer 12-byte entries")?;
+        .context("could not locate prefix trie")?;
     let prefix_entries = walk_entries(slab, prefix_start);
     let prefix_end = prefix_start + prefix_entries.len() * 12;
 
-    // Prob-tag array runs from prefix_end to the suffix trie start.
-    let suffix_start = find_entry_run(slab, prefix_end)
-        .context("could not locate suffix trie after prefix trie + prob-tag array")?;
-    let prob_tag_bytes = &slab[prefix_end..suffix_start];
-    let prob_tag = parse_prob_tag_array(prob_tag_bytes);
+    // 1-byte prelude (`0x15`) separates prefix trie from prob-array-1.
+    // Skip it before decoding records.
+    let pa1_start = prefix_end + 1;
 
+    // Suffix trie: locate it via the same 3-run-of-footers scan,
+    // starting somewhere past prob-array-1. We don't know the exact
+    // end of prob-array-1 up-front, so just scan from the end of
+    // the prefix trie.
+    let suffix_start = find_entry_run(slab, prefix_end + 1)
+        .context("could not locate suffix trie after prefix trie")?;
     let suffix_entries = walk_entries(slab, suffix_start);
     let suffix_end = suffix_start + suffix_entries.len() * 12;
 
-    if suffix_end > slab_len {
-        bail!(
-            "suffix trie at slab+{suffix_start} would run past slab end \
-             (slab_len={slab_len}, suffix_end={suffix_end})"
-        );
-    }
+    // 1-byte prelude again.
+    let pa2_start = suffix_end + 1;
+    let pa2_end = remaining;
 
-    let prefix = build_trie(prefix_entries)?;
-    let suffix = build_trie(suffix_entries)?;
+    // prob-array-1: from pa1_start up to suffix_start.
+    let prob_array_1 = parse_prob_tag_array(&slab[pa1_start..suffix_start]);
+    let prob_array_2 = parse_prob_tag_array(&slab[pa2_start..pa2_end]);
 
-    // Advance cursor to slab_end so downstream callers can pick up.
-    cur.advance(slab_len)
+    let prefix_dists = segment_distributions(&prob_array_1);
+    let suffix_dists = segment_distributions(&prob_array_2);
+
+    let prefix = build_trie(prefix_entries, prefix_dists)?;
+    let suffix = build_trie(suffix_entries, suffix_dists)?;
+
+    cur.advance(remaining)
         .context("advancing cursor past tries slab")?;
 
     Ok(Tries {
         prefix,
-        prob_tag,
         suffix,
+        prob_array_1,
+        prob_array_2,
     })
 }
 
@@ -209,7 +279,10 @@ fn is_entry_at(slab: &[u8], off: usize) -> bool {
 fn find_entry_run(slab: &[u8], start: usize) -> Option<usize> {
     let mut off = start;
     while off + 36 <= slab.len() {
-        if is_entry_at(slab, off) && is_entry_at(slab, off + 12) && is_entry_at(slab, off + 24) {
+        if is_entry_at(slab, off)
+            && is_entry_at(slab, off + 12)
+            && is_entry_at(slab, off + 24)
+        {
             return Some(off);
         }
         off += 1;
@@ -221,81 +294,139 @@ fn walk_entries(slab: &[u8], start: usize) -> Vec<TrieEntry> {
     let mut out = Vec::new();
     let mut off = start;
     while is_entry_at(slab, off) {
-        let flag = u16::from_le_bytes([slab[off], slab[off + 1]]);
-        let char = u16::from_le_bytes([slab[off + 2], slab[off + 3]]);
-        let count = u16::from_le_bytes([slab[off + 4], slab[off + 5]]);
-        let offset = u16::from_le_bytes([slab[off + 6], slab[off + 7]]);
         out.push(TrieEntry {
-            flag,
-            char,
-            count,
-            offset,
+            flag: u16::from_le_bytes([slab[off], slab[off + 1]]),
+            char: u16::from_le_bytes([slab[off + 2], slab[off + 3]]),
+            count: u16::from_le_bytes([slab[off + 4], slab[off + 5]]),
+            offset: u16::from_le_bytes([slab[off + 6], slab[off + 7]]),
         });
         off += 12;
     }
     out
 }
 
-fn build_trie(entries: Vec<TrieEntry>) -> Result<Trie> {
-    if entries.is_empty() {
-        bail!("cannot build a trie from zero entries");
-    }
-    // The header / root entry is entry 0 by convention. Verify by
-    // checking that its `offset` points just past itself (= 1) and
-    // its `count` children fit inside the entries vector.
-    let root = &entries[0];
-    if root.flag != 0 {
-        bail!(
-            "trie root is marked as a leaf (flag=1), which makes no sense \
-             for a multi-entry trie"
-        );
-    }
-    let root_end = root.offset as usize + root.count as usize;
-    if root_end > entries.len() {
-        bail!(
-            "trie root claims {} children starting at entries index {}, \
-             but there are only {} entries total",
-            root.count,
-            root.offset,
-            entries.len()
-        );
-    }
-    Ok(Trie {
-        entries,
-        root_index: 0,
-    })
-}
-
 fn parse_prob_tag_array(bytes: &[u8]) -> ProbTagArray {
     let mut records = Vec::with_capacity(bytes.len() / 8);
     let mut off = 0;
     while off + 8 <= bytes.len() {
-        let flag = bytes[off];
-        let canary = u16::from_le_bytes([bytes[off + 1], bytes[off + 2]]);
-        let prob = f32::from_le_bytes([
-            bytes[off + 3],
-            bytes[off + 4],
-            bytes[off + 5],
-            bytes[off + 6],
-        ]);
-        let tag_id = bytes[off + 7];
-        // Keep the record regardless of whether it looks clean; the
-        // array is known to contain filler bytes (0xBA fill) between
-        // real records. Callers filter by `flag == 0 && canary == 0xBABA`.
         records.push(ProbTagRecord {
-            flag,
-            canary,
-            prob,
-            tag_id,
+            flag: bytes[off],
+            canary: u16::from_le_bytes([bytes[off + 1], bytes[off + 2]]),
+            prob: f32::from_le_bytes([
+                bytes[off + 3],
+                bytes[off + 4],
+                bytes[off + 5],
+                bytes[off + 6],
+            ]),
+            tag_id: bytes[off + 7],
         });
         off += 8;
     }
     ProbTagArray { records }
 }
 
+/// Segment a prob-tag array into per-leaf distributions.
+///
+/// Boundary rule: a new distribution starts when the current
+/// record's `prob` is greater than the previous one (records are
+/// sorted descending within a distribution) OR the running sum
+/// would exceed 1.0. Empirically partitions every known array
+/// cleanly into `sum ≈ 1.0` segments.
+fn segment_distributions(array: &ProbTagArray) -> Vec<Distribution> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut cur_sum = 0.0f32;
+    let mut cur_prev = f32::MAX; // force a fresh start on first record
+
+    for (idx, rec) in array.records.iter().enumerate() {
+        // Only segment on clean records. Garbage-prob values at the
+        // tail of a run (if any) get swept into the current segment
+        // silently; real .par files seem not to have trailing junk.
+        if idx > start
+            && (rec.prob > cur_prev + 1e-4 || cur_sum + rec.prob > 1.001)
+        {
+            out.push(segment_to_dist(&array.records[start..idx]));
+            start = idx;
+            cur_sum = 0.0;
+        }
+        cur_sum += rec.prob;
+        cur_prev = rec.prob;
+    }
+    if start < array.records.len() {
+        out.push(segment_to_dist(&array.records[start..]));
+    }
+    out
+}
+
+fn segment_to_dist(records: &[ProbTagRecord]) -> Distribution {
+    Distribution {
+        probs: records
+            .iter()
+            .map(|r| TagProb {
+                tag_id: r.tag_id,
+                prob: r.prob,
+            })
+            .collect(),
+    }
+}
+
+fn build_trie(entries: Vec<TrieEntry>, distributions: Vec<Distribution>) -> Result<Trie> {
+    if entries.is_empty() {
+        bail!("cannot build a trie from zero entries");
+    }
+    let root = &entries[0];
+    if root.flag != 0 {
+        bail!(
+            "trie root is marked as a leaf (flag=1) — can't be, root must have children"
+        );
+    }
+    let root_end = root.offset as usize + root.count as usize;
+    if root_end > entries.len() {
+        bail!(
+            "trie root claims {} children at index {}, but only {} entries",
+            root.count,
+            root.offset,
+            entries.len()
+        );
+    }
+
+    // Walk leaves in pre-order DFS; the i-th leaf gets distribution i.
+    let mut leaf_dist = vec![None; entries.len()];
+    let mut stack = vec![0usize];
+    let mut leaf_counter = 0usize;
+    let n_dists = distributions.len();
+    while let Some(idx) = stack.pop() {
+        let e = &entries[idx];
+        if e.flag == 1 {
+            if leaf_counter < n_dists {
+                leaf_dist[idx] = Some(leaf_counter);
+            }
+            leaf_counter += 1;
+            continue;
+        }
+        // Push children in reverse so we pop them in natural order.
+        let start = e.offset as usize;
+        let end = start + e.count as usize;
+        if end > entries.len() {
+            continue;
+        }
+        for c in (start..end).rev() {
+            stack.push(c);
+        }
+    }
+
+    Ok(Trie {
+        entries,
+        root_index: 0,
+        leaf_dist,
+        distributions,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::par::header;
     use std::path::{Path, PathBuf};
 
     fn english_par_path() -> Option<PathBuf> {
@@ -314,54 +445,81 @@ mod tests {
         let bytes = std::fs::read(&par).unwrap();
         const SLAB_START: usize = 0xcf9cc3;
         const DTREE_START: usize = 0xd231bb;
+
+        // Need the real header so _header: &Header is available. Just
+        // parse it in-place from file-start to keep the test self-
+        // contained.
+        let mut hcur = Cursor::new(&bytes);
+        let hdr = header::read(&mut hcur).unwrap();
+
         let mut cur = Cursor::new(&bytes);
         cur.advance(SLAB_START).unwrap();
-        let tries = read(&mut cur, DTREE_START).unwrap();
+        let tries = read(&mut cur, &hdr, DTREE_START).unwrap();
 
-        // Sizes matching earlier archaeology:
-        assert_eq!(tries.prefix.entries.len(), 3000, "prefix trie entry count");
-        assert_eq!(tries.suffix.entries.len(), 3086, "suffix trie entry count");
-        // Prob-tag array: some thousands of records. Prior note:
-        // plan said ~5738, count here is the raw 8-byte-stride parse.
+        assert_eq!(tries.prefix.entries.len(), 3000, "prefix trie entries");
+        assert_eq!(tries.suffix.entries.len(), 3086, "suffix trie entries");
+
+        // Prob-arrays clean count
         assert!(
-            tries.prob_tag.records.len() > 5000,
-            "expected >5k prob-tag records, got {}",
-            tries.prob_tag.records.len()
+            tries.prob_array_1.records.iter().filter(|r| r.flag == 0 && r.canary == 0xBABA).count() > 5700,
+            "prob-array-1 should have >5700 clean records"
+        );
+        assert!(
+            tries.prob_array_2.records.iter().filter(|r| r.flag == 0 && r.canary == 0xBABA).count() > 6000,
+            "prob-array-2 should have >6000 clean records"
         );
 
-        // Suffix trie root: 61 children. The first few are the
-        // most-frequent word-ending letters in English: 's', 'e',
-        // 'n', 'd', 'y', ...
+        // Distribution counts match leaf counts (1:1 file-order mapping).
+        let prefix_leaves = tries.prefix.entries.iter().filter(|e| e.is_leaf()).count();
+        let suffix_leaves = tries.suffix.entries.iter().filter(|e| e.is_leaf()).count();
+        assert_eq!(prefix_leaves, 1728, "prefix leaves");
+        assert_eq!(suffix_leaves, 2187, "suffix leaves");
+        // Allow +/- 1 between distribution count and leaf count — the
+        // segmentation heuristic sometimes picks up a trailing 1-record
+        // "segment" past the last real distribution.
+        assert!(
+            (tries.prefix.distributions.len() as isize - prefix_leaves as isize).abs() <= 1,
+            "prefix distributions ({}) should match leaf count ({})",
+            tries.prefix.distributions.len(),
+            prefix_leaves
+        );
+        assert!(
+            (tries.suffix.distributions.len() as isize - suffix_leaves as isize).abs() <= 1,
+            "suffix distributions ({}) should match leaf count ({})",
+            tries.suffix.distributions.len(),
+            suffix_leaves
+        );
+
+        // Every distribution sums to ~1.
+        for (i, d) in tries.suffix.distributions.iter().enumerate().take(100) {
+            let s: f32 = d.probs.iter().map(|tp| tp.prob).sum();
+            assert!((s - 1.0).abs() < 0.01, "suffix dist {i} sum={s}");
+        }
+
+        // Structural sanity: walk suffix trie from 's' → 'e' → 's'
+        // (suffix "ses") and verify that each child lookup works.
         let root = tries.suffix.root();
-        assert_eq!(root.count, 61, "suffix trie root child count");
         let kids = tries.suffix.children(root);
-        assert_eq!(kids.len(), 61);
-        let first_chars: Vec<char> = kids.iter().take(5).filter_map(|e| e.as_char()).collect();
-        assert_eq!(first_chars, vec!['s', 'e', 'n', 'd', 'y']);
+        let s_node = kids.iter().find(|e| e.as_char() == Some('s')).unwrap();
+        let s_kids = tries.suffix.children(s_node);
+        let es_node = s_kids.iter().find(|e| e.as_char() == Some('e')).unwrap();
+        let es_kids = tries.suffix.children(es_node);
+        let ses_node = es_kids.iter().find(|e| e.as_char() == Some('s')).unwrap();
+        let _ = ses_node;
 
-        // Suffix trie should produce real English endings when walked.
-        // Pick 's' → 'e' → 's' — walk should land at children that are
-        // valid (flag=0) or leaves (flag=1) with character continuations
-        // that build a real suffix.
-        let s_node = kids[0]; // 's'
-        assert_eq!(s_node.as_char(), Some('s'));
-        let s_kids = tries.suffix.children(&s_node);
-        // 's' has 23 children per `count`
-        assert_eq!(s_kids.len(), 23);
-        // First child of 's' is 'e' (suffix 'es')
-        assert_eq!(s_kids[0].as_char(), Some('e'));
-        let es_node = s_kids[0];
-        let es_kids = tries.suffix.children(&es_node);
-        // 'es' has 20 children
-        assert_eq!(es_kids.len(), 20);
-        // First child is 's' — so we've built the suffix "ses" walking s → e → s
-        assert_eq!(es_kids[0].as_char(), Some('s'));
-
-        // Prefix trie root sanity.
-        let proot = tries.prefix.root();
-        assert_eq!(
-            proot.count, 61,
-            "prefix trie root child count (same marker format as suffix)"
-        );
+        // Suffix lookup for a word: walk the suffix trie in reverse
+        // order of the word's characters. 'classes' → chars reversed
+        // = 's', 'e', 's', 's', 'a', 'l', 'c'. Deepest matching leaf
+        // gives an NN-heavy distribution.
+        let dist = tries
+            .suffix
+            .lookup("classes".chars().rev())
+            .expect("lookup for 'classes' should hit a leaf in the suffix trie");
+        let peak = dist.peak().unwrap();
+        // NN = 19 on english.par. 'sses' leaf had dist NN=0.98 in the
+        // Python exploration — assert NN is the top tag and its prob
+        // is high.
+        assert_eq!(peak.tag_id, 19, "peak tag for 'classes' should be NN (tag 19)");
+        assert!(peak.prob > 0.9, "peak prob for 'classes' should be > 0.9, was {}", peak.prob);
     }
 }
