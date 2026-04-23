@@ -1,5 +1,5 @@
 import { FolderOpen, X } from "lucide-react";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { CorpusMeta, TaggerKind } from "@/types";
 import { buildIndex, inTauri } from "@/lib/tauri";
 
@@ -68,6 +68,24 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
   const [elapsedMs, setElapsedMs] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const unlistenRef = useRef<null | (() => void)>(null);
+
+  // Reset state when the dialog re-opens after a finished build so
+  // the Build button (gated on phase === "idle") is available again.
+  // Ongoing builds keep their state so re-opening mid-build doesn't
+  // wipe in-flight progress.
+  useEffect(() => {
+    if (!open) return;
+    if (phase === "done" || phase === "failed") {
+      setPhase("idle");
+      setProgress(0);
+      setDocIdx(0);
+      setDocTotal(null);
+      setElapsedMs(0);
+      setErrorMsg(null);
+      setName("");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
 
   if (!open) return null;
 
