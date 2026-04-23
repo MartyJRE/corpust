@@ -249,7 +249,7 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
               disabled={phase !== "idle"}
             />
             <span>
-              Annotate with TreeTagger (lemma + POS)<span className="sub"> · ≈18× slower</span>
+              Annotate with pure-Rust TreeTagger (lemma + POS)<span className="sub"> · ≈3× slower</span>
             </span>
           </label>
         </div>
