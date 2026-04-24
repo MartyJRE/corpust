@@ -4,7 +4,7 @@
 //   runKwic(req)   → result
 //   buildIndex(…)  → stream progress into BuildDialog
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Sidebar } from "@/components/chrome/Sidebar";
 import { StatusBar } from "@/components/chrome/StatusBar";
 import { TitleStrip } from "@/components/chrome/TitleStrip";
@@ -22,7 +22,7 @@ import { CommandPalette, type CommandDef } from "@/components/overlays/CommandPa
 import { BuildDialog } from "@/components/overlays/BuildDialog";
 import { CORPORA, RECENT_QUERIES, pickHits } from "@/data";
 import { makeDensity } from "@/lib/utils";
-import { inTauri, runCollocates, runKwic as runKwicTauri } from "@/lib/tauri";
+import { inTauri, listCorpora, runCollocates, runKwic as runKwicTauri } from "@/lib/tauri";
 import type { Collocate } from "@/types";
 import type {
   CorpusMeta,
@@ -66,6 +66,38 @@ export function App() {
   const [filters, setFilters] = useState<Filter[]>([{ key: "year", label: "year: 1800–1950" }]);
   const scrollPct = 0.18;
 
+  // Refresh the corpora list from disk via the Tauri backend. Real
+  // (persisted) corpora land at the top; baked-in fixtures stay below
+  // as the always-available demo set.
+  const refreshCorpora = useCallback(async () => {
+    if (!inTauri()) return;
+    try {
+      const saved = await listCorpora();
+      setCorpora((prev) => {
+        const fixtures = prev.filter((c) => CORPORA.some((f) => f.id === c.id));
+        const dedupedSaved = saved.filter(
+          (c) => !fixtures.some((f) => f.id === c.id),
+        );
+        return [...dedupedSaved, ...fixtures];
+      });
+      // If the current selection is a fixture and we just loaded a
+      // real corpus, switch to the first real one so the user lands
+      // on their own data instead of the demo.
+      if (saved.length > 0) {
+        setActiveId((current) => {
+          if (current && saved.some((c) => c.id === current)) return current;
+          return saved[0].id;
+        });
+      }
+    } catch (e) {
+      console.error("listCorpora failed:", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshCorpora();
+  }, [refreshCorpora]);
+
   const activeCorpus = useMemo(
     () => corpora.find((c) => c.id === activeId) ?? null,
     [corpora, activeId],
@@ -76,7 +108,11 @@ export function App() {
     if (!activeCorpus || !term.trim()) return;
     setLoading(true);
     setResult(null);
-    const isRealCorpus = inTauri() && activeCorpus.id.startsWith("corpus-");
+    // A "real" corpus is anything the backend registered — i.e. not one
+    // of the fixture entries baked into `CORPORA`. IDs used to start
+    // with `corpus-` (a per-process counter); since #1 they're slugs
+    // like `my-gutenberg`, so we check fixture membership instead.
+    const isRealCorpus = inTauri() && !CORPORA.some((c) => c.id === activeCorpus.id);
     if (isRealCorpus) {
       runKwicTauri({
         corpusId: activeCorpus.id,
@@ -125,40 +161,46 @@ export function App() {
   // real (backend-registered) corpus. Fixture corpora keep whatever
   // data.ts ships.
   //
-  // Debounced by 300 ms so typing in the query bar doesn't kick off
-  // a fresh 5000-hit KWIC + aggregation on every keystroke —
-  // previous version made the UI lag badly while typing common
-  // words like "the".
-  useEffect(() => {
+  // Split into two effects: button-click triggers (L/R window, layer,
+  // subview switch) refetch immediately so the UI feels snappy. Query
+  // text changes go through a 100 ms debounce so bursty typing
+  // coalesces into a single backend call. A request-id counter drops
+  // out-of-order responses so a stale answer can't clobber a fresh one.
+  const collReqRef = useRef(0);
+  const fetchCollocates = () => {
     if (subview !== "coll" || !activeCorpus || !term.trim()) return;
-    if (!inTauri() || !activeCorpus.id.startsWith("corpus-")) {
+    if (!inTauri() || CORPORA.some((c) => c.id === activeCorpus.id)) {
       setCollocates(null);
       return;
     }
-    let cancelled = false;
-    const timer = window.setTimeout(() => {
-      if (cancelled) return;
-      runCollocates({
-        corpusId: activeCorpus.id,
-        term: term.trim(),
-        layer,
-        leftWindow: collLeft,
-        rightWindow: collRight,
-        limit: 60,
+    const myId = ++collReqRef.current;
+    runCollocates({
+      corpusId: activeCorpus.id,
+      term: term.trim(),
+      layer,
+      leftWindow: collLeft,
+      rightWindow: collRight,
+      limit: 60,
+    })
+      .then((r) => {
+        if (myId === collReqRef.current) setCollocates(r.collocates);
       })
-        .then((r) => {
-          if (!cancelled) setCollocates(r.collocates);
-        })
-        .catch((e) => {
-          console.error("runCollocates failed:", e);
-          if (!cancelled) setCollocates([]);
-        });
-    }, 300);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [subview, activeCorpus, term, layer, collLeft, collRight]);
+      .catch((e) => {
+        console.error("runCollocates failed:", e);
+        if (myId === collReqRef.current) setCollocates([]);
+      });
+  };
+
+  useEffect(() => {
+    fetchCollocates();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subview, activeCorpus, layer, collLeft, collRight]);
+
+  useEffect(() => {
+    const t = window.setTimeout(fetchCollocates, 100);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [term]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -209,7 +251,7 @@ export function App() {
 
   const onRunCmd = (cmd: CommandDef) => {
     if (cmd.id === "build") setBuildOpen(true);
-    else if (cmd.id === "open") alert("Tauri open-dialog — wired in the real app");
+    else if (cmd.id === "open") void refreshCorpora();
     else if (cmd.id === "detail") setView("corpus");
     else if (cmd.id === "layer-word") {
       setLayer("word");
@@ -261,9 +303,7 @@ export function App() {
         <div className="cx-body">
           <Onboarding
             onBuild={() => setBuildOpen(true)}
-            onOpen={() => {
-              /* TODO: Tauri dialog */
-            }}
+            onOpen={() => void refreshCorpora()}
             onSample={() => setCorpora(CORPORA)}
           />
         </div>
@@ -361,7 +401,7 @@ export function App() {
             setView("search");
             window.setTimeout(run, 30);
           }}
-          onOpen={() => alert("Tauri open-dialog — wired in the real app")}
+          onOpen={() => void refreshCorpora()}
           onBuild={() => setBuildOpen(true)}
           recent={RECENT_QUERIES}
           onRunRecent={runRecent}

@@ -41,10 +41,6 @@ export async function listCorpora(): Promise<CorpusMeta[]> {
   return invokeSafe<CorpusMeta[]>("list_corpora");
 }
 
-export async function openCorpus(indexPath: string): Promise<CorpusMeta> {
-  return invokeSafe<CorpusMeta>("open_corpus", { indexPath });
-}
-
 export async function runKwic(req: KwicRequest): Promise<KwicResult> {
   return invokeSafe<KwicResult>("run_kwic", { req });
 }

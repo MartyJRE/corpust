@@ -1,0 +1,134 @@
+//! Platform-correct paths for persisted corpus data.
+//!
+//! Corpora live under a per-platform user data directory:
+//!
+//! ```text
+//! <data_root>/
+//! └── corpora/
+//!     └── <slug>/
+//!         ├── index/        ← tantivy files
+//!         └── metadata.json ← versioned CorpusMeta sidecar
+//! ```
+//!
+//! On macOS that's `~/Library/Application Support/corpust/`; on Linux
+//! `$XDG_DATA_HOME/corpust/` (default `~/.local/share/corpust/`); on
+//! Windows `%APPDATA%\corpust\`. We use [`BaseDirs`] + a single
+//! `corpust/` join rather than [`ProjectDirs`] so the path stays
+//! `corpust` on every platform — `ProjectDirs` would otherwise fold in
+//! a qualifier/organization prefix.
+
+use anyhow::{Result, anyhow};
+use directories::BaseDirs;
+use std::path::PathBuf;
+
+/// Root of all corpust-owned user data for the current OS account.
+pub fn data_root() -> Result<PathBuf> {
+    let base = BaseDirs::new().ok_or_else(|| anyhow!("no home directory available"))?;
+    Ok(base.data_dir().join("corpust"))
+}
+
+/// Directory that holds every built corpus.
+pub fn corpora_root() -> Result<PathBuf> {
+    Ok(data_root()?.join("corpora"))
+}
+
+/// Directory for a corpus with the given slug.
+pub fn corpus_dir(slug: &str) -> Result<PathBuf> {
+    Ok(corpora_root()?.join(slug))
+}
+
+/// Path to the tantivy index inside a corpus dir.
+pub fn index_path(slug: &str) -> Result<PathBuf> {
+    Ok(corpus_dir(slug)?.join("index"))
+}
+
+/// Path to the metadata sidecar inside a corpus dir.
+pub fn metadata_path(slug: &str) -> Result<PathBuf> {
+    Ok(corpus_dir(slug)?.join("metadata.json"))
+}
+
+/// Turn a human-chosen corpus name into a filesystem-safe slug.
+///
+/// Lowercase ASCII, `[a-z0-9_-]` only, with runs of other characters
+/// collapsed into a single dash. We keep it strict because the slug
+/// becomes part of the on-disk path on three different OSes — being
+/// forgiving about whitespace / accents isn't worth the cross-platform
+/// edge cases.
+pub fn slugify(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_dash = false;
+    for c in name.chars() {
+        let keep = if c.is_ascii_alphanumeric() {
+            Some(c.to_ascii_lowercase())
+        } else if c == '_' || c == '-' {
+            Some(c)
+        } else {
+            None
+        };
+        match keep {
+            Some(ch) => {
+                out.push(ch);
+                prev_dash = false;
+            }
+            None => {
+                if !prev_dash && !out.is_empty() {
+                    out.push('-');
+                    prev_dash = true;
+                }
+            }
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push_str("corpus");
+    }
+    out
+}
+
+/// Pick a slug that doesn't collide with an existing corpus directory.
+///
+/// If `<base>` is free we return it as-is. Otherwise we append
+/// `-2`, `-3`, … until we find one that's free. Caller decides whether
+/// to bail instead — we don't try to be clever about that here.
+pub fn unique_slug(base: &str) -> Result<String> {
+    let root = corpora_root()?;
+    if !root.exists() {
+        return Ok(base.to_owned());
+    }
+    if !root.join(base).exists() {
+        return Ok(base.to_owned());
+    }
+    for n in 2u32..=9999 {
+        let candidate = format!("{base}-{n}");
+        if !root.join(&candidate).exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow!("ran out of slug suffixes for base {base:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slugify_is_strict_and_safe() {
+        assert_eq!(slugify("Gutenberg · EN"), "gutenberg-en");
+        assert_eq!(slugify("  spaces  "), "spaces");
+        assert_eq!(slugify("a/b/c"), "a-b-c");
+        assert_eq!(slugify("éclair"), "clair");
+        assert_eq!(slugify("---"), "corpus");
+        assert_eq!(slugify(""), "corpus");
+        assert_eq!(slugify("my_corpus-1"), "my_corpus-1");
+    }
+
+    #[test]
+    fn data_root_is_a_path() {
+        // Can't assert a specific value across platforms, but it
+        // should at least resolve without error on any CI host.
+        let root = data_root().unwrap();
+        assert!(root.ends_with("corpust"));
+    }
+}

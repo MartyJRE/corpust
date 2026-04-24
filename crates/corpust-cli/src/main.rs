@@ -41,9 +41,18 @@ enum Command {
     Index {
         /// Directory to scan recursively for .txt files.
         input: PathBuf,
-        /// Where to write the index.
+        /// Explicit location for the index. Overrides the default,
+        /// which drops the index into the platform data directory
+        /// (`~/Library/Application Support/corpust/corpora/<slug>/index/`
+        /// on macOS, `$XDG_DATA_HOME/corpust/…` on Linux, `%APPDATA%\corpust\…`
+        /// on Windows).
         #[arg(long)]
-        out: PathBuf,
+        out: Option<PathBuf>,
+        /// Human-readable corpus name. Drives the on-disk slug when
+        /// `--out` is omitted. Defaults to the input directory's
+        /// basename.
+        #[arg(long)]
+        name: Option<String>,
         /// Enable POS + lemma annotation during indexing.
         #[arg(long)]
         annotate: bool,
@@ -105,11 +114,12 @@ fn main() -> Result<()> {
         Command::Index {
             input,
             out,
+            name,
             annotate,
             tagger,
             tagger_bundle,
             language,
-        } => run_index(input, out, annotate, tagger, tagger_bundle, language),
+        } => run_index(input, out, name, annotate, tagger, tagger_bundle, language),
         Command::Kwic {
             index,
             term,
@@ -122,12 +132,41 @@ fn main() -> Result<()> {
 
 fn run_index(
     input: PathBuf,
-    out: PathBuf,
+    out: Option<PathBuf>,
+    name: Option<String>,
     annotate: bool,
     tagger_kind: TaggerArg,
     tagger_bundle: PathBuf,
     language: String,
 ) -> Result<()> {
+    let out = match out {
+        Some(p) => p,
+        None => {
+            // No explicit --out: drop the index into the platform
+            // data directory, slug derived from --name or the input
+            // folder's basename.
+            let display_name = name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    input
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("corpus")
+                        .to_owned()
+                });
+            let base = corpust_io::paths::slugify(&display_name);
+            let slug = corpust_io::paths::unique_slug(&base)
+                .with_context(|| format!("allocating slug for {display_name:?}"))?;
+            let dir = corpust_io::paths::corpus_dir(&slug)
+                .with_context(|| format!("resolving corpus dir for slug {slug:?}"))?;
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
+            dir.join("index")
+        }
+    };
     let t0 = Instant::now();
     let docs = corpust_io::read_text_dir(&input)
         .with_context(|| format!("reading corpus at {}", input.display()))?;

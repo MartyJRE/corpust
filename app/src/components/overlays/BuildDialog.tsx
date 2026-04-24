@@ -89,12 +89,6 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
 
   if (!open) return null;
 
-  // Default the output path to `<source>.index/` so the user doesn't
-  // have to think about a second location. Real apps will want a
-  // settings-managed `<data_dir>/corpust/corpora/` — tracked in
-  // issue #1.
-  const outPath = path.replace(/\/+$/, "") + ".index";
-
   const runRealBuild = async () => {
     setErrorMsg(null);
     setPhase("reading");
@@ -130,7 +124,6 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
     try {
       const meta = await buildIndex({
         sourcePath: path,
-        outPath,
         annotate,
         name: name.trim() || undefined,
         tagger,
@@ -184,7 +177,7 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
         id: "new-" + Date.now(),
         kind: "mixed",
         name: name.trim() || path.split("/").pop() || "new corpus",
-        indexPath: outPath,
+        indexPath: path.replace(/\/+$/, "") + ".index",
         sourcePath: path,
         annotated: annotate,
         docCount: TOTAL_DOCS,

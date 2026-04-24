@@ -7,15 +7,16 @@
 
 use crate::{
     AppState, BuildRequest, Collocate as CollocateDto, CollocatesRequest, CollocatesResult,
-    CorpusMeta, KwicHit as KwicHitDto, KwicRequest, KwicResult, OpenedCorpus, TaggerKind,
+    CorpusMeta, CorpusMetaEnvelope, KwicHit as KwicHitDto, KwicRequest, KwicResult, OpenedCorpus,
+    TaggerKind,
 };
 use corpust_annotate::{Annotator, treetagger::TreeTagger};
 use corpust_index::{CorpusIndex, DEFAULT_CONTEXT};
+use corpust_io::paths;
 use corpust_query::{KwicRequest as CoreKwicRequest, kwic as run_core_kwic};
 use corpust_tagger::Tagger as RustTagger;
 use serde::Serialize;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -64,37 +65,50 @@ fn emit_failure(app: &AppHandle, started: Instant, message: &str) {
     );
 }
 
+/// Scan the platform data directory and return every persisted corpus.
+///
+/// Disk is the source of truth — corpora survive restarts because the
+/// build step writes `<slug>/metadata.json` next to the index. The
+/// in-memory `AppState.corpora` registry is only a cache of opened
+/// handles; we fall back to disk for everything else.
 #[tauri::command]
-pub fn list_corpora(state: State<'_, AppState>) -> Vec<CorpusMeta> {
-    state
-        .corpora
-        .lock()
-        .expect("corpus registry poisoned")
-        .values()
-        .map(|c| c.meta.clone())
-        .collect()
+pub fn list_corpora() -> Result<Vec<CorpusMeta>, String> {
+    let root = match paths::corpora_root() {
+        Ok(p) => p,
+        Err(e) => return Err(format!("resolving data dir: {e:#}")),
+    };
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let entries = std::fs::read_dir(&root)
+        .map_err(|e| format!("reading {}: {e}", root.display()))?;
+    for entry in entries.filter_map(Result::ok) {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let meta_file = entry.path().join("metadata.json");
+        if !meta_file.exists() {
+            continue;
+        }
+        match read_metadata_file(&meta_file) {
+            Ok(meta) => out.push(meta),
+            Err(e) => eprintln!("skipping {}: {e:#}", meta_file.display()),
+        }
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(out)
 }
 
+/// Open a corpus by slug (the `id` field returned from `list_corpora`
+/// or `build_index`). Registers the handle in `AppState` so subsequent
+/// KWIC / collocate calls hit the same instance.
 #[tauri::command]
 pub fn open_corpus(
     state: State<'_, AppState>,
-    index_path: String,
+    id: String,
 ) -> Result<CorpusMeta, String> {
-    let path = PathBuf::from(&index_path);
-    let index =
-        CorpusIndex::open(&path).map_err(|e| format!("open {index_path}: {e:#}"))?;
-    let id = fresh_id();
-    let mut meta = CorpusMeta::stub(
-        id.clone(),
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("corpus")
-            .to_owned(),
-        path.to_string_lossy().into_owned(),
-    );
-    meta.annotated = true; // assume until CorpusIndex exposes the flag
-    meta.built_at = iso_now();
-    meta.size_on_disk = dir_size(&path).unwrap_or(0);
+    let (index, meta) = load_from_disk(&id)?;
     state
         .corpora
         .lock()
@@ -114,11 +128,6 @@ pub fn run_collocates(
     state: State<'_, AppState>,
     req: CollocatesRequest,
 ) -> Result<CollocatesResult, String> {
-    let reg = state.corpora.lock().expect("corpus registry poisoned");
-    let opened = reg
-        .get(&req.corpus_id)
-        .ok_or_else(|| format!("no open corpus with id {}", req.corpus_id))?;
-
     // Pull a large KWIC result with enough context to cover both
     // window sides, then aggregate collocates. Cap hits at 5000 —
     // enough for meaningful collocations on common terms without
@@ -135,8 +144,9 @@ pub fn run_collocates(
         .context(context)
         .limit(HIT_CAP);
     let t0 = Instant::now();
-    let hits = run_core_kwic(&opened.index, kreq)
-        .map_err(|e| format!("kwic failed: {e:#}"))?;
+    let hits = with_corpus(&state, &req.corpus_id, |index| {
+        run_core_kwic(index, kreq).map_err(|e| format!("kwic failed: {e:#}"))
+    })?;
 
     // Count word occurrences per side, honoring asymmetric L/R
     // windows. The KWIC call fetched `context` tokens of each side,
@@ -236,10 +246,6 @@ pub fn run_kwic(
     state: State<'_, AppState>,
     req: KwicRequest,
 ) -> Result<KwicResult, String> {
-    let reg = state.corpora.lock().expect("corpus registry poisoned");
-    let opened = reg
-        .get(&req.corpus_id)
-        .ok_or_else(|| format!("no open corpus with id {}", req.corpus_id))?;
     let context = if req.context == 0 { DEFAULT_CONTEXT } else { req.context };
     let limit = req.limit.max(1);
     let kreq = CoreKwicRequest::new(&req.term)
@@ -248,8 +254,9 @@ pub fn run_kwic(
         .limit(limit);
 
     let t0 = Instant::now();
-    let hits = run_core_kwic(&opened.index, kreq)
-        .map_err(|e| format!("kwic failed: {e:#}"))?;
+    let hits = with_corpus(&state, &req.corpus_id, |index| {
+        run_core_kwic(index, kreq).map_err(|e| format!("kwic failed: {e:#}"))
+    })?;
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let truncated = hits.len() == limit;
     Ok(KwicResult {
@@ -300,7 +307,6 @@ fn build_index_inner(
     started: Instant,
 ) -> Result<CorpusMeta, String> {
     let source_path = PathBuf::from(&req.source_path);
-    let out_path = PathBuf::from(&req.out_path);
 
     if !source_path.exists() {
         return Err(format!(
@@ -314,6 +320,31 @@ fn build_index_inner(
     if !source_path.is_dir() {
         return Err(format!("{} is not a directory", source_path.display()));
     }
+
+    // Resolve the display name and derive an on-disk slug. Collisions
+    // get `-2`, `-3`, … appended so a user can re-build against the
+    // same folder without overwriting the previous index.
+    let name = req
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            source_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("corpus")
+                .to_owned()
+        });
+    let base_slug = paths::slugify(&name);
+    let slug = paths::unique_slug(&base_slug)
+        .map_err(|e| format!("allocating slug for {name:?}: {e:#}"))?;
+    let corpus_dir = paths::corpus_dir(&slug)
+        .map_err(|e| format!("resolving corpus dir: {e:#}"))?;
+    let out_path = corpus_dir.join("index");
+    std::fs::create_dir_all(&corpus_dir)
+        .map_err(|e| format!("creating {}: {e}", corpus_dir.display()))?;
 
     emit_progress(app, started, "reading", 0, None);
     let docs = corpust_io::read_text_dir(&source_path)
@@ -397,22 +428,8 @@ fn build_index_inner(
     let build_ms = t_build.elapsed().as_millis() as u64;
     emit_progress(app, started, "committing", doc_count as u64, Some(doc_count as u64));
 
-    let id = fresh_id();
-    let name = req
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            source_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("corpus")
-                .to_owned()
-        });
     let mut meta = CorpusMeta::stub(
-        id.clone(),
+        slug.clone(),
         name,
         out_path.to_string_lossy().into_owned(),
     );
@@ -429,13 +446,21 @@ fn build_index_inner(
     meta.size_on_disk = dir_size(&out_path).unwrap_or(0);
     meta.annotator = tagger_id.clone();
     meta.tagger_id = tagger_id;
+
+    // Persist the metadata sidecar so this corpus shows up on next
+    // `list_corpora` call. Done before we mutate the registry —
+    // failing here means the index is orphaned but the state stays
+    // clean, and the user can retry.
+    write_metadata_file(&corpus_dir.join("metadata.json"), &meta)
+        .map_err(|e| format!("writing metadata: {e:#}"))?;
+
     emit_progress(app, started, "done", doc_count as u64, Some(doc_count as u64));
     state
         .corpora
         .lock()
         .expect("corpus registry poisoned")
         .insert(
-            id,
+            slug,
             OpenedCorpus {
                 index,
                 meta: meta.clone(),
@@ -448,10 +473,68 @@ fn build_index_inner(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn fresh_id() -> String {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("corpus-{n}")
+/// Run `f` against a corpus handle, lazy-opening it from disk if it
+/// isn't already cached in the registry. The handle stays in the
+/// registry afterwards so the next query is cheap.
+fn with_corpus<F, R>(state: &State<'_, AppState>, id: &str, f: F) -> Result<R, String>
+where
+    F: FnOnce(&CorpusIndex) -> Result<R, String>,
+{
+    {
+        let reg = state.corpora.lock().expect("corpus registry poisoned");
+        if let Some(c) = reg.get(id) {
+            return f(&c.index);
+        }
+    }
+    let (index, meta) = load_from_disk(id)?;
+    let result = f(&index);
+    state
+        .corpora
+        .lock()
+        .expect("corpus registry poisoned")
+        .insert(id.to_owned(), OpenedCorpus { index, meta });
+    result
+}
+
+/// Open an existing corpus from disk by slug. Returns the tantivy
+/// handle plus the persisted metadata.
+fn load_from_disk(slug: &str) -> Result<(CorpusIndex, CorpusMeta), String> {
+    let corpus_dir = paths::corpus_dir(slug)
+        .map_err(|e| format!("resolving corpus dir for {slug}: {e:#}"))?;
+    let meta_file = corpus_dir.join("metadata.json");
+    if !meta_file.exists() {
+        return Err(format!(
+            "no corpus named {slug:?} (expected {})",
+            meta_file.display()
+        ));
+    }
+    let meta = read_metadata_file(&meta_file)
+        .map_err(|e| format!("reading {}: {e:#}", meta_file.display()))?;
+    let index_dir = corpus_dir.join("index");
+    let index = CorpusIndex::open(&index_dir)
+        .map_err(|e| format!("opening {}: {e:#}", index_dir.display()))?;
+    Ok((index, meta))
+}
+
+fn read_metadata_file(path: &Path) -> anyhow::Result<CorpusMeta> {
+    let bytes = std::fs::read(path)?;
+    let envelope: CorpusMetaEnvelope = serde_json::from_slice(&bytes)?;
+    // Future schema bumps get their migrations here.
+    if envelope.schema_version != CorpusMetaEnvelope::CURRENT_VERSION {
+        anyhow::bail!(
+            "unsupported metadata schema version {} (expected {})",
+            envelope.schema_version,
+            CorpusMetaEnvelope::CURRENT_VERSION
+        );
+    }
+    Ok(envelope.corpus)
+}
+
+fn write_metadata_file(path: &Path, meta: &CorpusMeta) -> anyhow::Result<()> {
+    let envelope = CorpusMetaEnvelope::wrap(meta.clone());
+    let json = serde_json::to_vec_pretty(&envelope)?;
+    std::fs::write(path, json)?;
+    Ok(())
 }
 
 /// Recursive on-disk byte total for a directory. Silently returns
@@ -595,4 +678,62 @@ fn resolve_treetagger_bundle_root(app: &AppHandle) -> Result<PathBuf, String> {
          explicitly (e.g. export \
          CORPUST_TREETAGGER_BUNDLE=/path/to/resources/treetagger)."
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_file(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "corpust-meta-{}-{}.json",
+            name,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        path
+    }
+
+    #[test]
+    fn metadata_round_trips_through_envelope() {
+        let path = tmp_file("round-trip");
+        let mut meta = CorpusMeta::stub(
+            "my-corpus".to_owned(),
+            "My Corpus".to_owned(),
+            "/tmp/fake/index".to_owned(),
+        );
+        meta.doc_count = 42;
+        meta.token_count = 1234;
+        meta.annotated = true;
+        meta.annotator = Some("treetagger-rs-english".to_owned());
+
+        write_metadata_file(&path, &meta).unwrap();
+        let read_back = read_metadata_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(read_back.id, "my-corpus");
+        assert_eq!(read_back.name, "My Corpus");
+        assert_eq!(read_back.doc_count, 42);
+        assert_eq!(read_back.token_count, 1234);
+        assert!(read_back.annotated);
+        assert_eq!(read_back.annotator.as_deref(), Some("treetagger-rs-english"));
+    }
+
+    #[test]
+    fn metadata_read_rejects_future_schema_versions() {
+        let path = tmp_file("bad-schema");
+        let bogus = serde_json::json!({
+            "schemaVersion": 999,
+            "corpus": CorpusMeta::stub("x".into(), "x".into(), "/x".into()),
+        });
+        std::fs::write(&path, serde_json::to_vec(&bogus).unwrap()).unwrap();
+        let err = read_metadata_file(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            err.to_string().contains("unsupported metadata schema version"),
+            "unexpected error: {err}"
+        );
+    }
 }

@@ -194,7 +194,6 @@ pub struct CollocatesResult {
 #[serde(rename_all = "camelCase")]
 pub struct BuildRequest {
     pub source_path: String,
-    pub out_path: String,
     pub annotate: bool,
     /// Display name for the resulting corpus. Optional — we fall
     /// back to the source directory's basename.
@@ -206,6 +205,27 @@ pub struct BuildRequest {
     /// speed.
     #[serde(default)]
     pub tagger: TaggerKind,
+}
+
+/// On-disk envelope for persisted corpus metadata. Versioned so future
+/// schema changes can be migrated instead of silently breaking older
+/// indexes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CorpusMetaEnvelope {
+    pub schema_version: u32,
+    pub corpus: CorpusMeta,
+}
+
+impl CorpusMetaEnvelope {
+    pub const CURRENT_VERSION: u32 = 1;
+
+    pub fn wrap(corpus: CorpusMeta) -> Self {
+        Self {
+            schema_version: Self::CURRENT_VERSION,
+            corpus,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
