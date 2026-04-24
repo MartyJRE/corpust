@@ -104,14 +104,16 @@ export function App() {
   );
   const density = useMemo(() => makeDensity(result ? result.hits : []), [result]);
 
-  const run = useCallback(() => {
+  // KWIC live-updates the same way collocates do. Typing debounces by
+  // 100 ms; layer / corpus switches refetch immediately; a request-id
+  // counter drops stale responses so the freshest one wins. We don't
+  // wipe `result` on refetch — the stale table stays visible so the
+  // UI doesn't strobe on every keystroke.
+  const kwicReqRef = useRef(0);
+  const runKwic = () => {
     if (!activeCorpus || !term.trim()) return;
+    const myId = ++kwicReqRef.current;
     setLoading(true);
-    setResult(null);
-    // A "real" corpus is anything the backend registered — i.e. not one
-    // of the fixture entries baked into `CORPORA`. IDs used to start
-    // with `corpus-` (a per-process counter); since #1 they're slugs
-    // like `my-gutenberg`, so we check fixture membership instead.
     const isRealCorpus = inTauri() && !CORPORA.some((c) => c.id === activeCorpus.id);
     if (isRealCorpus) {
       runKwicTauri({
@@ -122,6 +124,7 @@ export function App() {
         limit: 200,
       })
         .then((r) => {
+          if (myId !== kwicReqRef.current) return;
           // The Tauri backend returns hits with a numeric doc_id +
           // file path; the frontend's KwicHit shape carries docId
           // (string) and no path. Adapt the shape inline until the
@@ -134,28 +137,44 @@ export function App() {
             right: h.right,
           }));
           setResult({ hits, elapsedMs: r.elapsedMs, truncated: r.truncated });
+          setSelected(null);
         })
         .catch((e) => {
           console.error("runKwic failed:", e);
-          setResult({ hits: [], elapsedMs: 0, truncated: false });
+          if (myId === kwicReqRef.current) {
+            setResult({ hits: [], elapsedMs: 0, truncated: false });
+            setSelected(null);
+          }
         })
-        .finally(() => setLoading(false));
+        .finally(() => {
+          if (myId === kwicReqRef.current) setLoading(false);
+        });
       return;
     }
     // Fallback: fixture data for the non-Tauri / pre-built-corpus case.
     window.setTimeout(() => {
+      if (myId !== kwicReqRef.current) return;
       const hits = pickHits(activeCorpus.id, term.trim(), layer);
       const elapsedMs = 0.2 + Math.random() * 1.6;
       setResult({ hits, elapsedMs, truncated: hits.length >= 1000 });
+      setSelected(null);
       setLoading(false);
     }, 40);
-  }, [activeCorpus, term, layer]);
+  };
+  // Explicit Enter-key / "Run" button handler. Same path as the
+  // effects — the request-id guard handles any overlap.
+  const run = runKwic;
 
-  // Initial query on mount
   useEffect(() => {
-    run();
+    runKwic();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [layer, activeCorpus]);
+
+  useEffect(() => {
+    const t = window.setTimeout(runKwic, 100);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [term]);
 
   // Fetch real collocates when the Collocations view is active on a
   // real (backend-registered) corpus. Fixture corpora keep whatever
@@ -246,7 +265,6 @@ export function App() {
     setActiveId(q.corpus);
     setView("search");
     setSubview("kwic");
-    window.setTimeout(run, 20);
   };
 
   const onRunCmd = (cmd: CommandDef) => {
@@ -255,18 +273,15 @@ export function App() {
     else if (cmd.id === "detail") setView("corpus");
     else if (cmd.id === "layer-word") {
       setLayer("word");
-      window.setTimeout(run, 30);
     } else if (cmd.id === "layer-lemma") {
       if (activeCorpus?.annotated) {
         setLayer("lemma");
         setTerm("go");
-        window.setTimeout(run, 30);
       }
     } else if (cmd.id === "layer-pos") {
       if (activeCorpus?.annotated) {
         setLayer("pos");
         setTerm("NN");
-        window.setTimeout(run, 30);
       }
     } else if (cmd.id === "clear") {
       setTerm("");
@@ -330,10 +345,7 @@ export function App() {
         <QueryBar
           layer={layer}
           term={term}
-          onLayer={(l) => {
-            setLayer(l);
-            window.setTimeout(run, 30);
-          }}
+          onLayer={setLayer}
           onTerm={setTerm}
           onRun={run}
           disabled={!activeCorpus}
@@ -399,7 +411,6 @@ export function App() {
           onSelect={(id) => {
             setActiveId(id);
             setView("search");
-            window.setTimeout(run, 30);
           }}
           onOpen={() => void refreshCorpora()}
           onBuild={() => setBuildOpen(true)}
