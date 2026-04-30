@@ -677,6 +677,11 @@ mod tests {
                         prob: *p,
                     })
                     .collect();
+                // If context is [..., t_{-2}, t_{-1}], then predict uses context.last() as t1 and context[len-2] as t2.
+                // Binary output:
+                // tag[-1] = A
+                //   tag[-2] = B
+                // So the key should be (A, B).
                 table.insert(
                     (t1, t2),
                     par::dtree::Distribution {
@@ -690,12 +695,11 @@ mod tests {
         for line in raw.lines() {
             if let Some(rest) = line.strip_prefix("tag[-1] = ") {
                 flush(cur_t1, cur_t2, &cur_probs, &mut table);
-                cur_t1 = tag_to_id.get(rest).copied();
+                cur_t1 = tag_to_id.get(rest.trim()).copied();
                 cur_t2 = None;
-                cur_idx = 0;
             } else if let Some(rest) = line.strip_prefix("\ttag[-2] = ") {
                 flush(cur_t1, cur_t2, &cur_probs, &mut table);
-                cur_t2 = tag_to_id.get(rest).copied();
+                cur_t2 = tag_to_id.get(rest.trim()).copied();
                 cur_probs = vec![0.0; n_tags];
                 cur_idx = 0;
             } else if line.starts_with("\t\t") && cur_t1.is_some() && cur_t2.is_some() {

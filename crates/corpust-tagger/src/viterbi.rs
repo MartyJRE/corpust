@@ -108,21 +108,17 @@ pub fn tag_sequence(
         return Vec::new();
     }
 
-    let _ = header;
+    let sent_id = header.sent_tag_index as u32;
 
-    // Initial state mirrors `dcram/treetaggerj`'s `getStartTag()` —
-    // a synthetic start marker that no dtree internal can match,
-    // so all predicates fail and the first token's prediction
-    // comes from the all-no-path leaf. We model this with `None`
-    // for both `tag_{-1}` and `tag_{-2}`, producing an empty context
-    // slice into `Traversal::predict`.
+    // Initial state mirrors `tree-tagger` behavior — use the SENT
+    // tag as the initial context.
     let mut dps: Vec<HashMap<State, (f64, Option<(usize, State)>)>> =
         Vec::with_capacity(n + 1);
     let mut init = HashMap::new();
     init.insert(
         State {
-            last: None,
-            second_last: None,
+            last: Some(sent_id),
+            second_last: Some(sent_id),
         },
         (0.0_f64, None),
     );
@@ -146,32 +142,25 @@ pub fn tag_sequence(
         let mut next: HashMap<State, (f64, Option<(usize, State)>)> = HashMap::new();
         for (state, &(score, _)) in &dps[i] {
             state.write_context(&mut ctx_buf);
-            let cond = traversal.predict(&ctx_buf);
+            let cond = traversal.predict_combined(&ctx_buf);
             for (cand_idx, c) in cands.iter().enumerate() {
                 if c.lex_prob < cutoff {
                     continue;
                 }
-                let p_cond = cond
-                    .probs
-                    .iter()
-                    .find(|tp| tp.tag_id == c.tag_id)
-                    .map(|tp| tp.prob)
-                    .unwrap_or(0.0);
-                // Schmid's per-token formula is the bare HMM joint:
-                //   argmax_t  P(t | w) × P(t | ctx)
-                // (treetaggerj's reference implementation uses this
-                // exact form — see Tagger.java#getMostProbable.)
-                // Bayes correction with `/ P(t)` was tested with both
-                // computed and prelude-derived marginals and consistently
-                // regressed by 1+ tokens — Schmid's algorithm doesn't
-                // do the textbook Bayes step, despite the lexicon
-                // storing P(t | w).
-                let _ = tag_prior;
-                let local = c.lex_prob * p_cond;
-                if local <= 0.0 {
+                let p_cond = cond[c.tag_id as usize];
+                // Schmid's per-token formula is effectively:
+                //   argmax_t  P(t | w) × P(t | ctx) / P(t)
+                // We work in log-space for precision.
+                if p_cond <= 0.0 || c.lex_prob <= 0.0 {
                     continue;
                 }
-                let new_score = score + local.ln();
+                let mut local = c.lex_prob.ln() + p_cond.ln();
+                if let Some(&prior) = tag_prior.get(c.tag_id as usize) {
+                    if prior > 0.0 {
+                        local -= prior.ln();
+                    }
+                }
+                let new_score = score + local;
                 let new_state = state.shift(c.tag_id);
                 let entry = next
                     .entry(new_state)
@@ -306,7 +295,7 @@ mod tests {
                 },
             ],
             roots: vec![0],
-            wrapper_records: 0,
+            context_size: 2,
         };
         let marginal = synth_dist(&[1.0; 3]);
         let traversal = Traversal { forest, root: 0, marginal, override_table: None };
@@ -369,7 +358,7 @@ mod tests {
                 },
             ],
             roots: vec![0],
-            wrapper_records: 0,
+            context_size: 2,
         };
         let marginal = synth_dist(&[1.0; 3]);
         let traversal = Traversal { forest, root: 0, marginal, override_table: None };

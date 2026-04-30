@@ -203,6 +203,8 @@ pub struct KindCounts {
 pub struct DecisionTree {
     /// Every record in the order it appeared in the file.
     pub records: Vec<DTreeRecord>,
+    /// Header context size (cl).
+    pub context_size: u32,
 }
 
 impl DecisionTree {
@@ -284,19 +286,16 @@ impl DecisionTree {
     /// typed `predicate: Feature { back: u32, tag: u32 }` field
     /// without touching callers of the topology API.
     pub fn reconstruct(&self) -> Result<TreeForest> {
-        let wrapper_records = self.detect_wrapper_records();
-        let body = &self.records[wrapper_records..];
-
         let mut nodes: Vec<TreeNode> = Vec::new();
         let mut roots: Vec<usize> = Vec::new();
         let mut cursor = 0usize;
-        while cursor < body.len() {
-            let root = try_build_subtree(body, &mut cursor, &mut nodes).with_context(|| {
+        while cursor < self.records.len() {
+            let root = try_build_subtree(&self.records, &mut cursor, &mut nodes).with_context(|| {
                 format!(
-                    "preorder-DFS reconstruction ran off the end of the body \
-                     at record {} (wrapper_records={wrapper_records}, body_len={})",
+                    "preorder-DFS reconstruction ran off the end of the records \
+                     at record {} (total_records={})",
                     cursor,
-                    body.len()
+                    self.records.len()
                 )
             })?;
             roots.push(root);
@@ -305,22 +304,8 @@ impl DecisionTree {
         Ok(TreeForest {
             nodes,
             roots,
-            wrapper_records,
+            context_size: self.context_size,
         })
-    }
-
-    /// Detect leading wrapper / preamble records that aren't part of
-    /// any tree's topology.
-    fn detect_wrapper_records(&self) -> usize {
-        match self.records.first() {
-            // english.par-style Leaf wrapper.
-            Some(DTreeRecord::Leaf(_)) => 1,
-            // Toy-style 24-byte preamble — first record's u32[8] is
-            // a sentinel (0x01010001) that exceeds anything a real
-            // Internal's `test_tag_id` could carry.
-            Some(DTreeRecord::Internal(i)) if i.test_tag_id > 0xFFFF => 2,
-            _ => 0,
-        }
     }
 }
 
@@ -379,19 +364,67 @@ impl Traversal {
     /// the only tree's distribution.
     pub fn predict_combined(&self, context: &[u32]) -> Vec<f64> {
         let n_tags = self.marginal.probs.len();
-        let mut acc = vec![1.0f64; n_tags];
-        for &root in &self.forest.roots {
-            let dist = traverse_tree(&self.forest, root, context);
-            for tp in &dist.probs {
-                acc[tp.tag_id as usize] *= tp.prob;
+        if let Some(table) = self.override_table.as_ref() {
+            let t1 = context.last().copied().unwrap_or(31);
+            let t2 = context.len().checked_sub(2).and_then(|i| context.get(i)).copied().unwrap_or(31);
+            if let Some(d) = table.get(&(t1, t2)) {
+                return d.probs.iter().map(|tp| tp.prob).collect();
+            }
+            // Unigram fallback in table? (Some entries in print-prob-tree
+            // might be implicitly unigram or we might need a different t2).
+            // Let's look for ANY (t1, _) entry if (t1, t2) is missing.
+            for (&(kt1, _), dist) in table.iter() {
+                if kt1 == t1 {
+                    return dist.probs.iter().map(|tp| tp.prob).collect();
+                }
             }
         }
-        // Re-normalize so it's still a probability distribution.
-        let total: f64 = acc.iter().sum();
-        if total > 0.0 {
-            for v in acc.iter_mut() {
-                *v /= total;
+
+        if self.forest.roots.len() < 3 {
+            // Fallback for models that don't have the 3-tree structure.
+            let mut acc = vec![1.0f64; n_tags];
+            for &root in &self.forest.roots {
+                let dist = traverse_tree(&self.forest, root, context);
+                for tp in &dist.probs {
+                    acc[tp.tag_id as usize] *= tp.prob;
+                }
             }
+            let total: f64 = acc.iter().sum();
+            if total > 0.0 {
+                for v in acc.iter_mut() {
+                    *v /= total;
+                }
+            }
+            return acc;
+        }
+
+        // English.par ensemble logic:
+        // Tree 0: Global Prior
+        // Tree 1: Unigram Switch
+        // Tree 2: Bigram Tree
+        //
+        // Final P = 0.5 * Tree[2] + 0.5 * WeightedAverage(Tree[0], Tree[1])
+        let d0 = traverse_tree(&self.forest, self.forest.roots[0], context);
+        let d1 = traverse_tree(&self.forest, self.forest.roots[1], context);
+        let d2 = traverse_tree(&self.forest, self.forest.roots[2], context);
+
+        let w0 = d0.weight as f64;
+        let w1 = d1.weight as f64;
+        let w_sum = w0 + w1;
+
+        let mut acc = vec![0.0f64; n_tags];
+        for k in 0..n_tags {
+            let p0 = d0.probs[k].prob;
+            let p1 = d1.probs[k].prob;
+            let p2 = d2.probs[k].prob;
+
+            let p_prior = if w_sum > 0.0 {
+                (w0 * p0 + w1 * p1) / w_sum
+            } else {
+                p0
+            };
+
+            acc[k] = 0.5 * p2 + 0.5 * p_prior;
         }
         acc
     }
@@ -597,11 +630,8 @@ pub struct TreeForest {
     pub nodes: Vec<TreeNode>,
     /// Indices into `nodes` of each tree's root.
     pub roots: Vec<usize>,
-    /// How many leading records of the source `DecisionTree` were
-    /// stripped as wrapper / preamble. See
-    /// [`DecisionTree::reconstruct`] for the wrapper formats observed
-    /// so far.
-    pub wrapper_records: usize,
+    /// Header context size (cl).
+    pub context_size: u32,
 }
 
 /// A node in a reconstructed decision tree.
@@ -709,8 +739,6 @@ pub fn find_dtree_start(
 }
 
 /// Parse the decision-tree section from `cur` to EOF.
-///
-/// See the module docstring for the record-kind disambiguation order.
 pub fn read(cur: &mut Cursor<'_>, header: &Header) -> Result<DecisionTree> {
     let data = cur.bytes_after_cursor();
     let n = header.tags.len() as u32;
@@ -720,19 +748,16 @@ pub fn read(cur: &mut Cursor<'_>, header: &Header) -> Result<DecisionTree> {
     let leaf_size = 16 + dist_bytes;
     let default_size = 12 + dist_bytes;
 
-    if len < default_size {
-        bail!(
-            "decision-tree section is {} bytes — too short to hold a \
-             {}-tag default ({} bytes)",
-            len,
-            n,
-            default_size
-        );
+    if len < 4 {
+        bail!("decision-tree section is too short to hold Context_Size header");
     }
-    let default_start = len - default_size;
 
+    // The first 4 bytes are Context_Size (cl). In english.par this is 0x15 (21).
+    let context_size = u32_at(data, 0).unwrap();
     let mut records = Vec::new();
-    let mut p = 0usize;
+    let mut p = 4usize;
+
+    let default_start = len - default_size;
 
     while p < len {
         // 1. Default — only legal at the exact trailing offset.
@@ -767,9 +792,7 @@ pub fn read(cur: &mut Cursor<'_>, header: &Header) -> Result<DecisionTree> {
             continue;
         }
 
-        // 3. PrunedInternal — [1, N, weight] + distribution. Same
-        // binary layout as Default; distinguished by position (Default
-        // only fires at EOF, checked in step 1 above).
+        // 3. PrunedInternal — [1, N, weight] + distribution.
         if p + default_size <= len
             && u32_at(data, p) == Some(1)
             && u32_at(data, p + 4) == Some(n)
@@ -784,11 +807,7 @@ pub fn read(cur: &mut Cursor<'_>, header: &Header) -> Result<DecisionTree> {
             continue;
         }
 
-        // 4. Internal — 12 bytes, [reserved == 0, back_pos_i in {0..3}, test_tag_id < N].
-        // `reserved` is always 0 in observed models; the {0..3} mask
-        // is kept defensively in case future models use higher cl.
-        // Test-tag bound `< N` is the strong test that excludes the
-        // toy preamble's sentinel u32[8] (= 0x01010001).
+        // 4. Internal — 12 bytes.
         if p + 12 <= len {
             let reserved = u32_at(data, p).unwrap();
             let back_pos_i = u32_at(data, p + 4).unwrap();
@@ -804,8 +823,6 @@ pub fn read(cur: &mut Cursor<'_>, header: &Header) -> Result<DecisionTree> {
             }
         }
 
-        // None of the four known kinds fit — stop here so the next
-        // archaeology session has a concrete offset to look at.
         let preview = preview_bytes(data, p, 32);
         bail!(
             "unrecognized decision-tree record at section-offset {p} \
@@ -814,18 +831,10 @@ pub fn read(cur: &mut Cursor<'_>, header: &Header) -> Result<DecisionTree> {
         );
     }
 
-    if !matches!(records.last(), Some(DTreeRecord::Default(_))) {
-        bail!(
-            "decision tree didn't terminate with a Default record \
-             (last kind: {:?})",
-            records.last().map(|r| r.kind())
-        );
-    }
-
     cur.advance(len)
         .context("advancing cursor to EOF after decision tree")?;
 
-    Ok(DecisionTree { records })
+    Ok(DecisionTree { records, context_size })
 }
 
 fn u32_at(data: &[u8], off: usize) -> Option<u32> {
@@ -1173,11 +1182,10 @@ mod tests {
         assert_eq!(traversal.predict(&[]).weight, 300);
     }
 
-    /// English.par is known to reconstruct as a forest of 2 trees
-    /// (63-node chain + 1500-node main tree) after stripping the
-    /// wrapper Leaf and trailing Default.
+    /// English.par is known to reconstruct as a forest of 4 trees
+    /// (Prior Leaf, Unigram Switch, Bigram Tree, Fallback Leaf).
     #[test]
-    fn reconstructs_english_as_two_trees() {
+    fn reconstructs_english_as_four_trees() {
         let Some(par) = english_par_path() else {
             return;
         };
@@ -1193,14 +1201,17 @@ mod tests {
         };
         let tree = read(&mut cur, &header).unwrap();
         let forest = tree.reconstruct().unwrap();
-        assert_eq!(forest.roots.len(), 2, "english.par should be a 2-tree forest");
+        assert_eq!(forest.roots.len(), 4, "english.par should be a 4-tree forest");
         let n0 = subtree_size(&forest.nodes, forest.roots[0]);
         let n1 = subtree_size(&forest.nodes, forest.roots[1]);
-        eprintln!("english.par forest: tree[0]={n0} nodes, tree[1]={n1} nodes");
-        assert_eq!(n0, 63, "first tree should be 63 nodes");
-        // Wrapper stripped, Default kept as a leaf of the last tree.
-        // Body = 1565 - 1 (wrapper) = 1564 records. n0 + n1 = 1564.
-        assert_eq!(n0 + n1, 1564);
+        let n2 = subtree_size(&forest.nodes, forest.roots[2]);
+        let n3 = subtree_size(&forest.nodes, forest.roots[3]);
+        eprintln!("english.par forest: tree[0]={n0}, tree[1]={n1}, tree[2]={n2}, tree[3]={n3}");
+        assert_eq!(n0, 1, "first tree should be a single prior Leaf");
+        assert_eq!(n1, 63, "second tree should be the 63-node switch chain");
+        assert_eq!(n2, 1500, "third tree should be the 1500-node main tree");
+        assert_eq!(n3, 1, "fourth tree should be the trailing fallback Leaf");
+        assert_eq!(n0 + n1 + n2 + n3, 1565);
     }
 
     fn subtree_size(nodes: &[TreeNode], root: usize) -> usize {
