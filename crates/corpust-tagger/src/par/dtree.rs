@@ -376,6 +376,50 @@ impl Traversal {
         }
         acc
     }
+
+    /// Schmid 1995 / Brants 1995-style linear interpolation between
+    /// the bigram tree (`forest.roots.last()`) and the unigram tree
+    /// (`forest.roots.first()`):
+    ///
+    /// ```text
+    /// P(t | t_{-1}, t_{-2}) = (1 - I) × tree[1](t | ctx) + I × tree[0](t | tag_{-1})
+    /// ```
+    ///
+    /// where `I` is the interpolation weight (a backoff strength —
+    /// higher `I` trusts the unigram more). For single-tree forests
+    /// the interpolation collapses to the only tree's distribution.
+    ///
+    /// The unigram traversal uses only `tag_{-1}` (the last entry of
+    /// `context`), since tree[0] of `english.par` is a switch chain
+    /// over `tag_{-1}` and ignores deeper context anyway.
+    pub fn predict_interpolated(&self, context: &[u32], i_weight: f64) -> Vec<f64> {
+        let n_tags = self.marginal.probs.len();
+        let mut acc = vec![0.0f64; n_tags];
+        if self.forest.roots.len() <= 1 {
+            // Only one tree — return its distribution directly.
+            let dist = traverse_tree(&self.forest, self.root, context);
+            for tp in &dist.probs {
+                acc[tp.tag_id as usize] = tp.prob;
+            }
+            return acc;
+        }
+        let bigram = traverse_tree(&self.forest, self.root, context);
+        // Pass only tag_{-1} to the unigram tree.
+        let unigram_ctx: &[u32] = if let Some(last) = context.last() {
+            std::slice::from_ref(last)
+        } else {
+            &[]
+        };
+        let unigram_root = self.forest.roots[0];
+        let unigram = traverse_tree(&self.forest, unigram_root, unigram_ctx);
+        for tp in &bigram.probs {
+            acc[tp.tag_id as usize] += (1.0 - i_weight) * tp.prob;
+        }
+        for tp in &unigram.probs {
+            acc[tp.tag_id as usize] += i_weight * tp.prob;
+        }
+        acc
+    }
 }
 
 impl DecisionTree {

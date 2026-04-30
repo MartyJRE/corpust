@@ -1,46 +1,42 @@
-//! Bigram-Viterbi tagger over the dtree — **experimental**.
+//! Bigram-Viterbi tagger over the dtree — **experimental, not
+//! yet wired into `Tagger`**.
 //!
-//! **Not yet wired into `Tagger`.** Empirically the formulas tried
-//! so far all regress on the Gutenberg differential vs the
-//! lexicon-argmax baseline (92.42% → 87–92% across variants). Tree[1]
-//! correctly captures the cross-context shift (closed #9), the
-//! Viterbi DP itself reproduces the baseline when fed lex-only
-//! scores (sanity check passes), but no combination of `lex × tree`
-//! with any prior we've tried matches Schmid's actual `tree-tagger
-//! -prob` output on test sentences. The algorithm details (smoothing,
-//! how tree[0] and tree[1] interact, exact Bayes form) need more
-//! reverse-engineering — see #11.
-//!
-//! For each token we collect a list of candidate tags (from the
-//! lexicon when the word is known, or from `guess_unknown_tag` when
-//! it's not) and run dynamic programming over states `(t_{-1},
-//! t_{-2})` — the last two tags chosen. Per-position score is the
-//! Bayes-corrected joint
+//! Per-position score is `dcram/treetaggerj`'s `Tagger.java`
+//! formula:
 //!
 //! ```text
-//! P(t | w, ctx) ∝ P(t | w) × P(t | ctx) / P(t)
+//! argmax_t  P(t | w) × P(t | ctx)
 //! ```
 //!
-//! where `P(t | w)` is the lexicon's per-word distribution
-//! (confirmed to sum to 1.0 — see `lexicon::Candidate::prob`),
-//! `P(t | ctx)` is the dtree leaf reached by `Traversal::predict`,
-//! and `P(t)` is the unconditional prior — currently approximated
-//! by `Traversal::marginal` (weighted average over every leaf in
-//! the forest). Without the `/ P(t)` term, common tags get
-//! double-weighted via the lexicon and dtree both.
+//! where `P(t | w)` is the lexicon's per-word distribution and
+//! `P(t | ctx)` is the dtree's prediction for context. The dtree
+//! prediction comes from `Traversal::predict_interpolated` —
+//! Schmid 1995 / Brants 1995 linear interpolation between the
+//! bigram tree (last root) and the unigram tag_{-1}-only backoff
+//! (first root):
+//!
+//! ```text
+//! P(t | t_{-1}, t_{-2}) = (1-I) × tree[1](t | ctx) + I × tree[0](t | tag_{-1})
+//! ```
 //!
 //! State space is bounded by `num_tags^2` ≈ 3.4k for english.par; in
 //! practice only a small fraction is reachable per position so the
-//! DP runs in milliseconds on a typical sentence.
+//! DP runs in milliseconds on a typical sentence. Initial state has
+//! `tag_{-1}` and `tag_{-2}` both `None` — mirrors treetaggerj's
+//! `getStartTag()` synthetic start marker that no dtree internal
+//! can match.
 //!
-//! Initial state seeds both `tag_{-1}` and `tag_{-2}` with the SENT
-//! tag — Schmid's tagger trains sentence transitions conditioned on
-//! phantom SENT markers at the start of each sentence, and tree[1]
-//! has internals that test `tag_{-2} == SENT`.
+//! **Status**: every `I` weight tested (0.0–1.0) regresses vs the
+//! lexicon-only baseline of 92.42% on the Gutenberg sample (sweep
+//! peaks at 90.31% with `I=1.0` = pure tree[0]). The Viterbi DP
+//! itself is verified correct (lex-only mode reproduces baseline
+//! within rounding). Schmid's actual implementation likely uses
+//! per-leaf interpolation weights computed from training counts
+//! that we can't reconstruct without retraining — see #11.
 
 use std::collections::HashMap;
 
-use crate::par::dtree::{Distribution, Traversal};
+use crate::par::dtree::Traversal;
 use crate::par::header::Header;
 
 /// One candidate tag for a single token. Lemma is pre-resolved at
@@ -98,14 +94,6 @@ impl State {
 /// candidate per position; callers that can't produce any candidate
 /// for a token should synthesize one (e.g. an unknown-word fallback)
 /// rather than passing an empty vec.
-///
-/// The initial state seeds both `tag_{-1}` and `tag_{-2}` with the
-/// SENT tag — Schmid's tagger trains sentence transitions
-/// conditioned on phantom `SENT` markers at the start of each
-/// sentence, and tree[1] of `english.par` has internals that test
-/// `tag_{-2} == SENT`. Without this seed, the first token's context
-/// is empty and those internals take the no-branch, which lands at
-/// a meaningless fall-through leaf and degrades accuracy.
 pub fn tag_sequence(
     cands_per_token: &[Vec<Cand>],
     traversal: &Traversal,
@@ -116,19 +104,31 @@ pub fn tag_sequence(
         return Vec::new();
     }
 
-    let sent_tag = header.sent_tag_index as u32;
-    let prior = &traversal.marginal;
+    // Schmid-style interpolation weight: how much to trust the
+    // unigram (tag_{-1}-only) backoff vs the full bigram tree.
+    // Schmid 1995 / Brants 1995 use values in roughly [0.05, 0.3];
+    // 0.1 is a reasonable starting point. Empirically every value
+    // we've tried (sweep 0.0–1.0) regresses vs the lexicon
+    // baseline; left as a runtime constant for now.
+    let i_weight = 0.1_f64;
+    let _ = header;
 
     // dps[i] holds states *after* processing tokens 0..i. dps[0] is
     // the initial state (before any token), seeded with phantom SENT
     // markers so the first token sees a complete cl=2 context.
+    // Initial state mirrors `dcram/treetaggerj`'s `getStartTag()` —
+    // a synthetic start marker that no dtree internal can match,
+    // so all predicates fail and the first token's prediction
+    // comes from the all-no-path leaf. We model this with `None`
+    // for both `tag_{-1}` and `tag_{-2}`, producing an empty context
+    // slice into `predict_interpolated`.
     let mut dps: Vec<HashMap<State, (f64, Option<(usize, State)>)>> =
         Vec::with_capacity(n + 1);
     let mut init = HashMap::new();
     init.insert(
         State {
-            last: Some(sent_tag),
-            second_last: Some(sent_tag),
+            last: None,
+            second_last: None,
         },
         (0.0_f64, None),
     );
@@ -140,15 +140,14 @@ pub fn tag_sequence(
         let mut next: HashMap<State, (f64, Option<(usize, State)>)> = HashMap::new();
         for (state, &(score, _)) in &dps[i] {
             state.write_context(&mut ctx_buf);
-            let cond = traversal.predict_combined(&ctx_buf);
+            let cond = traversal.predict_interpolated(&ctx_buf, i_weight);
             for (cand_idx, c) in cands.iter().enumerate() {
                 let p_cond = cond.get(c.tag_id as usize).copied().unwrap_or(0.0);
-                let pri = tag_prob(prior, c.tag_id);
-                let local = if pri > 0.0 {
-                    c.lex_prob * p_cond / pri
-                } else {
-                    c.lex_prob * p_cond
-                };
+                // Schmid's per-token formula is the bare HMM joint:
+                // argmax_t  P(t | w) × P(t | ctx)
+                // (treetaggerj's reference implementation uses this
+                // exact form — see Tagger.java#getMostProbable.)
+                let local = c.lex_prob * p_cond;
                 if local <= 0.0 {
                     continue;
                 }
@@ -216,13 +215,6 @@ pub fn tag_sequence(
     out
 }
 
-fn tag_prob(dist: &Distribution, tag_id: u32) -> f64 {
-    dist.probs
-        .iter()
-        .find(|tp| tp.tag_id == tag_id)
-        .map(|tp| tp.prob)
-        .unwrap_or(0.0)
-}
 
 #[cfg(test)]
 mod tests {
