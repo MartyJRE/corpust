@@ -16,6 +16,7 @@
 //! par-explore f32s       <file> --from <off> --count <n>
 //! par-explore dtree-walk <file> --from <off> [--count <n>]
 //! par-explore dtree-walk-auto <file> [--count <n>]
+//! par-explore dtree-traverse <file> --from <off> --context T1,T2,...
 //! ```
 //!
 //! Offsets and lengths are decimal by default, `0x...` parses as hex.
@@ -38,12 +39,36 @@ fn main() -> Result<()> {
     let mut from: usize = 0;
     let mut len: usize = 128;
     let mut count: usize = 16;
+    let mut context: Vec<u32> = Vec::new();
+    let mut probe_tags: Vec<u32> = Vec::new();
 
     while let Some(flag) = it.next() {
         match flag.as_str() {
             "--from" => from = parse_num(it.next().context("--from needs a value")?)?,
             "--len" => len = parse_num(it.next().context("--len needs a value")?)?,
             "--count" => count = parse_num(it.next().context("--count needs a value")?)?,
+            "--context" => {
+                let arg = it.next().context("--context needs a value")?;
+                context = arg
+                    .split(',')
+                    .map(|s| {
+                        s.trim()
+                            .parse::<u32>()
+                            .with_context(|| format!("bad tag id in --context: {s:?}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            "--probe" => {
+                let arg = it.next().context("--probe needs a value")?;
+                probe_tags = arg
+                    .split(',')
+                    .map(|s| {
+                        s.trim()
+                            .parse::<u32>()
+                            .with_context(|| format!("bad tag id in --probe: {s:?}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            }
             other => bail!("unknown flag {other}"),
         }
     }
@@ -58,6 +83,7 @@ fn main() -> Result<()> {
         "f32s" => dump_f32s(&bytes, from, count),
         "dtree-walk" => dump_dtree_walk(&bytes, from, count),
         "dtree-walk-auto" => dump_dtree_walk_auto(&bytes, from, count),
+        "dtree-traverse" => dump_dtree_traverse(&bytes, from, &context, &probe_tags),
         "" => {
             eprintln!(
                 "usage: par-explore <header|hex|cstrs|u32s|f32s|dtree-walk|dtree-walk-auto> \
@@ -348,6 +374,92 @@ fn dump_dtree_walk_auto(bytes: &[u8], from: usize, count: usize) -> Result<()> {
         .map(|(i, c)| format!("i={i} → {c}"))
         .collect();
     println!("predicate distribution: {}", parts.join(", "));
+    Ok(())
+}
+
+/// Walk every tree of the forest with a given context (oldest tag
+/// first) and print each tree's resulting distribution top-K. Lets
+/// us see whether the trees agree, and which one (or which
+/// combination) matches what `tree-tagger -prob` produces for the
+/// equivalent context.
+fn dump_dtree_traverse(
+    bytes: &[u8],
+    from: usize,
+    context: &[u32],
+    probe_tags: &[u32],
+) -> Result<()> {
+    if from == 0 {
+        bail!("dtree-traverse needs --from <offset>");
+    }
+    let mut cur = par::Cursor::new(bytes);
+    let header = par::header::read(&mut cur)?;
+    let mut cur = par::Cursor::new(bytes);
+    cur.advance(from)?;
+    let tree = par::dtree::read(&mut cur, &header)?;
+    let forest = tree.reconstruct()?;
+
+    let context_names: Vec<&str> = context
+        .iter()
+        .map(|&t| header.tag(t).unwrap_or("?"))
+        .collect();
+    println!(
+        "context (oldest → newest): {} = {:?}",
+        context_names.join(" "),
+        context
+    );
+    println!("forest has {} tree(s)", forest.roots.len());
+
+    for (ti, &root) in forest.roots.iter().enumerate() {
+        let dist = par::dtree::traverse_tree(&forest, root, context);
+        let mut top: Vec<&par::dtree::TagProb> = dist.probs.iter().collect();
+        top.sort_by(|a, b| b.prob.partial_cmp(&a.prob).unwrap());
+        println!();
+        println!(
+            "tree[{ti}] (root fnidx={root}, weight={}) — top 5 tags:",
+            dist.weight
+        );
+        for tp in top.iter().take(5) {
+            let name = header.tag(tp.tag_id).unwrap_or("?");
+            println!("  {:>3} {:>11}  P = {:.6}", tp.tag_id, name, tp.prob);
+        }
+        if !probe_tags.is_empty() {
+            println!("  probe:");
+            for &t in probe_tags {
+                let p = dist
+                    .probs
+                    .iter()
+                    .find(|tp| tp.tag_id == t)
+                    .map(|tp| tp.prob)
+                    .unwrap_or(0.0);
+                let name = header.tag(t).unwrap_or("?");
+                println!("    {t:>3} {name:>11}  P = {p:.6}");
+            }
+        }
+    }
+
+    // Mixture (uniform-weighted average) for comparison.
+    if forest.roots.len() > 1 {
+        let n_tags = header.tags.len();
+        let mut mix = vec![0.0f64; n_tags];
+        for &root in &forest.roots {
+            let dist = par::dtree::traverse_tree(&forest, root, context);
+            for tp in &dist.probs {
+                mix[tp.tag_id as usize] += tp.prob;
+            }
+        }
+        for v in &mut mix {
+            *v /= forest.roots.len() as f64;
+        }
+        let mut top: Vec<(usize, f64)> = mix.iter().copied().enumerate().collect();
+        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        println!();
+        println!("uniform-mixture across all trees — top 5 tags:");
+        for (id, p) in top.iter().take(5) {
+            let name = header.tag(*id as u32).unwrap_or("?");
+            println!("  {:>3} {:>11}  P = {:.6}", id, name, p);
+        }
+    }
+
     Ok(())
 }
 

@@ -324,6 +324,73 @@ impl DecisionTree {
     }
 }
 
+/// Cached topology + chosen entry-root for `predict`. Build once per
+/// model; reuse across many predictions.
+#[derive(Debug, Clone)]
+pub struct Traversal {
+    pub forest: TreeForest,
+    /// Index into `forest.nodes` of the tree we descend from.
+    pub root: usize,
+}
+
+impl Traversal {
+    /// `tag_at[-(back_pos_i + 1)] == test_tag_id` predicate evaluated
+    /// against the supplied context (oldest tag first; e.g.
+    /// `[..., tag_{-2}, tag_{-1}]`). Returns the leaf distribution
+    /// reached by traversal.
+    pub fn predict<'a>(&'a self, context: &[u32]) -> &'a Distribution {
+        traverse_tree(&self.forest, self.root, context)
+    }
+}
+
+impl DecisionTree {
+    /// Reconstruct the forest and pick the inference root. The rule:
+    /// **last tree in preorder-DFS order**. For a single-tree forest
+    /// (toys, most models) that's the only tree. For `english.par`'s
+    /// 2-tree forest, that's tree[1] — empirically the inference
+    /// tree (see issue #9 for the experimental evidence and the
+    /// open question of tree[0]'s purpose).
+    pub fn traversal(&self) -> Result<Traversal> {
+        let forest = self.reconstruct()?;
+        let &root = forest
+            .roots
+            .last()
+            .context("forest has no trees — nothing to traverse")?;
+        Ok(Traversal { forest, root })
+    }
+}
+
+/// Walk one tree of a `TreeForest` from `root_idx` with `context`
+/// = previous tags (oldest first). Each `Internal` predicate
+/// `[back_pos_i, test_tag_id]` evaluates as
+/// `context[len - 1 - back_pos_i] == test_tag_id`. Out-of-bounds
+/// reads (early in a sentence) take the no-branch.
+///
+/// Returns the leaf distribution reached by the traversal.
+pub fn traverse_tree<'a>(
+    forest: &'a TreeForest,
+    root_idx: usize,
+    context: &[u32],
+) -> &'a Distribution {
+    let mut idx = root_idx;
+    loop {
+        match &forest.nodes[idx] {
+            TreeNode::Leaf { distribution, .. } => return distribution,
+            TreeNode::Internal {
+                predicate, yes, no, ..
+            } => {
+                let back = predicate.back_pos_i as usize;
+                let observed = context.len().checked_sub(back + 1).and_then(|k| context.get(k));
+                idx = if observed.copied() == Some(predicate.test_tag_id) {
+                    *yes
+                } else {
+                    *no
+                };
+            }
+        }
+    }
+}
+
 /// Topological view of the decision tree(s), reconstructed from the
 /// flat preorder-DFS record list by [`DecisionTree::reconstruct`].
 #[derive(Debug, Clone)]
@@ -686,11 +753,11 @@ mod tests {
         out
     }
 
-    fn synth_internal(offset_i: u32, tag_id: u32, branch_info: u32) -> Vec<u8> {
+    fn synth_internal(reserved: u32, back_pos_i: u32, test_tag_id: u32) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&offset_i.to_le_bytes());
-        out.extend_from_slice(&tag_id.to_le_bytes());
-        out.extend_from_slice(&branch_info.to_le_bytes());
+        out.extend_from_slice(&reserved.to_le_bytes());
+        out.extend_from_slice(&back_pos_i.to_le_bytes());
+        out.extend_from_slice(&test_tag_id.to_le_bytes());
         out
     }
 
@@ -874,6 +941,39 @@ mod tests {
             }
             _ => panic!("root should be an internal"),
         }
+    }
+
+    /// `predict()` follows yes/no branches according to the
+    /// reconstructed predicate. Tree shape:
+    ///
+    /// ```text
+    /// root: tag_{-1} == 1?
+    ///   yes → leaf weight=100
+    ///   no  → inner: tag_{-2} == 2?
+    ///           yes → leaf weight=200
+    ///           no  → Default weight=300
+    /// ```
+    #[test]
+    fn predict_follows_yes_no_branches() {
+        let n = 3u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&synth_internal(0, 0, 1)); // root: tag_{-1} == 1?
+        bytes.extend_from_slice(&synth_pruned(n, 100));    // yes leaf
+        bytes.extend_from_slice(&synth_internal(0, 1, 2)); // inner: tag_{-2} == 2?
+        bytes.extend_from_slice(&synth_pruned(n, 200));    // inner yes leaf
+        bytes.extend_from_slice(&synth_default(n, 300));   // inner no leaf
+
+        let tree = read(&mut Cursor::new(&bytes), &stub_header(n)).unwrap();
+        let traversal = tree.traversal().unwrap();
+
+        // tag_{-1} == 1 → yes leaf
+        assert_eq!(traversal.predict(&[0, 1]).weight, 100);
+        // tag_{-1} != 1, tag_{-2} == 2 → inner yes leaf
+        assert_eq!(traversal.predict(&[2, 0]).weight, 200);
+        // tag_{-1} != 1, tag_{-2} != 2 → default leaf
+        assert_eq!(traversal.predict(&[0, 0]).weight, 300);
+        // empty context — predicates always evaluate false → all no
+        assert_eq!(traversal.predict(&[]).weight, 300);
     }
 
     /// English.par is known to reconstruct as a forest of 2 trees
