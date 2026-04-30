@@ -393,10 +393,52 @@ impl Traversal {
     /// `context`), since tree[0] of `english.par` is a switch chain
     /// over `tag_{-1}` and ignores deeper context anyway.
     pub fn predict_interpolated(&self, context: &[u32], i_weight: f64) -> Vec<f64> {
+        self.predict_interpolated_inner(context, |_, _| i_weight)
+    }
+
+    /// Per-leaf-weighted interpolation. `I` is computed from the
+    /// bigram leaf's training count `N` (= `leaf.weight`):
+    ///
+    /// - **Lidstone**: `I = α / (α + N)` — `α` controls the neutral
+    ///   weight where `I = 0.5`.
+    /// - **Witten-Bell**: `I = U / (U + N)` — `U` = number of tags
+    ///   with non-zero probability at the leaf. Theoretically
+    ///   grounded for leave-one-out smoothing.
+    ///
+    /// Schmid 1995 §3 specifies per-leaf I "such that more weight is
+    /// given to the unconditional probability if the node has been
+    /// visited only a few times during training". Both forms above
+    /// satisfy that monotonicity.
+    pub fn predict_per_leaf_interpolated(
+        &self,
+        context: &[u32],
+        scheme: SmoothingScheme,
+    ) -> Vec<f64> {
+        self.predict_interpolated_inner(context, |dist, _ctx| match scheme {
+            SmoothingScheme::Lidstone(alpha) => {
+                let n = dist.weight as f64;
+                alpha / (alpha + n)
+            }
+            SmoothingScheme::WittenBell => {
+                let n = dist.weight as f64;
+                let u = dist.probs.iter().filter(|tp| tp.prob > 0.0).count() as f64;
+                if u + n > 0.0 {
+                    u / (u + n)
+                } else {
+                    0.5
+                }
+            }
+        })
+    }
+
+    fn predict_interpolated_inner(
+        &self,
+        context: &[u32],
+        i_weight_fn: impl Fn(&Distribution, &[u32]) -> f64,
+    ) -> Vec<f64> {
         let n_tags = self.marginal.probs.len();
         let mut acc = vec![0.0f64; n_tags];
         if self.forest.roots.len() <= 1 {
-            // Only one tree — return its distribution directly.
             let dist = traverse_tree(&self.forest, self.root, context);
             for tp in &dist.probs {
                 acc[tp.tag_id as usize] = tp.prob;
@@ -404,22 +446,31 @@ impl Traversal {
             return acc;
         }
         let bigram = traverse_tree(&self.forest, self.root, context);
-        // Pass only tag_{-1} to the unigram tree.
-        let unigram_ctx: &[u32] = if let Some(last) = context.last() {
-            std::slice::from_ref(last)
-        } else {
-            &[]
-        };
+        // Pass the full context to tree[0] too — tree[0] only tests
+        // tag_{-1} (back_pos_i=0) on `english.par` so deeper context
+        // is silently ignored, but for forests with deeper unigram
+        // backoff structure this stays correct.
         let unigram_root = self.forest.roots[0];
-        let unigram = traverse_tree(&self.forest, unigram_root, unigram_ctx);
+        let unigram = traverse_tree(&self.forest, unigram_root, context);
+        let i = i_weight_fn(bigram, context).clamp(0.0, 1.0);
         for tp in &bigram.probs {
-            acc[tp.tag_id as usize] += (1.0 - i_weight) * tp.prob;
+            acc[tp.tag_id as usize] += (1.0 - i) * tp.prob;
         }
         for tp in &unigram.probs {
-            acc[tp.tag_id as usize] += i_weight * tp.prob;
+            acc[tp.tag_id as usize] += i * tp.prob;
         }
         acc
     }
+}
+
+/// Choice of smoothing formula for `Traversal::predict_per_leaf_interpolated`.
+#[derive(Debug, Clone, Copy)]
+pub enum SmoothingScheme {
+    /// `I = α / (α + N)`. `α` is the neutral weight at which `I=0.5`.
+    Lidstone(f64),
+    /// `I = U / (U + N)` where `U` is the number of non-zero-prob
+    /// tags at the leaf.
+    WittenBell,
 }
 
 impl DecisionTree {

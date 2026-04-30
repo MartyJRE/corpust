@@ -22,8 +22,6 @@
 
 pub mod par;
 pub mod testkit;
-/// Experimental: not yet wired into `Tagger`. See module-level
-/// docs for the open formula-research issue (#11).
 pub mod viterbi;
 
 /// Re-export the Perl-compatible tokenizer so callers that depend on
@@ -53,6 +51,10 @@ use std::path::Path;
 /// with a single dominant candidate and diverges on ambiguous words.
 pub struct Tagger {
     model: par::Model,
+    /// Cached forest + entry-root for the dtree. `None` when the
+    /// model has no dtree or reconstruction failed; in either case
+    /// tagging falls back to lexicon-only argmax.
+    dtree: Option<par::dtree::Traversal>,
     tokenizer: tokenize::Tokenizer,
     language: &'static str,
     id: String,
@@ -72,8 +74,10 @@ impl Tagger {
         abbreviations: impl IntoIterator<Item = String>,
     ) -> Result<Self> {
         let model = par::load(path.as_ref())?;
+        let dtree = model.dtree.as_ref().and_then(|dt| dt.traversal().ok());
         Ok(Self {
             model,
+            dtree,
             tokenizer: tokenize::Tokenizer::new(abbreviations),
             language,
             id: format!("treetagger-rs-{language}"),
@@ -86,31 +90,34 @@ impl Tagger {
         &self.model
     }
 
-    /// Choose `(pos, lemma)` for a single token in isolation. Pure
-    /// lexicon lookup, with suffix-trie guessing for unknowns and a
-    /// final Default-distribution fallback. No context from
-    /// surrounding tokens yet.
-    fn tag_token(&self, word: &str) -> (Option<String>, Option<String>) {
+    /// Build the candidate list for one token: lexicon entries when
+    /// known, a single forced candidate from the unknown-word
+    /// guesser otherwise. Lemma is pre-resolved.
+    fn candidates_for(&self, word: &str) -> Vec<viterbi::Cand> {
         if let Some(entry) = self.model.lexicon.lookup(word) {
-            if let Some(best) = entry
-                .candidates
-                .iter()
-                .max_by(|a, b| a.prob.partial_cmp(&b.prob).unwrap_or(std::cmp::Ordering::Equal))
-            {
-                let pos = self.model.header.tag(best.tag_id).map(str::to_owned);
-                let lemma = self.model.lexicon.lemma(best.lemma_index).map(str::to_owned);
-                return (pos, lemma);
+            if !entry.candidates.is_empty() {
+                return entry
+                    .candidates
+                    .iter()
+                    .map(|c| viterbi::Cand {
+                        tag_id: c.tag_id,
+                        lex_prob: c.prob as f64,
+                        lemma: self.model.lexicon.lemma(c.lemma_index).map(str::to_owned),
+                    })
+                    .collect();
             }
         }
         // Unknown word. Get a best-guess POS from the tries; leave
         // lemma None — tree-tagger's `<unknown>` → None convention.
-        // (A minority of the oracle's proper-noun outputs use the
-        // surface form as lemma, but there's no way to know which
-        // without matching the oracle's internal capitalized-word
-        // lexicon, so None is the cleanest default.)
-        let peak_tag_id = self.guess_unknown_tag(word);
-        let pos = peak_tag_id.and_then(|t| self.model.header.tag(t.into()).map(str::to_owned));
-        (pos, None)
+        let tag_id = self
+            .guess_unknown_tag(word)
+            .map(u32::from)
+            .unwrap_or(self.model.header.sent_tag_index as u32);
+        vec![viterbi::Cand {
+            tag_id,
+            lex_prob: 1.0,
+            lemma: None,
+        }]
     }
 
     /// Guess the best POS tag ID for a word missing from the lexicon.
@@ -161,14 +168,34 @@ impl Tagger {
 impl Annotator for Tagger {
     fn annotate<'a>(&self, text: &'a str) -> Result<Vec<AnnotatedToken<'a>>> {
         let tokens = self.tokenizer.tokenize(text);
-        // Align each produced token back to its source span by
-        // forward-searching. Same strategy as
-        // `corpust_annotate::treetagger::align_to_source` — kept
-        // in-crate here since the shared extraction hasn't landed.
+        let cands: Vec<Vec<viterbi::Cand>> =
+            tokens.iter().map(|t| self.candidates_for(t)).collect();
+        let tagged: Vec<viterbi::Tagged> = match self.dtree.as_ref() {
+            Some(traversal) => viterbi::tag_sequence(&cands, traversal, &self.model.header),
+            None => cands
+                .iter()
+                .map(|cs| {
+                    let best = cs.iter().max_by(|a, b| {
+                        a.lex_prob
+                            .partial_cmp(&b.lex_prob)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    match best {
+                        Some(c) => viterbi::Tagged {
+                            pos: self.model.header.tag(c.tag_id).map(str::to_owned),
+                            lemma: c.lemma.clone(),
+                        },
+                        None => viterbi::Tagged {
+                            pos: None,
+                            lemma: None,
+                        },
+                    }
+                })
+                .collect(),
+        };
         let mut cursor = 0usize;
         let mut out = Vec::with_capacity(tokens.len());
-        for (position, tok) in tokens.into_iter().enumerate() {
-            let (pos, lemma) = self.tag_token(&tok);
+        for (position, (tok, t)) in tokens.into_iter().zip(tagged).enumerate() {
             let (start, end) = match text[cursor..].find(tok.as_str()) {
                 Some(off) => {
                     let s = cursor + off;
@@ -179,8 +206,8 @@ impl Annotator for Tagger {
             };
             out.push(AnnotatedToken {
                 word: Cow::Owned(tok),
-                lemma: lemma.map(Cow::Owned),
-                pos: pos.map(Cow::Owned),
+                lemma: t.lemma.map(Cow::Owned),
+                pos: t.pos.map(Cow::Owned),
                 byte_start: start,
                 byte_end: end,
                 position: position as Position,
@@ -468,6 +495,31 @@ mod tests {
             report.lemma_errors(),
             report.pos_accuracy()
         );
+    }
+
+    /// Probe specific lexicon entries to debug Viterbi mistakes.
+    #[test]
+    #[ignore]
+    fn lexicon_probe_words() {
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let model = par::load(&par).unwrap();
+        for word in ["King", "king", "How", "how", "I", "Table", "table"] {
+            match model.lexicon.lookup(word) {
+                Some(entry) => {
+                    eprintln!("=== {word:<10} ({} candidates) ===", entry.candidates.len());
+                    for c in &entry.candidates {
+                        let name = model.header.tag(c.tag_id).unwrap_or("?");
+                        let lemma = model.lexicon.lemma(c.lemma_index).unwrap_or("?");
+                        eprintln!(
+                            "  {:>2} {:>5}  P = {:.4}  lemma={lemma:?}",
+                            c.tag_id, name, c.prob
+                        );
+                    }
+                }
+                None => eprintln!("=== {word:<10} NOT IN LEXICON ==="),
+            }
+        }
     }
 
     /// Diff the pure-Rust lexicon-first tagger against the subprocess

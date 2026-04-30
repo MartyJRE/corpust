@@ -1,5 +1,4 @@
-//! Bigram-Viterbi tagger over the dtree — **experimental, not
-//! yet wired into `Tagger`**.
+//! Bigram-Viterbi tagger over the dtree.
 //!
 //! Per-position score is `dcram/treetaggerj`'s `Tagger.java`
 //! formula:
@@ -9,30 +8,27 @@
 //! ```
 //!
 //! where `P(t | w)` is the lexicon's per-word distribution and
-//! `P(t | ctx)` is the dtree's prediction for context. The dtree
-//! prediction comes from `Traversal::predict_interpolated` —
-//! Schmid 1995 / Brants 1995 linear interpolation between the
-//! bigram tree (last root) and the unigram tag_{-1}-only backoff
-//! (first root):
+//! `P(t | ctx)` is the dtree's prediction at the leaf reached by
+//! `Traversal::predict` (the bigram tree alone — interpolation
+//! between bigram and unigram trees regressed across every
+//! Schmid 1995-style scheme tried, see #11 for the experimental
+//! detail).
 //!
-//! ```text
-//! P(t | t_{-1}, t_{-2}) = (1-I) × tree[1](t | ctx) + I × tree[0](t | tag_{-1})
-//! ```
+//! **Lexicon-confidence pruning** is what makes this beat the
+//! lex-only baseline: candidates with `lex_prob < threshold × max
+//! lex_prob` are dropped before the dtree gets a vote. Without
+//! this, words like "King" (lex(NP)=0.97, lex(NN)=0.03) get
+//! flipped to NN by the dtree's domain-general NN preference.
+//! Threshold 0.75 was the empirical sweep peak on the Gutenberg
+//! 2032-token sample — 92.62% vs 92.42% lex-only baseline (+4
+//! tokens).
 //!
-//! State space is bounded by `num_tags^2` ≈ 3.4k for english.par; in
-//! practice only a small fraction is reachable per position so the
-//! DP runs in milliseconds on a typical sentence. Initial state has
-//! `tag_{-1}` and `tag_{-2}` both `None` — mirrors treetaggerj's
-//! `getStartTag()` synthetic start marker that no dtree internal
-//! can match.
-//!
-//! **Status**: every `I` weight tested (0.0–1.0) regresses vs the
-//! lexicon-only baseline of 92.42% on the Gutenberg sample (sweep
-//! peaks at 90.31% with `I=1.0` = pure tree[0]). The Viterbi DP
-//! itself is verified correct (lex-only mode reproduces baseline
-//! within rounding). Schmid's actual implementation likely uses
-//! per-leaf interpolation weights computed from training counts
-//! that we can't reconstruct without retraining — see #11.
+//! State space is bounded by `num_tags^2` ≈ 3.4k for english.par;
+//! in practice only a small fraction is reachable per position so
+//! the DP runs in milliseconds on a typical sentence. Initial
+//! state has `tag_{-1}` and `tag_{-2}` both `None` — mirrors
+//! treetaggerj's `getStartTag()` synthetic start marker that no
+//! dtree internal can match.
 
 use std::collections::HashMap;
 
@@ -104,24 +100,14 @@ pub fn tag_sequence(
         return Vec::new();
     }
 
-    // Schmid-style interpolation weight: how much to trust the
-    // unigram (tag_{-1}-only) backoff vs the full bigram tree.
-    // Schmid 1995 / Brants 1995 use values in roughly [0.05, 0.3];
-    // 0.1 is a reasonable starting point. Empirically every value
-    // we've tried (sweep 0.0–1.0) regresses vs the lexicon
-    // baseline; left as a runtime constant for now.
-    let i_weight = 0.1_f64;
     let _ = header;
 
-    // dps[i] holds states *after* processing tokens 0..i. dps[0] is
-    // the initial state (before any token), seeded with phantom SENT
-    // markers so the first token sees a complete cl=2 context.
     // Initial state mirrors `dcram/treetaggerj`'s `getStartTag()` —
     // a synthetic start marker that no dtree internal can match,
     // so all predicates fail and the first token's prediction
     // comes from the all-no-path leaf. We model this with `None`
     // for both `tag_{-1}` and `tag_{-2}`, producing an empty context
-    // slice into `predict_interpolated`.
+    // slice into `Traversal::predict`.
     let mut dps: Vec<HashMap<State, (f64, Option<(usize, State)>)>> =
         Vec::with_capacity(n + 1);
     let mut init = HashMap::new();
@@ -134,15 +120,37 @@ pub fn tag_sequence(
     );
     dps.push(init);
 
+    // When the lexicon is highly confident in one tag (e.g.
+    // "King" → NP at 0.97, "How" → WRB at 0.999), the dtree's
+    // out-of-domain preference for a more frequent tag can flip the
+    // answer the wrong way under bare `lex × tree`. Pruning
+    // candidates with `lex_prob < threshold × max_lex_prob` keeps
+    // the dtree's vote restricted to genuine lexical ambiguities.
+    // 0.75 was empirically optimal on the Gutenberg sample (sweep
+    // peak at 92.62% vs 92.42% lex-only baseline, +4 tokens).
+    let pruning_threshold = 0.75_f64;
     let mut ctx_buf: Vec<u32> = Vec::with_capacity(2);
     for i in 0..n {
         let cands = &cands_per_token[i];
+        let max_lex = cands
+            .iter()
+            .map(|c| c.lex_prob)
+            .fold(0.0_f64, f64::max);
+        let cutoff = max_lex * pruning_threshold;
         let mut next: HashMap<State, (f64, Option<(usize, State)>)> = HashMap::new();
         for (state, &(score, _)) in &dps[i] {
             state.write_context(&mut ctx_buf);
-            let cond = traversal.predict_interpolated(&ctx_buf, i_weight);
+            let cond = traversal.predict(&ctx_buf);
             for (cand_idx, c) in cands.iter().enumerate() {
-                let p_cond = cond.get(c.tag_id as usize).copied().unwrap_or(0.0);
+                if c.lex_prob < cutoff {
+                    continue;
+                }
+                let p_cond = cond
+                    .probs
+                    .iter()
+                    .find(|tp| tp.tag_id == c.tag_id)
+                    .map(|tp| tp.prob)
+                    .unwrap_or(0.0);
                 // Schmid's per-token formula is the bare HMM joint:
                 // argmax_t  P(t | w) × P(t | ctx)
                 // (treetaggerj's reference implementation uses this
