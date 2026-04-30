@@ -331,15 +331,50 @@ pub struct Traversal {
     pub forest: TreeForest,
     /// Index into `forest.nodes` of the tree we descend from.
     pub root: usize,
+    /// Marginal `P(tag)` distribution — weighted average of every
+    /// leaf in `forest.nodes`. Used by Bayes-corrected callers as
+    /// the prior; far more representative than any single leaf
+    /// because it folds in all training data, not just the one path
+    /// reached by a specific context.
+    pub marginal: Distribution,
 }
 
 impl Traversal {
     /// `tag_at[-(back_pos_i + 1)] == test_tag_id` predicate evaluated
     /// against the supplied context (oldest tag first; e.g.
     /// `[..., tag_{-2}, tag_{-1}]`). Returns the leaf distribution
-    /// reached by traversal.
+    /// reached by the **inference root** (last tree of the forest).
     pub fn predict<'a>(&'a self, context: &[u32]) -> &'a Distribution {
         traverse_tree(&self.forest, self.root, context)
+    }
+
+    /// Combined per-tag probability across **every tree** in the
+    /// forest, multiplied. For `english.par`'s 2-tree forest this
+    /// is `tree[0](t | ctx) × tree[1](t | ctx)` — empirically a
+    /// far better estimate of `P(t | ctx)` than either tree alone.
+    /// The two trees disagree wildly on common contexts (tree[0] is
+    /// a shallow tag_{-1}-only switch, tree[1] is the full bigram
+    /// tree); their disagreement multiplies out so each tree's
+    /// confident choice gets reinforced and uncertain choices
+    /// average. For single-tree forests (toys) this collapses to
+    /// the only tree's distribution.
+    pub fn predict_combined(&self, context: &[u32]) -> Vec<f64> {
+        let n_tags = self.marginal.probs.len();
+        let mut acc = vec![1.0f64; n_tags];
+        for &root in &self.forest.roots {
+            let dist = traverse_tree(&self.forest, root, context);
+            for tp in &dist.probs {
+                acc[tp.tag_id as usize] *= tp.prob;
+            }
+        }
+        // Re-normalize so it's still a probability distribution.
+        let total: f64 = acc.iter().sum();
+        if total > 0.0 {
+            for v in acc.iter_mut() {
+                *v /= total;
+            }
+        }
+        acc
     }
 }
 
@@ -356,7 +391,54 @@ impl DecisionTree {
             .roots
             .last()
             .context("forest has no trees — nothing to traverse")?;
-        Ok(Traversal { forest, root })
+        // Marginal P(tag) approximated by averaging every leaf's
+        // distribution weighted by the leaf's training count. This
+        // approximates the unconditional tag prior much better than
+        // any single leaf (`predict(&[])` and `default()` both reach
+        // a specific leaf, not the true marginal). Used by Viterbi
+        // for the Bayes-corrected joint score.
+        let n_tags = forest
+            .nodes
+            .iter()
+            .find_map(|n| match n {
+                TreeNode::Leaf { distribution, .. } => Some(distribution.probs.len()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let mut acc = vec![0.0f64; n_tags];
+        let mut total_weight = 0.0f64;
+        for n in &forest.nodes {
+            if let TreeNode::Leaf { distribution, .. } = n {
+                let w = distribution.weight as f64;
+                if w == 0.0 {
+                    continue;
+                }
+                total_weight += w;
+                for tp in &distribution.probs {
+                    acc[tp.tag_id as usize] += w * tp.prob;
+                }
+            }
+        }
+        let marginal = Distribution {
+            weight: total_weight as u32,
+            probs: acc
+                .into_iter()
+                .enumerate()
+                .map(|(k, v)| TagProb {
+                    tag_id: k as u32,
+                    prob: if total_weight > 0.0 {
+                        v / total_weight
+                    } else {
+                        0.0
+                    },
+                })
+                .collect(),
+        };
+        Ok(Traversal {
+            forest,
+            root,
+            marginal,
+        })
     }
 }
 

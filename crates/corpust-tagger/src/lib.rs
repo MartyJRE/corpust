@@ -22,6 +22,9 @@
 
 pub mod par;
 pub mod testkit;
+/// Experimental: not yet wired into `Tagger`. See module-level
+/// docs for the open formula-research issue (#11).
+pub mod viterbi;
 
 /// Re-export the Perl-compatible tokenizer so callers that depend on
 /// `corpust-tagger` don't also need to pull in `corpust-tokenize`.
