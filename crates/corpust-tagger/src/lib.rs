@@ -39,16 +39,15 @@ use std::path::Path;
 /// Constructed from a `.par` file; the loaded [`Model`] is immutable and
 /// cheap to share across rayon workers via a normal `&Tagger` borrow.
 ///
-/// **Current mode of operation: lexicon-first baseline.** Tokens are
-/// tokenized via `corpust_tokenize::treetagger::Tokenizer` and tagged by
-/// picking the maximum-probability candidate from the `.par` lexicon.
-/// For unknown words we fall back to the peak tag of the decision-tree
-/// Default distribution. Context-based disambiguation via Viterbi over
-/// the decision tree is **not wired yet** — sub-task 2 of
-/// `pure-rust-treetagger.md` is still working out what the 3 u32 fields
-/// of each Internal record actually encode. This is a known-degraded
-/// correctness baseline that matches the subprocess oracle on words
-/// with a single dominant candidate and diverges on ambiguous words.
+/// **Current mode: dtree-driven bigram Viterbi.** Tokens are
+/// tokenized via `corpust_tokenize::treetagger::Tokenizer` and the
+/// per-token candidate list comes from either the lexicon (known
+/// words) or the suffix trie's full distribution + capitalization
+/// boost (unknown words). `viterbi::tag_sequence` then picks the
+/// best path under  `argmax_t P(t | w) × P(t | ctx)`  with the
+/// dtree-confidence pruning trick (see viterbi module docs).
+/// Models without a usable dtree degrade to per-token lexicon
+/// argmax with no context.
 pub struct Tagger {
     model: par::Model,
     /// Cached forest + entry-root for the dtree. `None` when the
@@ -91,8 +90,9 @@ impl Tagger {
     }
 
     /// Build the candidate list for one token: lexicon entries when
-    /// known, a single forced candidate from the unknown-word
-    /// guesser otherwise. Lemma is pre-resolved.
+    /// known, otherwise the unknown-word distribution from the
+    /// suffix trie (with prefix trie / dtree default as fallbacks
+    /// and a capitalized → NP boost). Lemma is pre-resolved.
     fn candidates_for(&self, word: &str) -> Vec<viterbi::Cand> {
         if let Some(entry) = self.model.lexicon.lookup(word) {
             if !entry.candidates.is_empty() {
@@ -107,57 +107,96 @@ impl Tagger {
                     .collect();
             }
         }
-        // Unknown word. Get a best-guess POS from the tries; leave
-        // lemma None — tree-tagger's `<unknown>` → None convention.
-        let tag_id = self
-            .guess_unknown_tag(word)
-            .map(u32::from)
-            .unwrap_or(self.model.header.sent_tag_index as u32);
-        vec![viterbi::Cand {
-            tag_id,
-            lex_prob: 1.0,
-            lemma: None,
-        }]
+        self.unknown_word_candidates(word)
     }
 
-    /// Guess the best POS tag ID for a word missing from the lexicon.
-    ///
-    /// Heuristics, in order:
-    /// 1. **Capitalized** word → default to NP (proper noun, tag 21
-    ///    on the English tagset). TreeTagger treats capitalized
-    ///    unknowns as proper nouns by default, and trying the prefix
-    ///    trie first on these loses on e.g. "Accolon" (which the
-    ///    suffix trie tags as VVN by the 'lon' ending).
-    /// 2. **Lowercase** word → suffix-trie peak.
-    /// 3. Fall back to prefix-trie peak, then to the dtree Default
-    ///    distribution's peak.
-    fn guess_unknown_tag(&self, word: &str) -> Option<u8> {
-        // Only "Capitalized" (mixed-case) unknowns default to NP. ALL-CAPS
-        // words tend to be section headings like "BOOK" or
-        // "BIBLIOGRAPHICAL" that oracle tags as regular NN/JJ.
+    /// Distribution of plausible tags for a word missing from the
+    /// lexicon. Pulls the suffix-trie distribution (or the prefix
+    /// trie if suffix has no match), then for "Capitalized"
+    /// (mixed-case, first-letter-upper) words ensures NP appears
+    /// with non-trivial weight — TreeTagger's default-to-proper-
+    /// noun convention for unknown capitalized tokens.
+    fn unknown_word_candidates(&self, word: &str) -> Vec<viterbi::Cand> {
         let chars: Vec<char> = word.chars().collect();
         let first_upper = chars.first().copied().map(|c| c.is_uppercase()).unwrap_or(false);
         let rest_lower = chars.iter().skip(1).all(|c| !c.is_uppercase());
-        if first_upper && rest_lower {
-            if let Some(np) = self.tag_id_by_name("NP") {
-                return Some(np);
-            }
-        }
-        let tries = self.model.tries.as_ref()?;
-        if let Some(tp) = tries.suffix.lookup(word.chars().rev()).and_then(|d| d.peak()) {
-            return Some(tp.tag_id);
-        }
-        if let Some(tp) = tries.prefix.lookup(word.chars()).and_then(|d| d.peak()) {
-            return Some(tp.tag_id);
-        }
-        self.model.dtree.as_ref().and_then(|dt| {
-            dt.default()
-                .distribution
+        // Mixed-case "Capitalized" words (first letter upper, rest
+        // lower) get an NP boost — TreeTagger treats those as
+        // candidates for proper noun. ALL-CAPS words tend to be
+        // headings ("BOOK") tagged as NN/JJ rather than NP, so we
+        // exclude them from the boost.
+        let np_candidate = first_upper && rest_lower;
+
+        let trie_dist = self.model.tries.as_ref().and_then(|tries| {
+            tries
+                .suffix
+                .lookup(word.chars().rev())
+                .or_else(|| tries.prefix.lookup(word.chars()))
+        });
+
+        let mut cands: Vec<viterbi::Cand> = match trie_dist {
+            Some(d) => d
                 .probs
                 .iter()
-                .max_by(|a, b| a.prob.partial_cmp(&b.prob).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|tp| tp.tag_id as u8)
-        })
+                .map(|tp| viterbi::Cand {
+                    tag_id: tp.tag_id as u32,
+                    lex_prob: tp.prob as f64,
+                    lemma: None,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
+        // Capitalization heuristic: for "Mixed-case" words,
+        // boost NP to a meaningful share so context-aware Viterbi
+        // can still pick it. Without this, suffix-trie alone tags
+        // "Accolon" as VVN (the -lon ending) regardless of context.
+        if np_candidate {
+            if let Some(np) = self.tag_id_by_name("NP") {
+                let np_id = u32::from(np);
+                let np_boost = 0.7_f64;
+                let scale = (1.0 - np_boost).max(0.0);
+                for c in cands.iter_mut() {
+                    c.lex_prob *= scale;
+                }
+                if let Some(c) = cands.iter_mut().find(|c| c.tag_id == np_id) {
+                    c.lex_prob += np_boost;
+                } else {
+                    cands.push(viterbi::Cand {
+                        tag_id: np_id,
+                        lex_prob: np_boost,
+                        lemma: None,
+                    });
+                }
+            }
+        }
+
+        if cands.is_empty() {
+            // Last resort: dtree Default leaf or SENT as a sentinel.
+            let fallback = self
+                .model
+                .dtree
+                .as_ref()
+                .and_then(|dt| {
+                    dt.default()
+                        .distribution
+                        .probs
+                        .iter()
+                        .max_by(|a, b| {
+                            a.prob
+                                .partial_cmp(&b.prob)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|tp| tp.tag_id)
+                })
+                .unwrap_or(self.model.header.sent_tag_index as u32);
+            cands.push(viterbi::Cand {
+                tag_id: fallback,
+                lex_prob: 1.0,
+                lemma: None,
+            });
+        }
+        cands
     }
 
     fn tag_id_by_name(&self, name: &str) -> Option<u8> {
