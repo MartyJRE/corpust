@@ -11,11 +11,26 @@
 //! ```text
 //! kind                    | total bytes (N=num_tags)   | header layout
 //! ------------------------|----------------------------|-----------------------------
-//! Internal                | 12                         | [offset_i, tag_id, branch_info]
+//! Internal                | 12                         | [reserved=0, back_pos_i, test_tag_id]
 //! Leaf                    | 16 + N*12                  | [node_id, 1, N, weight]
 //! PrunedInternal          | 12 + N*12                  | [1, N, weight]
 //! Default (always last)   | 12 + N*12                  | [1, N, weight]
 //! ```
+//!
+//! **Internal predicate semantics** (reverse-engineered 2026-04-30):
+//! `back_pos_i` is the zero-indexed back-position to test (0 means
+//! tag_{-1}, 1 means tag_{-2}, etc.) and `test_tag_id` is the tag
+//! being checked. The predicate evaluates as
+//! `tag_at[-(back_pos_i + 1)] == test_tag_id`. On `english.par`
+//! 724/781 internals test tag_{-1} and 57/781 test tag_{-2},
+//! consistent with the model's cl=2 training. The `reserved` u32 is
+//! always 0 in every model examined.
+//!
+//! Earlier plan drafts (see `pure-rust-treetagger.md` Section 4 prior
+//! to 2026-04-30) had `back_pos_i` and `test_tag_id` swapped; the
+//! mistake came from a toy1 (cl=1) vs toy2 (cl=2) differential in
+//! which the change in `back_pos_i` (always 0 in toy1, 0 or 1 in
+//! toy2) was misread as a change in test tag.
 //!
 //! Distribution payload (Leaf / PrunedInternal / Default) is always
 //! `N × (u32 tag_id, f64 prob)` records with `tag_id == index` and
@@ -83,36 +98,33 @@ pub struct Distribution {
     pub probs: Vec<TagProb>,
 }
 
-/// 12-byte record between/around distribution records in the dtree
-/// section. Field names here reflect the plan's working hypothesis
-/// (`[offset_i, tag_id, branch_info]` = Schmid's `tag_{-i}=t` test),
-/// **but current `english.par` evidence contradicts that reading**:
+/// 12-byte record encoding a Schmid `tag_{-i}=t` test. Predicate
+/// evaluates as `tag_at[-(back_pos_i + 1)] == test_tag_id`.
 ///
-/// - `offset_i` is always `0` across all 781 records.
-/// - `tag_id` takes two values: `0` (724 records) and `1` (57 records).
-/// - `branch_info` ranges over all 58 tag IDs (min 0, max 57).
+/// Cross-file evidence supporting this interpretation:
 ///
-/// That's a very different structural signature from what toy-model
-/// archaeology saw (varying `offset_i` in `{1,2}`, etc.). The
-/// `english.par` internals look more like a *different* record kind
-/// that my walker is treating as the same — possibly a tree-edge
-/// index record or a leaf-pointer — whereas genuine Schmid-style
-/// `tag_{-i}=t` tests might live in a different section entirely.
-/// Keeping the old names here for continuity with the plan's doc;
-/// sub-task 2 will rename once we've confirmed the interpretation
-/// with toy-model differentials.
+/// | model       | cl | back_pos_i values            | observed test_tag_id range |
+/// |-------------|----|------------------------------|----------------------------|
+/// | toy1        | 1  | {0} × 1 internal             | {0}                        |
+/// | toy2        | 2  | {1} × 1 internal             | {0}                        |
+/// | toy3        | 2  | {0}×9, {1}×9                 | 0..4                       |
+/// | toy4        | 2  | {0}, {0}, {1}                | {0,1,2}                    |
+/// | toy6        | 3  | {2} × 1 internal             | {0}                        |
+/// | english.par | 2  | {0}×724, {1}×57              | 0..57                      |
+///
+/// `cl` is read from the dtree wrapper preamble (the second 12-byte
+/// record at section offset 12, u32[8] of that record).
 #[derive(Debug, Clone, Copy)]
 pub struct Internal {
-    /// `u32[0]` of the 12-byte record. Observed always `0` on
-    /// `english.par`; toy-model tests (prior archaeology) saw values
-    /// `1` and `2` — the discrepancy is the open question for
-    /// sub-task 2.
-    pub offset_i: u32,
-    /// `u32[4]` of the 12-byte record. Always `0` on `english.par`.
-    pub tag_id: u32,
-    /// `u32[8]` of the 12-byte record. On `english.par` this takes
-    /// values in `0..num_tags` — looks like an actual tag ID.
-    pub branch_info: u32,
+    /// `u32[0]` of the record. Always `0` in every model examined
+    /// (toys 1–6, english.par). Possibly reserved/padding.
+    pub reserved: u32,
+    /// `u32[4]` — zero-indexed back-position. `0` means tag_{-1},
+    /// `1` means tag_{-2}, etc. Bounded above by `cl - 1`.
+    pub back_pos_i: u32,
+    /// `u32[8]` — tag id being tested at position `-(back_pos_i + 1)`.
+    /// Always in `0..num_tags`.
+    pub test_tag_id: u32,
 }
 
 /// Decision-tree leaf — `P(tag | context)` at a terminal node.
@@ -241,9 +253,24 @@ impl DecisionTree {
     /// Reconstruct the binary-tree topology from the flat record list
     /// by parsing it as a preorder DFS (yes-child first). Returns a
     /// forest because `english.par` is known to contain two
-    /// back-to-back trees after stripping the wrapper [`Leaf`] and
+    /// back-to-back trees after stripping the wrapper records and
     /// trailing [`Default`]. Toy models produce a single-element
     /// forest.
+    ///
+    /// **Wrappers.** Two distinct preamble formats have been observed
+    /// at the start of the dtree section:
+    ///
+    /// - `english.par` style — a single 16+N*12 byte record that
+    ///   parses as a [`Leaf`] (with `node_id=21`, distribution
+    ///   matching nothing structurally meaningful yet). One record.
+    /// - Toy-model style — two consecutive 12-byte records. The
+    ///   first has bytes `[0, 0, 0x01010001]`; the second has
+    ///   `[0, 0, cl]` where `cl` is the model's context-length
+    ///   parameter. These get walker-classified as [`Internal`]
+    ///   because the byte shape matches, but their `branch_info`
+    ///   value (`0x01010001` = 16842753) is far above the tag-id
+    ///   ceiling that real Internals respect, so a `branch_info`
+    ///   threshold cleanly distinguishes them.
     ///
     /// `nodes[0]` is the root of the first tree. `roots` lists the
     /// index into `nodes` of each tree's root so callers can walk
@@ -256,26 +283,44 @@ impl DecisionTree {
     /// semantics are pinned down, `TreeNode::Internal` can grow a
     /// typed `predicate: Feature { back: u32, tag: u32 }` field
     /// without touching callers of the topology API.
-    pub fn reconstruct(&self) -> TreeForest {
-        // Strip the wrapper Leaf (when present — only english.par has
-        // it). The trailing Default stays — it's the rightmost leaf
-        // of the last tree under preorder DFS, not a standalone
-        // fallback. (Every binary tree with N leaves has N-1
-        // internals; stripping the Default would give the last tree
-        // N-1 leaves and N-1 internals, which doesn't balance.)
-        let has_wrapper = matches!(self.records.first(), Some(DTreeRecord::Leaf(_)));
-        let body_start = if has_wrapper { 1 } else { 0 };
-        let body = &self.records[body_start..];
+    pub fn reconstruct(&self) -> Result<TreeForest> {
+        let wrapper_records = self.detect_wrapper_records();
+        let body = &self.records[wrapper_records..];
 
         let mut nodes: Vec<TreeNode> = Vec::new();
         let mut roots: Vec<usize> = Vec::new();
         let mut cursor = 0usize;
         while cursor < body.len() {
-            let root = build_subtree(body, &mut cursor, &mut nodes);
+            let root = try_build_subtree(body, &mut cursor, &mut nodes).with_context(|| {
+                format!(
+                    "preorder-DFS reconstruction ran off the end of the body \
+                     at record {} (wrapper_records={wrapper_records}, body_len={})",
+                    cursor,
+                    body.len()
+                )
+            })?;
             roots.push(root);
         }
 
-        TreeForest { nodes, roots }
+        Ok(TreeForest {
+            nodes,
+            roots,
+            wrapper_records,
+        })
+    }
+
+    /// Detect leading wrapper / preamble records that aren't part of
+    /// any tree's topology.
+    fn detect_wrapper_records(&self) -> usize {
+        match self.records.first() {
+            // english.par-style Leaf wrapper.
+            Some(DTreeRecord::Leaf(_)) => 1,
+            // Toy-style 24-byte preamble — first record's u32[8] is
+            // a sentinel (0x01010001) that exceeds anything a real
+            // Internal's `test_tag_id` could carry.
+            Some(DTreeRecord::Internal(i)) if i.test_tag_id > 0xFFFF => 2,
+            _ => 0,
+        }
     }
 }
 
@@ -288,6 +333,11 @@ pub struct TreeForest {
     pub nodes: Vec<TreeNode>,
     /// Indices into `nodes` of each tree's root.
     pub roots: Vec<usize>,
+    /// How many leading records of the source `DecisionTree` were
+    /// stripped as wrapper / preamble. See
+    /// [`DecisionTree::reconstruct`] for the wrapper formats observed
+    /// so far.
+    pub wrapper_records: usize,
 }
 
 /// A node in a reconstructed decision tree.
@@ -313,18 +363,21 @@ pub enum TreeNode {
     },
 }
 
-fn build_subtree(
+fn try_build_subtree(
     body: &[DTreeRecord],
     cursor: &mut usize,
     nodes: &mut Vec<TreeNode>,
-) -> usize {
+) -> Option<usize> {
     let rec_idx = *cursor;
+    if rec_idx >= body.len() {
+        return None;
+    }
     *cursor += 1;
+    let my_idx = nodes.len();
     match &body[rec_idx] {
         DTreeRecord::Internal(internal) => {
             // Reserve this node's slot first so recursive calls can
             // push their own nodes without indexing conflict.
-            let my_idx = nodes.len();
             nodes.push(TreeNode::Leaf {
                 node_id: None,
                 distribution: Distribution {
@@ -332,40 +385,63 @@ fn build_subtree(
                     probs: Vec::new(),
                 },
             }); // placeholder, overwritten below
-            let yes = build_subtree(body, cursor, nodes);
-            let no = build_subtree(body, cursor, nodes);
+            let yes = try_build_subtree(body, cursor, nodes)?;
+            let no = try_build_subtree(body, cursor, nodes)?;
             nodes[my_idx] = TreeNode::Internal {
                 predicate: *internal,
                 yes,
                 no,
             };
-            my_idx
         }
         DTreeRecord::PrunedInternal(p) => {
-            let my_idx = nodes.len();
             nodes.push(TreeNode::Leaf {
                 node_id: None,
                 distribution: p.distribution.clone(),
             });
-            my_idx
         }
         DTreeRecord::Leaf(l) => {
-            let my_idx = nodes.len();
             nodes.push(TreeNode::Leaf {
                 node_id: Some(l.node_id),
                 distribution: l.distribution.clone(),
             });
-            my_idx
         }
         DTreeRecord::Default(d) => {
-            let my_idx = nodes.len();
             nodes.push(TreeNode::Leaf {
                 node_id: None,
                 distribution: d.distribution.clone(),
             });
-            my_idx
         }
     }
+    Some(my_idx)
+}
+
+/// Scan forward from `search_from` looking for the first byte offset
+/// at which the remaining bytes parse cleanly as a complete dtree
+/// section (terminating in a `Default` flush with EOF).
+///
+/// Used by exploration tooling on toy `.par` files where the dtree
+/// start offset isn't known a priori. Linear in file length × section
+/// length: fine for toys (~hundreds of bytes), don't call on
+/// `english.par` — use the known constant there.
+pub fn find_dtree_start(
+    bytes: &[u8],
+    header: &Header,
+    search_from: usize,
+) -> Option<usize> {
+    let n_us = header.tags.len();
+    let default_size = 12 + n_us * 12;
+    if bytes.len() < default_size || search_from > bytes.len() - default_size {
+        return None;
+    }
+    let max_start = bytes.len() - default_size;
+    for off in search_from..=max_start {
+        let mut cur = Cursor::new(bytes);
+        cur.advance(off).ok()?;
+        if read(&mut cur, header).is_ok() {
+            return Some(off);
+        }
+    }
+    None
 }
 
 /// Parse the decision-tree section from `cur` to EOF.
@@ -444,16 +520,20 @@ pub fn read(cur: &mut Cursor<'_>, header: &Header) -> Result<DecisionTree> {
             continue;
         }
 
-        // 4. Internal — 12 bytes, [offset_i ∈ {0,1,2,3}, tag_id < N, branch_info].
+        // 4. Internal — 12 bytes, [reserved == 0, back_pos_i in {0..3}, test_tag_id < N].
+        // `reserved` is always 0 in observed models; the {0..3} mask
+        // is kept defensively in case future models use higher cl.
+        // Test-tag bound `< N` is the strong test that excludes the
+        // toy preamble's sentinel u32[8] (= 0x01010001).
         if p + 12 <= len {
-            let offset_i = u32_at(data, p).unwrap();
-            let tag_id = u32_at(data, p + 4).unwrap();
-            if matches!(offset_i, 0 | 1 | 2 | 3) && tag_id < n {
-                let branch_info = u32_at(data, p + 8).unwrap();
+            let reserved = u32_at(data, p).unwrap();
+            let back_pos_i = u32_at(data, p + 4).unwrap();
+            if matches!(reserved, 0 | 1 | 2 | 3) && back_pos_i < n {
+                let test_tag_id = u32_at(data, p + 8).unwrap();
                 records.push(DTreeRecord::Internal(Internal {
-                    offset_i,
-                    tag_id,
-                    branch_info,
+                    reserved,
+                    back_pos_i,
+                    test_tag_id,
                 }));
                 p += 12;
                 continue;
@@ -670,9 +750,9 @@ mod tests {
 
         // Internal fields round-trip.
         let first_internal = tree.internals().next().unwrap();
-        assert_eq!(first_internal.offset_i, 2);
-        assert_eq!(first_internal.tag_id, 1);
-        assert_eq!(first_internal.branch_info, 42);
+        assert_eq!(first_internal.reserved, 2);
+        assert_eq!(first_internal.back_pos_i, 1);
+        assert_eq!(first_internal.test_tag_id, 42);
 
         // Leaf node_id round-trips.
         let first_leaf = tree.leaves().next().unwrap();
@@ -760,13 +840,13 @@ mod tests {
         bytes.extend_from_slice(&synth_default(n, 99)); // inner no-child (leaf, Default at EOF)
 
         let tree = read(&mut Cursor::new(&bytes), &stub_header(n)).unwrap();
-        let forest = tree.reconstruct();
+        let forest = tree.reconstruct().unwrap();
         assert_eq!(forest.roots.len(), 1);
 
         let root = &forest.nodes[forest.roots[0]];
         match root {
             TreeNode::Internal { predicate, yes, no } => {
-                assert_eq!((predicate.offset_i, predicate.tag_id, predicate.branch_info), (1, 0, 10));
+                assert_eq!((predicate.reserved, predicate.back_pos_i, predicate.test_tag_id), (1, 0, 10));
                 match &forest.nodes[*yes] {
                     TreeNode::Leaf { distribution, .. } => {
                         assert_eq!(distribution.weight, 5);
@@ -775,7 +855,7 @@ mod tests {
                 }
                 match &forest.nodes[*no] {
                     TreeNode::Internal { predicate: inner, yes: iy, no: in_, .. } => {
-                        assert_eq!((inner.offset_i, inner.tag_id, inner.branch_info), (2, 1, 20));
+                        assert_eq!((inner.reserved, inner.back_pos_i, inner.test_tag_id), (2, 1, 20));
                         match &forest.nodes[*iy] {
                             TreeNode::Leaf { distribution, .. } => {
                                 assert_eq!(distribution.weight, 6);
@@ -815,7 +895,7 @@ mod tests {
             end_offset: 0,
         };
         let tree = read(&mut cur, &header).unwrap();
-        let forest = tree.reconstruct();
+        let forest = tree.reconstruct().unwrap();
         assert_eq!(forest.roots.len(), 2, "english.par should be a 2-tree forest");
         let n0 = subtree_size(&forest.nodes, forest.roots[0]);
         let n1 = subtree_size(&forest.nodes, forest.roots[1]);

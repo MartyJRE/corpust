@@ -15,6 +15,7 @@
 //! par-explore u32s       <file> --from <off> --count <n>
 //! par-explore f32s       <file> --from <off> --count <n>
 //! par-explore dtree-walk <file> --from <off> [--count <n>]
+//! par-explore dtree-walk-auto <file> [--count <n>]
 //! ```
 //!
 //! Offsets and lengths are decimal by default, `0x...` parses as hex.
@@ -56,10 +57,11 @@ fn main() -> Result<()> {
         "u32s" => dump_u32s(&bytes, from, count),
         "f32s" => dump_f32s(&bytes, from, count),
         "dtree-walk" => dump_dtree_walk(&bytes, from, count),
+        "dtree-walk-auto" => dump_dtree_walk_auto(&bytes, from, count),
         "" => {
             eprintln!(
-                "usage: par-explore <header|hex|cstrs|u32s|f32s|dtree-walk> <file> \
-                 [--from N] [--len N] [--count N]"
+                "usage: par-explore <header|hex|cstrs|u32s|f32s|dtree-walk|dtree-walk-auto> \
+                 <file> [--from N] [--len N] [--count N]"
             );
             std::process::exit(2);
         }
@@ -180,11 +182,11 @@ fn dump_dtree_walk(bytes: &[u8], from: usize, count: usize) -> Result<()> {
             par::dtree::DTreeRecord::Internal(n) => {
                 println!(
                     "  [{i:>5}] @ sec+{section_off:>7} / 0x{file_off:08x}  Internal  \
-                     offset_i={:>2}  tag_id={:>3} ({})  branch_info={}",
-                    n.offset_i,
-                    n.tag_id,
-                    header.tag(n.tag_id).unwrap_or("?"),
-                    n.branch_info
+                     reserved={:>2}  back_pos_i={:>2}  test_tag={:>3} ({})",
+                    n.reserved,
+                    n.back_pos_i,
+                    n.test_tag_id,
+                    header.tag(n.test_tag_id).unwrap_or("?"),
                 );
                 section_off += 12;
             }
@@ -220,30 +222,152 @@ fn dump_dtree_walk(bytes: &[u8], from: usize, count: usize) -> Result<()> {
         "summary: {} internals, {} leaves, {} pruned-internals, {} defaults",
         c.internals, c.leaves, c.pruned_internals, c.defaults
     );
-    // Break down the 12-byte Internal records by their first two
-    // u32s — sub-task 2 needs to know how `offset_i` and `tag_id`
-    // co-vary (the plan's toy models saw `offset_i ∈ {1,2,3}` but
-    // `english.par` shows a different pattern), plus `branch_info`'s
-    // range, to pick which corpus to train a toy against.
+    // Distribution of `back_pos_i` values across Internals — useful
+    // to verify the model's `cl` (each internal carries one position
+    // index in 0..cl). And `test_tag_id` range as a sanity check.
     use std::collections::BTreeMap;
-    let mut by_header: BTreeMap<(u32, u32), usize> = BTreeMap::new();
-    let mut branch_min = u32::MAX;
-    let mut branch_max = u32::MIN;
+    let mut by_back_pos: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut tt_min = u32::MAX;
+    let mut tt_max = u32::MIN;
     for n in tree.internals() {
-        *by_header.entry((n.offset_i, n.tag_id)).or_insert(0) += 1;
-        branch_min = branch_min.min(n.branch_info);
-        branch_max = branch_max.max(n.branch_info);
+        *by_back_pos.entry(n.back_pos_i).or_insert(0) += 1;
+        tt_min = tt_min.min(n.test_tag_id);
+        tt_max = tt_max.max(n.test_tag_id);
     }
-    print!("internals by (offset_i, tag_id): ");
-    let parts: Vec<String> = by_header
+    print!("internals by back_pos_i: ");
+    let parts: Vec<String> = by_back_pos
         .iter()
-        .map(|((o, t), c)| format!("({o},{t})={c}"))
+        .map(|(p, c)| format!("i={p} → {c}"))
         .collect();
     println!("{}", parts.join(", "));
-    if !by_header.is_empty() {
-        println!("branch_info range: {branch_min}..={branch_max}");
+    if !by_back_pos.is_empty() {
+        println!("test_tag_id range: {tt_min}..={tt_max}");
     }
     Ok(())
+}
+
+/// Like `dtree-walk`, but locate the dtree section automatically by
+/// scanning forward from where the lexicon ends. Then dump every
+/// Internal record enriched with topology context — preorder index,
+/// depth, yes-subtree size, no-subtree size — so we can spot any
+/// correlation between `branch_info` and tree structure.
+fn dump_dtree_walk_auto(bytes: &[u8], from: usize, count: usize) -> Result<()> {
+    let mut cur = par::Cursor::new(bytes);
+    let header = par::header::read(&mut cur)?;
+
+    let dtree_start = if from > 0 {
+        from
+    } else {
+        // Scan forward from the post-lexicon position. For toys this
+        // works in milliseconds; for large files (english.par)
+        // callers should pass --from with the known offset.
+        let lexicon_end = match par::lexicon::read(&mut cur, &header) {
+            Ok(_) => cur.offset(),
+            Err(_) => cur.offset(),
+        };
+        par::dtree::find_dtree_start(bytes, &header, lexicon_end).with_context(|| {
+            format!(
+                "no offset in [{lexicon_end}, {}] parses as a dtree section",
+                bytes.len()
+            )
+        })?
+    };
+
+    println!(
+        "dtree at offset {dtree_start} (0x{dtree_start:x})"
+    );
+
+    let mut cur = par::Cursor::new(bytes);
+    cur.advance(dtree_start)?;
+    let tree = par::dtree::read(&mut cur, &header)?;
+    let forest = tree.reconstruct()?;
+    let counts = tree.kind_counts();
+    println!(
+        "{} records: {} internals, {} leaves, {} pruned-internals, {} defaults; \
+         forest has {} tree(s), {} reconstructed nodes",
+        tree.records.len(),
+        counts.internals,
+        counts.leaves,
+        counts.pruned_internals,
+        counts.defaults,
+        forest.roots.len(),
+        forest.nodes.len()
+    );
+
+    // Compute depth + subtree size per forest node.
+    let mut depth = vec![0usize; forest.nodes.len()];
+    let mut size = vec![1usize; forest.nodes.len()];
+    for &root in &forest.roots {
+        annotate(&forest.nodes, root, 0, &mut depth, &mut size);
+    }
+
+    // Walk forest.nodes in order — that's preorder DFS — and print
+    // every Internal record with its predicate + topology context.
+    // Predicate reads as `tag_at[-(i+1)] == test_tag`.
+    println!();
+    println!(
+        "{:>6}  {:>5}  {:>3}  {:>3}  {:>11}  {:>4}  {:>4}",
+        "fnidx", "depth", "i", "tt", "test_tag", "ysz", "nsz"
+    );
+    let mut shown = 0usize;
+    let mut by_back_pos: std::collections::BTreeMap<u32, usize> =
+        std::collections::BTreeMap::new();
+    for (fnidx, node) in forest.nodes.iter().enumerate() {
+        let par::dtree::TreeNode::Internal { predicate, yes, no } = node else {
+            continue;
+        };
+        *by_back_pos.entry(predicate.back_pos_i).or_insert(0) += 1;
+        if shown >= count {
+            shown += 1;
+            continue;
+        }
+        let tag_name = header.tag(predicate.test_tag_id).unwrap_or("?");
+        println!(
+            "{:>6}  {:>5}  {:>3}  {:>3}  {:>11}  {:>4}  {:>4}",
+            fnidx,
+            depth[fnidx],
+            predicate.back_pos_i,
+            predicate.test_tag_id,
+            tag_name,
+            size[*yes],
+            size[*no],
+        );
+        shown += 1;
+    }
+    if shown > count {
+        println!(
+            "  … {} more internals (pass --count {} to see all)",
+            shown - count,
+            counts.internals
+        );
+    }
+
+    println!();
+    let parts: Vec<String> = by_back_pos
+        .iter()
+        .map(|(i, c)| format!("i={i} → {c}"))
+        .collect();
+    println!("predicate distribution: {}", parts.join(", "));
+    Ok(())
+}
+
+fn annotate(
+    nodes: &[par::dtree::TreeNode],
+    idx: usize,
+    d: usize,
+    depth: &mut [usize],
+    size: &mut [usize],
+) -> usize {
+    depth[idx] = d;
+    let s = match &nodes[idx] {
+        par::dtree::TreeNode::Leaf { .. } => 1,
+        par::dtree::TreeNode::Internal { yes, no, .. } => {
+            1 + annotate(nodes, *yes, d + 1, depth, size)
+                + annotate(nodes, *no, d + 1, depth, size)
+        }
+    };
+    size[idx] = s;
+    s
 }
 
 fn dump_f32s(bytes: &[u8], from: usize, count: usize) -> Result<()> {
