@@ -649,8 +649,8 @@ fn try_build_subtree(
                     probs: Vec::new(),
                 },
             }); // placeholder, overwritten below
-            let yes = try_build_subtree(body, cursor, nodes)?;
             let no = try_build_subtree(body, cursor, nodes)?;
+            let yes = try_build_subtree(body, cursor, nodes)?;
             nodes[my_idx] = TreeNode::Internal {
                 predicate: *internal,
                 yes,
@@ -1090,18 +1090,19 @@ mod tests {
     }
 
     /// Preorder-DFS reconstruction on a tree with known shape:
-    /// Internal(Leaf, Internal(Leaf, Default)) — 2 internals, 3
-    /// leaves, with the trailing Default acting as the rightmost
-    /// leaf of the last tree.
+    /// Internal(Internal(Default, Leaf), Leaf) — 2 internals, 3
+    /// leaves, with the trailing Default acting as the leftmost
+    /// leaf of the last tree. The serialized child order is
+    /// no-child first, then yes-child.
     #[test]
     fn reconstructs_small_tree() {
         let n = 3u32;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&synth_internal(1, 0, 10)); // root
-        bytes.extend_from_slice(&synth_pruned(n, 5)); // root yes-child (leaf)
         bytes.extend_from_slice(&synth_internal(2, 1, 20)); // root no-child (internal)
-        bytes.extend_from_slice(&synth_pruned(n, 6)); // inner yes-child (leaf)
         bytes.extend_from_slice(&synth_default(n, 99)); // inner no-child (leaf, Default at EOF)
+        bytes.extend_from_slice(&synth_pruned(n, 6)); // inner yes-child (leaf)
+        bytes.extend_from_slice(&synth_pruned(n, 5)); // root yes-child (leaf)
 
         let tree = read(&mut Cursor::new(&bytes), &stub_header(n)).unwrap();
         let forest = tree.reconstruct().unwrap();
@@ -1118,7 +1119,12 @@ mod tests {
                     _ => panic!("root.yes should be a leaf"),
                 }
                 match &forest.nodes[*no] {
-                    TreeNode::Internal { predicate: inner, yes: iy, no: in_, .. } => {
+                    TreeNode::Internal {
+                        predicate: inner,
+                        yes: iy,
+                        no: in_,
+                        ..
+                    } => {
                         assert_eq!((inner.reserved, inner.back_pos_i, inner.test_tag_id), (2, 1, 20));
                         match &forest.nodes[*iy] {
                             TreeNode::Leaf { distribution, .. } => {
@@ -1128,7 +1134,10 @@ mod tests {
                         }
                         match &forest.nodes[*in_] {
                             TreeNode::Leaf { distribution, .. } => {
-                                assert_eq!(distribution.weight, 99, "should be the Default acting as rightmost leaf");
+                                assert_eq!(
+                                    distribution.weight, 99,
+                                    "should be the Default acting as leftmost leaf"
+                                );
                             }
                             _ => panic!("inner.no should be a leaf (the Default)"),
                         }
@@ -1155,10 +1164,10 @@ mod tests {
         let n = 3u32;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&synth_internal(0, 0, 1)); // root: tag_{-1} == 1?
-        bytes.extend_from_slice(&synth_pruned(n, 100));    // yes leaf
         bytes.extend_from_slice(&synth_internal(0, 1, 2)); // inner: tag_{-2} == 2?
-        bytes.extend_from_slice(&synth_pruned(n, 200));    // inner yes leaf
-        bytes.extend_from_slice(&synth_default(n, 300));   // inner no leaf
+        bytes.extend_from_slice(&synth_default(n, 300)); // inner no leaf
+        bytes.extend_from_slice(&synth_pruned(n, 200)); // inner yes leaf
+        bytes.extend_from_slice(&synth_pruned(n, 100)); // yes leaf
 
         let tree = read(&mut Cursor::new(&bytes), &stub_header(n)).unwrap();
         let traversal = tree.traversal().unwrap();
@@ -1201,6 +1210,42 @@ mod tests {
         // Wrapper stripped, Default kept as a leaf of the last tree.
         // Body = 1565 - 1 (wrapper) = 1564 records. n0 + n1 = 1564.
         assert_eq!(n0 + n1, 1564);
+    }
+
+    #[test]
+    fn english_bigram_tree_matches_binary_probe_distribution() {
+        let Some(par) = english_par_path() else {
+            return;
+        };
+        let bytes = std::fs::read(&par).unwrap();
+        let mut cur = Cursor::new(&bytes);
+        cur.advance(0xd231bb).unwrap();
+        let header = Header {
+            field_a: 0,
+            field_b: 0,
+            sent_tag_index: 31,
+            tags: (0..58).map(|i| format!("T{i}")).collect(),
+            end_offset: 0,
+        };
+        let tree = read(&mut cur, &header).unwrap();
+        let traversal = tree.traversal().unwrap();
+        let dist = traversal.predict(&[9, 19]); // DT, NN
+        let prob = |tag_id| {
+            dist.probs
+                .iter()
+                .find(|tp| tp.tag_id == tag_id)
+                .map(|tp| tp.prob)
+                .unwrap_or(0.0)
+        };
+
+        assert!(
+            (prob(48) - 0.044133).abs() < 0.000001,
+            "VVD probability drifted"
+        );
+        assert!(
+            (prob(50) - 0.011908).abs() < 0.000001,
+            "VVN probability drifted"
+        );
     }
 
     fn subtree_size(nodes: &[TreeNode], root: usize) -> usize {
