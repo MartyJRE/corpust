@@ -337,6 +337,13 @@ pub struct Traversal {
     /// because it folds in all training data, not just the one path
     /// reached by a specific context.
     pub marginal: Distribution,
+    /// Optional `(tag_{-1}, tag_{-2}) → distribution` override
+    /// table. When `Some`, `predict` consults this first and falls
+    /// back to tree traversal when the context isn't present. Used
+    /// by archaeology tests to feed in `tree-tagger -print-prob-tree`
+    /// output and measure the upper-bound accuracy without our
+    /// reverse-engineered tree.
+    pub override_table: Option<std::collections::HashMap<(u32, u32), Distribution>>,
 }
 
 impl Traversal {
@@ -344,7 +351,19 @@ impl Traversal {
     /// against the supplied context (oldest tag first; e.g.
     /// `[..., tag_{-2}, tag_{-1}]`). Returns the leaf distribution
     /// reached by the **inference root** (last tree of the forest).
+    /// If `override_table` is set and contains an entry for the
+    /// current context, that wins over tree traversal.
     pub fn predict<'a>(&'a self, context: &[u32]) -> &'a Distribution {
+        if let Some(table) = self.override_table.as_ref() {
+            if let (Some(&t1), Some(&t2)) = (
+                context.last(),
+                context.len().checked_sub(2).and_then(|i| context.get(i)),
+            ) {
+                if let Some(d) = table.get(&(t1, t2)) {
+                    return d;
+                }
+            }
+        }
         traverse_tree(&self.forest, self.root, context)
     }
 
@@ -533,6 +552,7 @@ impl DecisionTree {
             forest,
             root,
             marginal,
+            override_table: None,
         })
     }
 }

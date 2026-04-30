@@ -618,6 +618,128 @@ mod tests {
         );
     }
 
+    /// Run our Viterbi pipeline using `tree-tagger -print-prob-tree
+    /// english.par` output as the dtree's prediction lookup.
+    /// Bypasses our reverse-engineered tree entirely. Two outcomes:
+    ///
+    /// - **Accuracy jumps to ~oracle**: the formula is right, our
+    ///   tree parsing is wrong (or incomplete).
+    /// - **Accuracy stays similar**: the formula itself differs.
+    ///
+    /// Requires `/tmp/print-prob-tree.txt`:
+    /// `tree-tagger -print-prob-tree english.par > /tmp/print-prob-tree.txt`.
+    #[test]
+    #[ignore]
+    fn binary_prob_tree_upper_bound() {
+        use std::collections::HashMap;
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let path = "/tmp/print-prob-tree.txt";
+        if !Path::new(path).exists() {
+            eprintln!("missing {path}");
+            return;
+        }
+        let raw = std::fs::read_to_string(path).unwrap();
+
+        // Parse print-prob-tree.txt into a (tag_-1, tag_-2) → 58-tag
+        // distribution map. Lines look like:
+        //   "tag[-1] = NP"
+        //   "\ttag[-2] = NP"
+        //   "\t\t    # 0.000000"
+        //   "\t\t    $ 0.000295"
+        //   ...
+        let m = par::load(&par).unwrap();
+        let n_tags = m.header.tags.len();
+        let tag_to_id: HashMap<String, u32> = m
+            .header
+            .tags
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i as u32))
+            .collect();
+
+        let mut table: HashMap<(u32, u32), par::dtree::Distribution> = HashMap::new();
+        let mut cur_t1: Option<u32> = None;
+        let mut cur_t2: Option<u32> = None;
+        let mut cur_probs: Vec<f64> = vec![0.0; n_tags];
+        let mut cur_idx = 0usize;
+
+        let flush = |t1: Option<u32>,
+                     t2: Option<u32>,
+                     probs: &[f64],
+                     table: &mut HashMap<(u32, u32), par::dtree::Distribution>| {
+            if let (Some(t1), Some(t2)) = (t1, t2) {
+                let dist_probs = probs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| par::dtree::TagProb {
+                        tag_id: i as u32,
+                        prob: *p,
+                    })
+                    .collect();
+                table.insert(
+                    (t1, t2),
+                    par::dtree::Distribution {
+                        weight: 0,
+                        probs: dist_probs,
+                    },
+                );
+            }
+        };
+
+        for line in raw.lines() {
+            if let Some(rest) = line.strip_prefix("tag[-1] = ") {
+                flush(cur_t1, cur_t2, &cur_probs, &mut table);
+                cur_t1 = tag_to_id.get(rest).copied();
+                cur_t2 = None;
+                cur_idx = 0;
+            } else if let Some(rest) = line.strip_prefix("\ttag[-2] = ") {
+                flush(cur_t1, cur_t2, &cur_probs, &mut table);
+                cur_t2 = tag_to_id.get(rest).copied();
+                cur_probs = vec![0.0; n_tags];
+                cur_idx = 0;
+            } else if line.starts_with("\t\t") && cur_t1.is_some() && cur_t2.is_some() {
+                let trimmed = line.trim();
+                if let Some((_tag, prob_str)) = trimmed.rsplit_once(' ') {
+                    let p: f64 = prob_str.parse().unwrap_or(0.0);
+                    if cur_idx < n_tags {
+                        cur_probs[cur_idx] = p;
+                        cur_idx += 1;
+                    }
+                }
+            }
+        }
+        flush(cur_t1, cur_t2, &cur_probs, &mut table);
+
+        eprintln!("parsed {} (tag_-1, tag_-2) → distribution entries", table.len());
+
+        // Build a tagger with the override table installed.
+        let mut tagger = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        if let Some(t) = tagger.dtree.as_mut() {
+            t.override_table = Some(table);
+        } else {
+            eprintln!("model has no dtree traversal — skipping");
+            return;
+        }
+
+        // Run the diff against the oracle.
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap();
+        let text_path = repo.join("testdata/gutenberg/1251.txt");
+        if !text_path.exists() { return }
+        let sample: String = std::fs::read_to_string(&text_path).unwrap()
+            .chars().take(10_000).collect();
+        let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
+        let report = testkit::diff(&oracle, &tagger, &sample).unwrap();
+        eprintln!(
+            "binary-prob-tree experiment: {}/{} exact, {} POS-err, pos_acc={:.4}",
+            report.matches,
+            report.oracle_tokens,
+            report.pos_errors(),
+            report.pos_accuracy()
+        );
+    }
+
     /// Probe specific lexicon entries to debug Viterbi mistakes.
     #[test]
     #[ignore]
