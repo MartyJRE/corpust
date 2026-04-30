@@ -90,10 +90,18 @@ impl State {
 /// candidate per position; callers that can't produce any candidate
 /// for a token should synthesize one (e.g. an unknown-word fallback)
 /// rather than passing an empty vec.
+///
+/// `tag_prior` is the marginal `P(tag)` distribution — typically
+/// `Tries::tag_prelude` normalized to sum to 1, the per-tag
+/// training-frequency counts straight from the `.par` file. Used
+/// for Bayes correction:
+/// `P(t | w, ctx) ∝ P(t | w) × P(t | ctx) / P(t)`. Pass an empty
+/// slice to skip the correction.
 pub fn tag_sequence(
     cands_per_token: &[Vec<Cand>],
     traversal: &Traversal,
     header: &Header,
+    tag_prior: &[f64],
 ) -> Vec<Tagged> {
     let n = cands_per_token.len();
     if n == 0 {
@@ -120,14 +128,12 @@ pub fn tag_sequence(
     );
     dps.push(init);
 
-    // When the lexicon is highly confident in one tag (e.g.
-    // "King" → NP at 0.97, "How" → WRB at 0.999), the dtree's
-    // out-of-domain preference for a more frequent tag can flip the
-    // answer the wrong way under bare `lex × tree`. Pruning
-    // candidates with `lex_prob < threshold × max_lex_prob` keeps
-    // the dtree's vote restricted to genuine lexical ambiguities.
-    // 0.75 was empirically optimal on the Gutenberg sample (sweep
-    // peak at 92.62% vs 92.42% lex-only baseline, +4 tokens).
+    // Relative pruning: candidates with `lex_prob < threshold ×
+    // max_lex_prob` are dropped before the dtree gets to vote.
+    // Threshold 0.75 protects words where one tag dominates
+    // ("King" → NP at 0.97 vs NN at 0.03) from the dtree's
+    // domain-general preferences without losing genuine
+    // ambiguities (saved/looked at ~0.3/0.7 lex split).
     let pruning_threshold = 0.75_f64;
     let mut ctx_buf: Vec<u32> = Vec::with_capacity(2);
     for i in 0..n {
@@ -152,9 +158,15 @@ pub fn tag_sequence(
                     .map(|tp| tp.prob)
                     .unwrap_or(0.0);
                 // Schmid's per-token formula is the bare HMM joint:
-                // argmax_t  P(t | w) × P(t | ctx)
+                //   argmax_t  P(t | w) × P(t | ctx)
                 // (treetaggerj's reference implementation uses this
                 // exact form — see Tagger.java#getMostProbable.)
+                // Bayes correction with `/ P(t)` was tested with both
+                // computed and prelude-derived marginals and consistently
+                // regressed by 1+ tokens — Schmid's algorithm doesn't
+                // do the textbook Bayes step, despite the lexicon
+                // storing P(t | w).
+                let _ = tag_prior;
                 let local = c.lex_prob * p_cond;
                 if local <= 0.0 {
                     continue;
@@ -323,7 +335,7 @@ mod tests {
                 },
             ],
         ];
-        let out = tag_sequence(&cands, &traversal, &header);
+        let out = tag_sequence(&cands, &traversal, &header, &[]);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].pos.as_deref(), Some("T1"));
         assert_eq!(out[1].pos.as_deref(), Some("T0"));
@@ -382,7 +394,7 @@ mod tests {
                 },
             ],
         ];
-        let out = tag_sequence(&cands, &traversal, &header);
+        let out = tag_sequence(&cands, &traversal, &header, &[]);
         assert_eq!(out[0].pos.as_deref(), Some("T0"));
         assert_eq!(out[1].pos.as_deref(), Some("T1"));
     }

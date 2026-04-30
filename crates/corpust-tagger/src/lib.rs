@@ -267,13 +267,32 @@ impl Tagger {
     }
 }
 
+/// Normalize per-tag training counts (`Tries::tag_prelude`) to a
+/// proper probability distribution. Returns an empty Vec if the
+/// prelude is empty or sums to zero.
+fn normalize_prior(prelude: &[f64]) -> Vec<f64> {
+    let total: f64 = prelude.iter().sum();
+    if total <= 0.0 {
+        return Vec::new();
+    }
+    prelude.iter().map(|v| v / total).collect()
+}
+
 impl Annotator for Tagger {
     fn annotate<'a>(&self, text: &'a str) -> Result<Vec<AnnotatedToken<'a>>> {
         let tokens = self.tokenizer.tokenize(text);
         let cands: Vec<Vec<viterbi::Cand>> =
             tokens.iter().map(|t| self.candidates_for(t)).collect();
         let tagged: Vec<viterbi::Tagged> = match self.dtree.as_ref() {
-            Some(traversal) => viterbi::tag_sequence(&cands, traversal, &self.model.header),
+            Some(traversal) => {
+                let tag_prior = self
+                    .model
+                    .tries
+                    .as_ref()
+                    .map(|t| normalize_prior(&t.tag_prelude))
+                    .unwrap_or_default();
+                viterbi::tag_sequence(&cands, traversal, &self.model.header, &tag_prior)
+            }
             None => cands
                 .iter()
                 .map(|cs| {

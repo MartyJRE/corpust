@@ -193,6 +193,12 @@ pub struct Tries {
     pub prob_array_1: ProbTagArray,
     /// Raw prob-array-2 records. Segmented into `suffix.distributions`.
     pub prob_array_2: ProbTagArray,
+    /// Per-tag prelude — 58 `f64`s at the very start of the slab,
+    /// one per tag in `Header::tags`. Range observed on `english.par`
+    /// is roughly 7..21000, matching training-frequency counts. Used
+    /// by callers as the true marginal `P(tag)` — divide by the
+    /// total — for Bayes correction in inference.
+    pub tag_prelude: Vec<f64>,
 }
 
 /// Parse the tries slab + its two prob-arrays + the one that lives
@@ -202,7 +208,7 @@ pub struct Tries {
 /// absolute file offset where the decision tree begins — the second
 /// prob-array extends from just-after-the-suffix-trie to just-before
 /// the dtree.
-pub fn read(cur: &mut Cursor<'_>, _header: &Header, dtree_start: usize) -> Result<Tries> {
+pub fn read(cur: &mut Cursor<'_>, header: &Header, dtree_start: usize) -> Result<Tries> {
     let slab_start = cur.offset();
     if dtree_start <= slab_start {
         bail!(
@@ -222,6 +228,30 @@ pub fn read(cur: &mut Cursor<'_>, _header: &Header, dtree_start: usize) -> Resul
     // Locate prefix trie entry run.
     let prefix_start = find_entry_run(slab, 0)
         .context("could not locate prefix trie")?;
+
+    // Read the per-tag prelude — `num_tags` f64 values at the very
+    // start of the slab, one per tag id. The remaining bytes between
+    // the prelude and the prefix trie are alignment padding (2 bytes
+    // on `english.par`).
+    let n_tags = header.tags.len();
+    let prelude_bytes = n_tags * 8;
+    let mut tag_prelude = Vec::with_capacity(n_tags);
+    if prelude_bytes <= prefix_start {
+        for k in 0..n_tags {
+            let off = k * 8;
+            let v = f64::from_le_bytes([
+                slab[off],
+                slab[off + 1],
+                slab[off + 2],
+                slab[off + 3],
+                slab[off + 4],
+                slab[off + 5],
+                slab[off + 6],
+                slab[off + 7],
+            ]);
+            tag_prelude.push(v);
+        }
+    }
     let prefix_entries = walk_entries(slab, prefix_start);
     let prefix_end = prefix_start + prefix_entries.len() * 12;
 
@@ -260,6 +290,7 @@ pub fn read(cur: &mut Cursor<'_>, _header: &Header, dtree_start: usize) -> Resul
         suffix,
         prob_array_1,
         prob_array_2,
+        tag_prelude,
     })
 }
 
