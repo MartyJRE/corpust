@@ -111,21 +111,84 @@ impl Tagger {
     }
 
     /// Distribution of plausible tags for a word missing from the
-    /// lexicon. Pulls the suffix-trie distribution (or the prefix
-    /// trie if suffix has no match), then for "Capitalized"
-    /// (mixed-case, first-letter-upper) words ensures NP appears
-    /// with non-trivial weight — TreeTagger's default-to-proper-
-    /// noun convention for unknown capitalized tokens.
+    /// lexicon. Tries (in order):
+    ///
+    /// 1. **Numeric pattern** — any digit anywhere → CD.
+    /// 2. **Roman numeral pattern** — `^[IVXLCDM]+$` → NP.
+    /// 3. **All-caps lowercase fallback** — for an all-uppercase
+    ///    word with no original-case lex hit, look up the lowercase
+    ///    form ("BOOK" → "book") to handle headings.
+    /// 4. **Suffix trie distribution** + capitalized → NP boost.
+    /// 5. Last resort: peak of the dtree Default leaf.
     fn unknown_word_candidates(&self, word: &str) -> Vec<viterbi::Cand> {
         let chars: Vec<char> = word.chars().collect();
         let first_upper = chars.first().copied().map(|c| c.is_uppercase()).unwrap_or(false);
-        let rest_lower = chars.iter().skip(1).all(|c| !c.is_uppercase());
-        // Mixed-case "Capitalized" words (first letter upper, rest
-        // lower) get an NP boost — TreeTagger treats those as
-        // candidates for proper noun. ALL-CAPS words tend to be
-        // headings ("BOOK") tagged as NN/JJ rather than NP, so we
-        // exclude them from the boost.
-        let np_candidate = first_upper && rest_lower;
+        let all_upper = !chars.is_empty()
+            && chars.iter().all(|c| !c.is_alphabetic() || c.is_uppercase());
+        // Boost NP for any first-uppercase word that survives the
+        // numeric / Roman / lowercase-lexicon fallbacks. Mixed-case
+        // ("Pendragon") and all-caps ("WILLIAM") tokens both
+        // qualify here since their lowercase forms didn't match
+        // the lexicon.
+        let np_candidate = first_upper;
+
+        // 1. Digits anywhere → cardinal number.
+        if chars.iter().any(|c| c.is_ascii_digit()) {
+            if let Some(cd) = self.tag_id_by_name("CD") {
+                return vec![viterbi::Cand {
+                    tag_id: u32::from(cd),
+                    lex_prob: 1.0,
+                    lemma: None,
+                }];
+            }
+        }
+
+        // 2. Roman numerals → NP. Only triggers when every
+        // character is in the Roman set; the lexicon catches "I"
+        // (the pronoun) before we get here, so single-letter false
+        // positives like "V" alone are vanishingly rare.
+        if all_upper
+            && chars.iter().all(|c| matches!(*c, 'I' | 'V' | 'X' | 'L' | 'C' | 'D' | 'M'))
+        {
+            if let Some(np) = self.tag_id_by_name("NP") {
+                return vec![viterbi::Cand {
+                    tag_id: u32::from(np),
+                    lex_prob: 1.0,
+                    lemma: None,
+                }];
+            }
+        }
+
+        // 3. Capitalized lowercase fallback. For all-caps headings
+        // ("BOOK" → "book") AND mixed-case sentence-internal
+        // capitalizations ("Hundred" → "hundred", "Beast" →
+        // "beast"), try the lexicon with the lowercased form. Words
+        // we'd otherwise tag NP via the heuristic become plain
+        // NN/CD/JJ when their lowercase is a known common-class
+        // word. Skip the fallback when no letter is uppercase since
+        // that means the original lookup already exhausted lexicon.
+        if first_upper {
+            let lc: String = word.chars().flat_map(|c| c.to_lowercase()).collect();
+            if lc != word {
+                if let Some(entry) = self.model.lexicon.lookup(&lc) {
+                    if !entry.candidates.is_empty() {
+                        return entry
+                            .candidates
+                            .iter()
+                            .map(|c| viterbi::Cand {
+                                tag_id: c.tag_id,
+                                lex_prob: c.prob as f64,
+                                lemma: self
+                                    .model
+                                    .lexicon
+                                    .lemma(c.lemma_index)
+                                    .map(str::to_owned),
+                            })
+                            .collect();
+                    }
+                }
+            }
+        }
 
         let trie_dist = self.model.tries.as_ref().and_then(|tries| {
             tries
@@ -543,7 +606,10 @@ mod tests {
         let Some(bundle) = bundle_path() else { return };
         let par = bundle.join("lib/english.par");
         let model = par::load(&par).unwrap();
-        for word in ["King", "king", "How", "how", "I", "Table", "table"] {
+        for word in [
+            "King", "king", "How", "how", "I", "Table", "table",
+            "saved", "made", "slew", "have", "that",
+        ] {
             match model.lexicon.lookup(word) {
                 Some(entry) => {
                     eprintln!("=== {word:<10} ({} candidates) ===", entry.candidates.len());
