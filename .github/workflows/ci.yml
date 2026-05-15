@@ -66,7 +66,15 @@ jobs:
           cache-dependency-path: app/package-lock.json
       - run: npm ci
       - run: npm run build
-      - run: npm run test:run
+      - run: npm run coverage
+      - name: upload UI coverage to codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: app/coverage/lcov.info
+          flags: js
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   coverage:
     name: coverage
@@ -85,10 +93,11 @@ jobs:
           cargo llvm-cov --workspace --exclude corpust-ui \
             --ignore-filename-regex 'par_explore\.rs' \
             --lcov --output-path lcov.info
-      - name: upload to codecov
+      - name: upload Rust coverage to codecov
         uses: codecov/codecov-action@v5
         with:
           files: lcov.info
+          flags: rust
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

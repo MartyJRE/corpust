@@ -12,4 +12,5 @@ CLAUDE.local.md
 # Frontend tooling output (app-scoped .gitignore covers the rest)
 node_modules
 /app/dist
+/app/coverage
 /app/src-tauri/gen

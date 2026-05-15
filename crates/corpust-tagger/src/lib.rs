@@ -1983,6 +1983,53 @@ mod tests {
     }
 
     #[test]
+    fn model_accessor_returns_loaded_model() {
+        let Some(tagger) = english_tagger() else {
+            return;
+        };
+        // tag count should round-trip via the public accessor.
+        assert!(tagger.model().header.tags.len() > 30);
+    }
+
+    #[test]
+    fn candidates_for_routes_unknown_words_through_fallback() {
+        let Some(tagger) = english_tagger() else {
+            return;
+        };
+        // Pick a word the lexicon definitely misses so candidates_for
+        // takes the `unknown_word_candidates` arm.
+        let mut probe = None;
+        for w in ["zorglax", "plumblort", "xqztron", "vrelltik"] {
+            if tagger
+                .model
+                .lexicon
+                .lookup(w)
+                .is_none_or(|e| e.candidates.is_empty())
+            {
+                probe = Some(w);
+                break;
+            }
+        }
+        let probe = probe.expect("at least one invented word should miss the lexicon");
+        let cands = tagger.candidates_for(probe);
+        assert!(!cands.is_empty(), "candidates_for must always return ≥1");
+    }
+
+    #[test]
+    fn unknown_word_falls_back_to_dtree_default_for_empty_input() {
+        let Some(tagger) = english_tagger() else {
+            return;
+        };
+        // Empty word: no first_upper, no digits, no Roman match, no
+        // lowercase-lex hit, and the suffix-trie lookup over an empty
+        // iterator returns nothing → falls through to the dtree
+        // default-leaf branch (line ~314 in lib.rs).
+        let cands = tagger.unknown_word_candidates("");
+        assert_eq!(cands.len(), 1);
+        assert!((cands[0].lex_prob - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn normalize_prior_handles_empty_and_zero_sum() {
         assert!(normalize_prior(&[]).is_empty());
         assert!(normalize_prior(&[0.0, 0.0, 0.0]).is_empty());
