@@ -17,14 +17,16 @@
 //! Default (always last)   | 12 + N*12                  | [1, N, weight]
 //! ```
 //!
-//! **Internal predicate semantics** (reverse-engineered 2026-04-30):
-//! `back_pos_i` is the zero-indexed back-position to test (0 means
-//! tag_{-1}, 1 means tag_{-2}, etc.) and `test_tag_id` is the tag
-//! being checked. The predicate evaluates as
-//! `tag_at[-(back_pos_i + 1)] == test_tag_id`. On `english.par`
-//! 724/781 internals test tag_{-1} and 57/781 test tag_{-2},
-//! consistent with the model's cl=2 training. The `reserved` u32 is
-//! always 0 in every model examined.
+//! **Internal predicate semantics** (reverse-engineered 2026-04-30,
+//! direction corrected 2026-05-15 — see #13): `back_pos_i` is a
+//! direct **index into the oldest-first context array**, not a
+//! back-offset from the newest tag. The predicate evaluates as
+//! `context[back_pos_i] == test_tag_id` where the context for cl=2
+//! is `[t_-2, t_-1]`. So `back_pos_i = 0 → t_-2`, `back_pos_i = 1
+//! → t_-1`. On `english.par` 724/781 internals split on t_-2 and
+//! 57/781 on t_-1 — most splits are on the older context tag because
+//! Tree[1] (the unigram switch) already handles t_-1 splits. The
+//! `reserved` u32 is always 0 in every model examined.
 //!
 //! Earlier plan drafts (see `pure-rust-treetagger.md` Section 4 prior
 //! to 2026-04-30) had `back_pos_i` and `test_tag_id` swapped; the
@@ -99,7 +101,10 @@ pub struct Distribution {
 }
 
 /// 12-byte record encoding a Schmid `tag_{-i}=t` test. Predicate
-/// evaluates as `tag_at[-(back_pos_i + 1)] == test_tag_id`.
+/// evaluates as `context[back_pos_i] == test_tag_id` where `context`
+/// is oldest-first (so for cl=2, `back_pos_i=0 → t_-2`,
+/// `back_pos_i=1 → t_-1`). See module docstring + #13 for the
+/// differential-test that pinned this down.
 ///
 /// Cross-file evidence supporting this interpretation:
 ///
@@ -119,10 +124,11 @@ pub struct Internal {
     /// `u32[0]` of the record. Always `0` in every model examined
     /// (toys 1–6, english.par). Possibly reserved/padding.
     pub reserved: u32,
-    /// `u32[4]` — zero-indexed back-position. `0` means tag_{-1},
-    /// `1` means tag_{-2}, etc. Bounded above by `cl - 1`.
+    /// `u32[4]` — zero-indexed index into the oldest-first context
+    /// array. For cl=2, `0` means t_-2 and `1` means t_-1. Bounded
+    /// above by `cl - 1`.
     pub back_pos_i: u32,
-    /// `u32[8]` — tag id being tested at position `-(back_pos_i + 1)`.
+    /// `u32[8]` — tag id being tested at `context[back_pos_i]`.
     /// Always in `0..num_tags`.
     pub test_tag_id: u32,
 }
@@ -341,7 +347,7 @@ pub struct Traversal {
 }
 
 impl Traversal {
-    /// `tag_at[-(back_pos_i + 1)] == test_tag_id` predicate evaluated
+    /// `context[back_pos_i] == test_tag_id` predicate evaluated
     /// against the supplied context (oldest tag first; e.g.
     /// `[..., tag_{-2}, tag_{-1}]`). Returns the leaf distribution
     /// reached by the **inference root** (last tree of the forest).
@@ -507,10 +513,10 @@ impl Traversal {
             return acc;
         }
         let bigram = traverse_tree(&self.forest, self.root, context);
-        // Pass the full context to tree[0] too — tree[0] only tests
-        // tag_{-1} (back_pos_i=0) on `english.par` so deeper context
-        // is silently ignored, but for forests with deeper unigram
-        // backoff structure this stays correct.
+        // Pass the full context to tree[0] too — on english.par
+        // tree[0] is a single-leaf global prior so context is
+        // ignored, but for forests where roots[0] is a real
+        // tree this remains correct.
         let unigram_root = self.forest.roots[0];
         let unigram = traverse_tree(&self.forest, unigram_root, context);
         let i = i_weight_fn(bigram, context).clamp(0.0, 1.0);
