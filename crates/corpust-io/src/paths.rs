@@ -16,13 +16,29 @@
 //! `corpust/` join rather than [`ProjectDirs`] so the path stays
 //! `corpust` on every platform — `ProjectDirs` would otherwise fold in
 //! a qualifier/organization prefix.
+//!
+//! ## Override
+//!
+//! Set the `CORPUST_DATA_ROOT` environment variable to point the whole
+//! tree somewhere else — typically an external drive. The value is
+//! taken verbatim (no `corpust/` suffix appended), so a path like
+//! `/Volumes/Big/corpust-data` will hold `corpora/<slug>/...` directly
+//! under it.
 
 use anyhow::{Result, anyhow};
 use directories::BaseDirs;
 use std::path::PathBuf;
 
 /// Root of all corpust-owned user data for the current OS account.
+///
+/// Honors `$CORPUST_DATA_ROOT` if set; otherwise falls back to the
+/// platform-specific data directory.
 pub fn data_root() -> Result<PathBuf> {
+    if let Ok(override_path) = std::env::var("CORPUST_DATA_ROOT") {
+        if !override_path.is_empty() {
+            return Ok(PathBuf::from(override_path));
+        }
+    }
     let base = BaseDirs::new().ok_or_else(|| anyhow!("no home directory available"))?;
     Ok(base.data_dir().join("corpust"))
 }
@@ -128,7 +144,36 @@ mod tests {
     fn data_root_is_a_path() {
         // Can't assert a specific value across platforms, but it
         // should at least resolve without error on any CI host.
+        // Skip when the test env happens to have the override set;
+        // in that case it just resolves to the override verbatim.
+        if std::env::var("CORPUST_DATA_ROOT").is_ok() {
+            return;
+        }
         let root = data_root().unwrap();
         assert!(root.ends_with("corpust"));
+    }
+
+    #[test]
+    fn data_root_honors_env_override() {
+        // SAFETY: tests in this module are #[test]-serialized only
+        // when cargo's --test-threads=1 is set, but the env var is
+        // read+restored within this single test so it's robust either
+        // way as long as no other test reads the same var concurrently.
+        let prev = std::env::var("CORPUST_DATA_ROOT").ok();
+        // SAFETY: setting/removing env vars is unsafe in Rust 2024
+        // because other threads might read concurrently. This test
+        // crate only reads CORPUST_DATA_ROOT here, so the race window
+        // is bounded.
+        unsafe {
+            std::env::set_var("CORPUST_DATA_ROOT", "/tmp/corpust-test-override");
+        }
+        let root = data_root().unwrap();
+        assert_eq!(root, PathBuf::from("/tmp/corpust-test-override"));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CORPUST_DATA_ROOT", v),
+                None => std::env::remove_var("CORPUST_DATA_ROOT"),
+            }
+        }
     }
 }
