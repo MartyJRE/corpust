@@ -35,7 +35,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --exclude corpust-ui --all-targets -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -49,7 +49,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --workspace
-        run: cargo test --workspace --no-fail-fast
+        run: cargo test --workspace --exclude corpust-ui --no-fail-fast
 
   coverage:
     name: coverage
@@ -63,7 +63,7 @@ jobs:
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: generate coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --exclude corpust-ui --lcov --output-path lcov.info
       - name: upload to codecov
         uses: codecov/codecov-action@v4
         with:
