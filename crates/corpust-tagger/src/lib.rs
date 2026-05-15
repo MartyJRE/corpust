@@ -89,6 +89,16 @@ impl Tagger {
         &self.model
     }
 
+    /// Override the bigram-vs-prior mix weight used by the dtree
+    /// ensemble in [`par::dtree::Traversal::predict_combined`]. Useful
+    /// for sweeping λ during accuracy tuning. No-op when the model
+    /// has no dtree.
+    pub fn set_lambda_bigram(&mut self, lambda: f64) {
+        if let Some(tr) = self.dtree.as_mut() {
+            tr.lambda_bigram = lambda;
+        }
+    }
+
     /// Build the candidate list for one token: lexicon entries when
     /// known, otherwise the unknown-word distribution from the
     /// suffix trie (with prefix trie / dtree default as fallbacks
@@ -616,6 +626,41 @@ mod tests {
             report.lemma_errors(),
             report.pos_accuracy()
         );
+    }
+
+    /// Sweep the dtree bigram-vs-prior mix weight `λ` on the gutenberg
+    /// sample and print pos_acc for each value. Ignored by default;
+    /// run with `cargo test -p corpust-tagger --lib
+    /// sweep_lambda_bigram_on_gutenberg_sample --
+    /// --nocapture --ignored`.
+    #[test]
+    #[ignore]
+    fn sweep_lambda_bigram_on_gutenberg_sample() {
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let text_path = repo.join("testdata/gutenberg/1251.txt");
+        if !text_path.exists() {
+            return;
+        }
+        let full = std::fs::read_to_string(&text_path).unwrap();
+        let sample: String = full.chars().take(50_000).collect();
+        let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
+        let mut subject = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        let lambdas = [0.00, 0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 0.80, 1.00];
+        for &lambda in &lambdas {
+            subject.set_lambda_bigram(lambda);
+            let report = testkit::diff(&oracle, &subject, &sample).unwrap();
+            eprintln!(
+                "λ_bigram={lambda:.2}  pos_acc={:.4}  POS-err={}",
+                report.pos_accuracy(),
+                report.pos_errors()
+            );
+        }
     }
 
     /// Run our Viterbi pipeline using `tree-tagger -print-prob-tree

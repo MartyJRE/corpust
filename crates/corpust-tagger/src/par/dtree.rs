@@ -329,6 +329,15 @@ pub struct Traversal {
     /// output and measure the upper-bound accuracy without our
     /// reverse-engineered tree.
     pub override_table: Option<std::collections::HashMap<(u32, u32), Distribution>>,
+    /// Mix weight on the bigram tree in `predict_combined`'s ensemble:
+    /// `P_final = λ · tree[2] + (1 - λ) · weighted_avg(tree[0], tree[1])`.
+    /// Default is `0.10` — picked from a sweep over a 50 KB gutenberg
+    /// sample (`sweep_lambda_bigram_on_gutenberg_sample`). The U-shape
+    /// of the curve put the original `0.50` exactly at the worst point
+    /// (destructive mixing with the Bayes prior subtraction downstream
+    /// in Viterbi); shifting weight back onto the prior recovers
+    /// ~0.26 pp of POS accuracy on the larger sample.
+    pub lambda_bigram: f64,
 }
 
 impl Traversal {
@@ -424,7 +433,7 @@ impl Traversal {
                 p0
             };
 
-            acc[k] = 0.5 * p2 + 0.5 * p_prior;
+            acc[k] = self.lambda_bigram * p2 + (1.0 - self.lambda_bigram) * p_prior;
         }
         acc
     }
@@ -586,6 +595,7 @@ impl DecisionTree {
             root,
             marginal,
             override_table: None,
+            lambda_bigram: 0.10,
         })
     }
 }

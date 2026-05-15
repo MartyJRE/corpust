@@ -298,7 +298,7 @@ mod tests {
             context_size: 2,
         };
         let marginal = synth_dist(&[1.0; 3]);
-        let traversal = Traversal { forest, root: 0, marginal, override_table: None };
+        let traversal = Traversal { forest, root: 0, marginal, override_table: None, lambda_bigram: 0.10 };
         let header = stub_header(n);
 
         // Token A: only candidate is tag 1 (forces context = [_, 1]).
@@ -361,7 +361,7 @@ mod tests {
             context_size: 2,
         };
         let marginal = synth_dist(&[1.0; 3]);
-        let traversal = Traversal { forest, root: 0, marginal, override_table: None };
+        let traversal = Traversal { forest, root: 0, marginal, override_table: None, lambda_bigram: 0.10 };
         let header = stub_header(n);
 
         let cands = vec![
