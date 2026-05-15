@@ -276,8 +276,15 @@ pub fn read(cur: &mut Cursor<'_>, header: &Header, dtree_start: usize) -> Result
     let prob_array_1 = parse_prob_tag_array(&slab[pa1_start..suffix_start]);
     let prob_array_2 = parse_prob_tag_array(&slab[pa2_start..pa2_end]);
 
-    let prefix_dists = segment_distributions(&prob_array_1);
-    let suffix_dists = segment_distributions(&prob_array_2);
+    // Segment by leaf `count`: each trie leaf in pre-order DFS claims
+    // exactly `count` records from the prob-array. This matches how
+    // tree-tagger's runtime reads the file (verified via lldb on
+    // suffix_lookup, see #14) and unlike the previous prob-curve-
+    // based heuristic produces partial distributions that don't
+    // always sum to 1.0 — which is exactly what Schmid's smoothing
+    // expects from per-node distributions.
+    let prefix_dists = segment_by_leaf_counts(&prob_array_1, &prefix_entries);
+    let suffix_dists = segment_by_leaf_counts(&prob_array_2, &suffix_entries);
 
     let prefix = build_trie(prefix_entries, prefix_dists)?;
     let suffix = build_trie(suffix_entries, suffix_dists)?;
@@ -356,13 +363,10 @@ fn parse_prob_tag_array(bytes: &[u8]) -> ProbTagArray {
     ProbTagArray { records }
 }
 
-/// Segment a prob-tag array into per-leaf distributions.
-///
-/// Boundary rule: a new distribution starts when the current
-/// record's `prob` is greater than the previous one (records are
-/// sorted descending within a distribution) OR the running sum
-/// would exceed 1.0. Empirically partitions every known array
-/// cleanly into `sum ≈ 1.0` segments.
+/// Legacy prob-curve-based segmentation, kept around as a reference
+/// for the previous algorithm. The current segmentation goes via
+/// per-leaf `count` (see `segment_by_leaf_counts`).
+#[allow(dead_code)]
 fn segment_distributions(array: &ProbTagArray) -> Vec<Distribution> {
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -385,6 +389,46 @@ fn segment_distributions(array: &ProbTagArray) -> Vec<Distribution> {
     }
     if start < array.records.len() {
         out.push(segment_to_dist(&array.records[start..]));
+    }
+    out
+}
+
+/// Segment a prob-tag array using each trie leaf's `count` field as
+/// the number of records to consume. Walks `entries` in pre-order DFS
+/// (same order the file stores them) and pairs the i-th leaf with the
+/// next `count` records from `array`.
+///
+/// Distributions produced this way are *partial* — they don't have
+/// to sum to 1.0. Schmid's runtime computes the full P(t|w) by
+/// interpolating partial distributions along the trie path.
+fn segment_by_leaf_counts(array: &ProbTagArray, entries: &[TrieEntry]) -> Vec<Distribution> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    let mut stack = vec![0usize];
+    while let Some(idx) = stack.pop() {
+        if idx >= entries.len() {
+            continue;
+        }
+        let e = &entries[idx];
+        if e.is_leaf() {
+            let take = (e.count as usize).min(array.records.len() - cursor);
+            let slice = &array.records[cursor..cursor + take];
+            out.push(segment_to_dist(slice));
+            cursor += take;
+            continue;
+        }
+        let start = e.offset as usize;
+        let end = start + e.count as usize;
+        if end > entries.len() {
+            continue;
+        }
+        // Push in reverse so we pop in natural pre-order.
+        for c in (start..end).rev() {
+            stack.push(c);
+        }
     }
     out
 }
@@ -521,10 +565,18 @@ mod tests {
             suffix_leaves
         );
 
-        // Every distribution sums to ~1.
+        // Distributions are *partial* — they don't have to sum to
+        // 1.0. The runtime smooths multiple partial distributions
+        // along the trie path. We just sanity-check that probs are
+        // all in [0, 1].
         for (i, d) in tries.suffix.distributions.iter().enumerate().take(100) {
-            let s: f32 = d.probs.iter().map(|tp| tp.prob).sum();
-            assert!((s - 1.0).abs() < 0.01, "suffix dist {i} sum={s}");
+            for tp in &d.probs {
+                assert!(
+                    (0.0..=1.0 + 1e-5).contains(&tp.prob),
+                    "suffix dist {i} has out-of-range prob: {}",
+                    tp.prob
+                );
+            }
         }
 
         // Structural sanity: walk suffix trie from 's' → 'e' → 's'
