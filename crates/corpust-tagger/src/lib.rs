@@ -62,6 +62,16 @@ pub struct Tagger {
     /// token are dropped before the dtree weighs in. `0.0` disables
     /// pruning entirely; higher values trust the lexicon more.
     pruning_threshold: f64,
+    /// Capitalized-word NP boost: when an unknown word starts
+    /// with an uppercase letter and isn't recognized via the
+    /// lowercase-fallback path, NP is forced into the candidate
+    /// list with `lex_prob = np_boost`, and all other candidates
+    /// have their `lex_prob` scaled by `(1 - np_boost)`. Default
+    /// 0.95 — picked from a sweep over the Gutenberg samples; the
+    /// suffix-trie's aggregate for capitalized words tends to give
+    /// noise candidates that Viterbi's Bayes correction can pick
+    /// over NP, so we keep most of the mass on NP.
+    np_boost: f64,
     /// Override for the per-tag marginal `P(t)` used in Viterbi's
     /// Bayes-correction step. `None` falls back to
     /// `normalize_prior(tries.tag_prelude)`. Mostly for diagnostic
@@ -91,6 +101,7 @@ impl Tagger {
             language,
             id: format!("treetagger-rs-{language}"),
             pruning_threshold: 0.001,
+            np_boost: 0.95,
             tag_prior_override: None,
         })
     }
@@ -115,6 +126,11 @@ impl Tagger {
     /// pruning entirely, `1.0` keeps only the top-lex candidate(s).
     pub fn set_pruning_threshold(&mut self, threshold: f64) {
         self.pruning_threshold = threshold;
+    }
+
+    /// Override the capitalized-word NP boost. See the field docs.
+    pub fn set_np_boost(&mut self, boost: f64) {
+        self.np_boost = boost;
     }
 
     /// Build the candidate list for one token: lexicon entries when
@@ -245,7 +261,7 @@ impl Tagger {
         if np_candidate {
             if let Some(np) = self.tag_id_by_name("NP") {
                 let np_id = u32::from(np);
-                let np_boost = 0.7_f64;
+                let np_boost = self.np_boost;
                 let scale = (1.0 - np_boost).max(0.0);
                 for c in cands.iter_mut() {
                     c.lex_prob *= scale;
@@ -1038,6 +1054,57 @@ mod tests {
         eprintln!("dtree marginal:        POS-err={} pos_acc={:.4}", r.pos_errors(), r.pos_accuracy());
     }
 
+    /// Verify that summing trie leaf `count` fields equals the
+    /// total prob-array record count. If so, the per-entry `count`
+    /// is the authoritative distribution length and our prob-curve
+    /// segmentation was wrong.
+    #[test]
+    #[ignore]
+    fn verify_leaf_count_segmentation_hypothesis() {
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let tagger = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        let tries = tagger.model().tries.as_ref().unwrap();
+        for (label, trie, pa) in [
+            ("suffix", &tries.suffix, &tries.prob_array_2),
+            ("prefix", &tries.prefix, &tries.prob_array_1),
+        ] {
+            let leaf_count_sum: u32 = trie
+                .entries
+                .iter()
+                .filter(|e| e.is_leaf())
+                .map(|e| e.count as u32)
+                .sum();
+            let leaves: usize = trie.entries.iter().filter(|e| e.is_leaf()).count();
+            eprintln!(
+                "{label}: {} leaves, sum-of-counts={}, prob_array records={}",
+                leaves, leaf_count_sum, pa.records.len(),
+            );
+        }
+    }
+
+    /// Dump literal 8 bytes per record around hart's distribution
+    /// (record 4502). Note: prob-array-2 starts at slab-offset
+    /// 0x01d255 already past the 0x15 prelude byte.
+    #[test]
+    #[ignore]
+    fn dump_hart_bytes_corrected() {
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let bytes = std::fs::read(&par).unwrap();
+        // Slab starts at 0xcf9cc3, prob_array_2 at slab+0x01d255 → 0xd16f18
+        let pa_start = 0xcf9cc3 + 0x01d255;
+        let target_rec = 4502usize;
+        for i in 0..7 {
+            let rec_off = pa_start + (target_rec - 2 + i) * 8;
+            let b: [u8; 8] = bytes[rec_off..rec_off + 8].try_into().unwrap();
+            eprintln!(
+                "  rec[{}] at file_off=0x{:x}: bytes = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                target_rec - 2 + i, rec_off, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            );
+        }
+    }
+
     /// Probe what our suffix trie returns for the unknown words that
     /// account for most of the residual errors. Useful for comparing
     /// against `tree-tagger -prob` to see if the trie itself, the
@@ -1049,7 +1116,7 @@ mod tests {
         let Some(bundle) = bundle_path() else { return };
         let par = bundle.join("lib/english.par");
         let tagger = Tagger::load(&par, "english", english_abbreviations()).unwrap();
-        let words = ["hart", "Hart", "damosels", "truage", "May-day", "BIBLIOGRAPHICAL"];
+        let words = ["Balan", "Uriens", "Guenever", "Accolon", "May-day"];
         for w in words {
             eprintln!("\n=== {w:?} ===");
             let cands = tagger.candidates_for(w);
@@ -1078,6 +1145,32 @@ mod tests {
                     None => "(no match — fell through)".to_string(),
                 });
             }
+        }
+    }
+
+    /// Sweep the capitalized-word NP boost. We can't reach it via
+    /// a setter so this test rebuilds the tagger and patches the
+    /// boost via a thread-local override (added below). Ignored.
+    #[test]
+    #[ignore]
+    fn sweep_np_boost_on_gutenberg() {
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap();
+        let text_path = repo.join("testdata/gutenberg/1251.txt");
+        if !text_path.exists() { return }
+        let sample: String = std::fs::read_to_string(&text_path).unwrap()
+            .chars().take(50_000).collect();
+        let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
+        let mut subject = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        for &boost in &[0.5_f64, 0.7, 0.8, 0.9, 0.95, 0.99] {
+            subject.set_np_boost(boost);
+            let r = testkit::diff(&oracle, &subject, &sample).unwrap();
+            eprintln!(
+                "np_boost={boost:.2}  POS-err={}  pos_acc={:.4}",
+                r.pos_errors(), r.pos_accuracy(),
+            );
         }
     }
 
