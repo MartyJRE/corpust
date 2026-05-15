@@ -1170,6 +1170,38 @@ mod tests {
         }
     }
 
+    /// Dump our parsed lexicon entries for a handful of words to
+    /// compare against `tree-tagger -prob`. Ignored.
+    #[test]
+    #[ignore]
+    fn probe_lexicon_entries() {
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let tagger = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        let words = [
+            "Requests", "requests",
+            "Resolution", "resolution",
+            "Notes", "notes",
+            "Recalls", "recalls",
+            "Affirms", "affirms",
+            "Council", "council",
+        ];
+        for w in words {
+            eprintln!("\n=== {w:?} ===");
+            match tagger.model().lexicon.lookup(w) {
+                Some(entry) => {
+                    let mut cands: Vec<_> = entry.candidates.iter().collect();
+                    cands.sort_by(|a, b| b.prob.partial_cmp(&a.prob).unwrap());
+                    for c in &cands {
+                        let tag = tagger.model().header.tag(c.tag_id).unwrap_or("?");
+                        eprintln!("  {tag:>6} {:.4}", c.prob);
+                    }
+                }
+                None => eprintln!("  (not in lex)"),
+            }
+        }
+    }
+
     /// Probe what our suffix trie returns for the unknown words that
     /// account for most of the residual errors. Useful for comparing
     /// against `tree-tagger -prob` to see if the trie itself, the
