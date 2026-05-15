@@ -176,15 +176,46 @@ impl Tagger {
         // the lexicon.
         let np_candidate = first_upper;
 
-        // 1. Digits anywhere → cardinal number.
-        if chars.iter().any(|c| c.is_ascii_digit()) {
-            if let Some(cd) = self.tag_id_by_name("CD") {
-                return vec![viterbi::Cand {
-                    tag_id: u32::from(cd),
-                    lex_prob: 1.0,
-                    lemma: None,
-                }];
+        // 1. Numeric tokens:
+        //    - All digits (possibly with separators `,.`-`/`) → CD
+        //      ("123", "1,234", "3.14", "2025-01")
+        //    - Ordinal endings ("39th", "33rd", "51st", "2nd") → JJ
+        //    - Mixed alphanumeric with letters and digits ("S/24",
+        //      "2B", "10031st") → fall through to suffix-trie + NP
+        //      boost; numeric-only logic is too aggressive otherwise.
+        let has_digit = chars.iter().any(|c| c.is_ascii_digit());
+        if has_digit {
+            let all_digits_or_sep = chars
+                .iter()
+                .all(|c| c.is_ascii_digit() || matches!(*c, ',' | '.' | '-' | '/'));
+            let lc: String = word.chars().flat_map(|c| c.to_lowercase()).collect();
+            let ordinal_suffix = lc.ends_with("th")
+                || lc.ends_with("rd")
+                || lc.ends_with("st")
+                || lc.ends_with("nd");
+            let digit_prefix_then_ordinal = ordinal_suffix
+                && chars.iter().take(chars.len().saturating_sub(2)).any(|c| c.is_ascii_digit())
+                && chars.iter().take(chars.len().saturating_sub(2)).all(|c| c.is_ascii_digit());
+            if all_digits_or_sep {
+                if let Some(cd) = self.tag_id_by_name("CD") {
+                    return vec![viterbi::Cand {
+                        tag_id: u32::from(cd),
+                        lex_prob: 1.0,
+                        lemma: None,
+                    }];
+                }
             }
+            if digit_prefix_then_ordinal {
+                if let Some(jj) = self.tag_id_by_name("JJ") {
+                    return vec![viterbi::Cand {
+                        tag_id: u32::from(jj),
+                        lex_prob: 1.0,
+                        lemma: None,
+                    }];
+                }
+            }
+            // Otherwise fall through — mixed alphanumeric, let
+            // suffix-trie + NP boost handle.
         }
 
         // 2. Roman numerals → NP. Only triggers when every
@@ -670,6 +701,40 @@ mod tests {
         eprintln!(
             "gutenberg sample: {} oracle / {} subject tokens, {} exact, \
              {} word-err, {} POS-err, {} lemma-err, pos_acc={:.4}",
+            report.oracle_tokens,
+            report.subject_tokens,
+            report.matches,
+            report.word_errors(),
+            report.pos_errors(),
+            report.lemma_errors(),
+            report.pos_accuracy()
+        );
+    }
+
+    /// Accuracy on the UN Security Council resolutions corpus at
+    /// `/tmp/unsc-sample-*.txt`. Reads `$CORPUST_BENCH_SAMPLE` if
+    /// set, falls back to `/tmp/unsc-sample-100.txt`. Returns early
+    /// if the sample isn't present. Ignored.
+    #[test]
+    #[ignore]
+    fn baseline_vs_oracle_on_unsc_sample() {
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let sample_path = std::env::var("CORPUST_BENCH_SAMPLE")
+            .unwrap_or_else(|_| "/tmp/unsc-sample-100.txt".to_string());
+        let path = Path::new(&sample_path);
+        if !path.exists() {
+            eprintln!("missing {sample_path}");
+            return;
+        }
+        let sample = std::fs::read_to_string(path).unwrap();
+        let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
+        let subject = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        let report = testkit::diff(&oracle, &subject, &sample).unwrap();
+        eprintln!(
+            "unsc sample {sample_path} ({:.1} KB): {} oracle / {} subject tokens, \
+             {} exact, {} word-err, {} POS-err, {} lemma-err, pos_acc={:.4}",
+            sample.len() as f64 / 1024.0,
             report.oracle_tokens,
             report.subject_tokens,
             report.matches,
@@ -1215,12 +1280,19 @@ mod tests {
     fn categorize_residual_errors_on_gutenberg() {
         let Some(bundle) = bundle_path() else { return };
         let par = bundle.join("lib/english.par");
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap();
-        let text_path = repo.join("testdata/gutenberg/1251.txt");
-        if !text_path.exists() { return }
-        let sample: String = std::fs::read_to_string(&text_path).unwrap()
-            .chars().take(10_000).collect();
+        // Default to gutenberg, override via CORPUST_BENCH_SAMPLE.
+        let sample = if let Ok(path) = std::env::var("CORPUST_BENCH_SAMPLE") {
+            match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(_) => { eprintln!("missing {path}"); return }
+            }
+        } else {
+            let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent().unwrap().parent().unwrap();
+            let text_path = repo.join("testdata/gutenberg/1251.txt");
+            if !text_path.exists() { return }
+            std::fs::read_to_string(&text_path).unwrap().chars().take(10_000).collect()
+        };
 
         let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
         let ours = Tagger::load(&par, "english", english_abbreviations()).unwrap();
