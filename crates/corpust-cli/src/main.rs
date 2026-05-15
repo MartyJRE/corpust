@@ -310,11 +310,7 @@ fn run_index(
     // the tantivy index would be more accurate but isn't needed
     // for the display-only header in the UI.
     meta.token_count = (byte_count / 6) as u64;
-    meta.avg_doc_len = if doc_count > 0 {
-        (byte_count / doc_count) as u64
-    } else {
-        0
-    };
+    meta.avg_doc_len = byte_count.checked_div(doc_count).unwrap_or(0) as u64;
     meta.built_at = iso_now();
     meta.build_ms = build_ms;
     meta.size_on_disk = dir_size(&out).unwrap_or(0);
