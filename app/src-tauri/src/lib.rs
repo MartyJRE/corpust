@@ -54,57 +54,9 @@ pub fn run() {
 // Shared DTOs (mirror TS types in app/src/types.ts)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CorpusMeta {
-    pub id: String,
-    pub name: String,
-    /// One of "literary" / "legal" / "news" / "mixed". We don't
-    /// classify yet, so always "mixed".
-    pub kind: String,
-    pub index_path: String,
-    pub source_path: String,
-    pub annotated: bool,
-    pub doc_count: u64,
-    pub token_count: u64,
-    /// Unique-type count — 0 until we land a counting pass.
-    pub types: u64,
-    pub avg_doc_len: u64,
-    pub built_at: String,
-    pub build_ms: u64,
-    pub languages: Vec<String>,
-    pub tokeniser: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotator: Option<String>,
-    pub size_on_disk: u64,
-    /// Backend-only identifier for the tagger used at build time.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tagger_id: Option<String>,
-}
-
-impl CorpusMeta {
-    pub fn stub(id: String, name: String, index_path: String) -> Self {
-        Self {
-            id,
-            name,
-            kind: "mixed".to_owned(),
-            index_path: index_path.clone(),
-            source_path: index_path,
-            annotated: false,
-            doc_count: 0,
-            token_count: 0,
-            types: 0,
-            avg_doc_len: 0,
-            built_at: String::new(),
-            build_ms: 0,
-            languages: vec!["en".to_owned()],
-            tokeniser: "corpust".to_owned(),
-            annotator: None,
-            size_on_disk: 0,
-            tagger_id: None,
-        }
-    }
-}
+// Re-export the persisted-corpus DTOs from `corpust-io` so the CLI
+// and the Tauri side share one definition.
+pub use corpust_io::metadata::{CorpusMeta, CorpusMetaEnvelope};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -207,26 +159,8 @@ pub struct BuildRequest {
     pub tagger: TaggerKind,
 }
 
-/// On-disk envelope for persisted corpus metadata. Versioned so future
-/// schema changes can be migrated instead of silently breaking older
-/// indexes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CorpusMetaEnvelope {
-    pub schema_version: u32,
-    pub corpus: CorpusMeta,
-}
-
-impl CorpusMetaEnvelope {
-    pub const CURRENT_VERSION: u32 = 1;
-
-    pub fn wrap(corpus: CorpusMeta) -> Self {
-        Self {
-            schema_version: Self::CURRENT_VERSION,
-            corpus,
-        }
-    }
-}
+// `CorpusMetaEnvelope` is re-exported from `corpust_io::metadata`
+// above. No local definition.
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]

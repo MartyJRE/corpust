@@ -17,7 +17,7 @@ use corpust_query::{KwicRequest as CoreKwicRequest, kwic as run_core_kwic};
 use corpust_tagger::Tagger as RustTagger;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const PROGRESS_EVENT: &str = "build:progress";
@@ -530,41 +530,9 @@ fn read_metadata_file(path: &Path) -> anyhow::Result<CorpusMeta> {
     Ok(envelope.corpus)
 }
 
-fn write_metadata_file(path: &Path, meta: &CorpusMeta) -> anyhow::Result<()> {
-    let envelope = CorpusMetaEnvelope::wrap(meta.clone());
-    let json = serde_json::to_vec_pretty(&envelope)?;
-    std::fs::write(path, json)?;
-    Ok(())
-}
-
-/// Recursive on-disk byte total for a directory. Silently returns
-/// `None` if anything goes wrong — this is display-only and the UI
-/// shouldn't fail the build over a stat error.
-fn dir_size(path: &std::path::Path) -> Option<u64> {
-    fn walk(path: &std::path::Path, total: &mut u64) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let md = entry.metadata()?;
-            if md.is_dir() {
-                walk(&entry.path(), total)?;
-            } else {
-                *total += md.len();
-            }
-        }
-        Ok(())
-    }
-    let mut total = 0u64;
-    walk(path, &mut total).ok()?;
-    Some(total)
-}
-
-fn iso_now() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("unix:{secs}")
-}
+// Metadata sidecar helpers live in `corpust_io::metadata` and are
+// re-exported above for the Tauri command bodies that need them.
+use corpust_io::metadata::{dir_size, iso_now, write_metadata_file};
 
 /// Locate the bundled TreeTagger parameter + abbreviations files.
 ///
@@ -683,6 +651,7 @@ fn resolve_treetagger_bundle_root(app: &AppHandle) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp_file(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

@@ -4,6 +4,7 @@
 //! come later — each as a separate reader behind a common trait once we have
 //! enough shape to know what the trait should look like.
 
+pub mod metadata;
 pub mod paths;
 
 use anyhow::{Context, Result};

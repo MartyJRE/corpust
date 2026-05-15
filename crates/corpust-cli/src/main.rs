@@ -139,24 +139,38 @@ fn run_index(
     tagger_bundle: PathBuf,
     language: String,
 ) -> Result<()> {
-    let out = match out {
-        Some(p) => p,
+    // Track (display_name, slug, corpus_dir) so we can write the
+    // metadata sidecar next to the index when the layout permits
+    // (default platform-data-dir path) and a sensible best-effort
+    // sidecar next to `--out` for explicit paths.
+    let display_name = name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            input
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("corpus")
+                .to_owned()
+        });
+    let (out, slug, corpus_dir) = match out {
+        Some(p) => {
+            // Explicit `--out`: write the sidecar alongside it. If the
+            // user passed `…/foo/index`, sidecar goes to `…/foo/`.
+            // Slug derives from the parent's basename or `--name`.
+            let corpus_dir = p
+                .parent()
+                .filter(|pp| !pp.as_os_str().is_empty())
+                .map(|pp| pp.to_path_buf())
+                .unwrap_or_else(|| p.clone());
+            let slug = corpust_io::paths::slugify(&display_name);
+            (p, slug, corpus_dir)
+        }
         None => {
-            // No explicit --out: drop the index into the platform
-            // data directory, slug derived from --name or the input
-            // folder's basename.
-            let display_name = name
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    input
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("corpus")
-                        .to_owned()
-                });
+            // Default: drop into the platform data directory, slug
+            // derived from --name or the input folder's basename.
             let base = corpust_io::paths::slugify(&display_name);
             let slug = corpust_io::paths::unique_slug(&base)
                 .with_context(|| format!("allocating slug for {display_name:?}"))?;
@@ -164,7 +178,7 @@ fn run_index(
                 .with_context(|| format!("resolving corpus dir for slug {slug:?}"))?;
             std::fs::create_dir_all(&dir)
                 .with_context(|| format!("creating {}", dir.display()))?;
-            dir.join("index")
+            (dir.join("index"), slug, dir)
         }
     };
     let t0 = Instant::now();
@@ -187,10 +201,41 @@ fn run_index(
     }
 
     let t1 = Instant::now();
+    let tagger_id = tagger.as_deref().map(|t| t.id().to_owned());
     let index = CorpusIndex::create(&out)
         .with_context(|| format!("creating index at {}", out.display()))?;
     index.add_documents(docs, tagger.as_deref())?;
     let index_elapsed = t1.elapsed();
+    let build_ms = t1.elapsed().as_millis() as u64;
+
+    // Write the metadata.json sidecar next to the index so the
+    // Tauri UI's `list_corpora` picks the corpus up. Mirrors the
+    // structure the Tauri build path produces.
+    use corpust_io::metadata::{
+        CorpusMeta, dir_size, iso_now, write_metadata_file,
+    };
+    let mut meta = CorpusMeta::stub(
+        slug,
+        display_name,
+        out.to_string_lossy().into_owned(),
+    );
+    meta.source_path = input.to_string_lossy().into_owned();
+    meta.annotated = annotate;
+    meta.doc_count = doc_count as u64;
+    // Token count is a byte-based approximation; a real pass over
+    // the tantivy index would be more accurate but isn't needed
+    // for the display-only header in the UI.
+    meta.token_count = (byte_count / 6) as u64;
+    meta.avg_doc_len = if doc_count > 0 { (byte_count / doc_count) as u64 } else { 0 };
+    meta.built_at = iso_now();
+    meta.build_ms = build_ms;
+    meta.size_on_disk = dir_size(&out).unwrap_or(0);
+    meta.annotator = tagger_id.clone();
+    meta.tagger_id = tagger_id;
+    let metadata_path = corpus_dir.join("metadata.json");
+    if let Err(e) = write_metadata_file(&metadata_path, &meta) {
+        eprintln!("warning: couldn't write {}: {e:#}", metadata_path.display());
+    }
 
     println!(
         "indexed {doc_count} doc(s) ({byte_count} bytes) in {:.2?} (read {:.2?} + index {:.2?})",
@@ -199,6 +244,7 @@ fn run_index(
         index_elapsed
     );
     println!("index written to {}", out.display());
+    println!("metadata written to {}", metadata_path.display());
     Ok(())
 }
 
