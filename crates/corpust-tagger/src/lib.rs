@@ -1038,6 +1038,49 @@ mod tests {
         eprintln!("dtree marginal:        POS-err={} pos_acc={:.4}", r.pos_errors(), r.pos_accuracy());
     }
 
+    /// Probe what our suffix trie returns for the unknown words that
+    /// account for most of the residual errors. Useful for comparing
+    /// against `tree-tagger -prob` to see if the trie itself, the
+    /// post-trie heuristics (NP boost, fallback), or downstream
+    /// Viterbi is the source of the disagreement.
+    #[test]
+    #[ignore]
+    fn probe_unknown_word_candidates() {
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let tagger = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        let words = ["hart", "Hart", "damosels", "truage", "May-day", "BIBLIOGRAPHICAL"];
+        for w in words {
+            eprintln!("\n=== {w:?} ===");
+            let cands = tagger.candidates_for(w);
+            let mut cands_sorted: Vec<_> = cands.iter().collect();
+            cands_sorted.sort_by(|a, b| b.lex_prob.partial_cmp(&a.lex_prob).unwrap());
+            for c in cands_sorted.iter().take(8) {
+                let tag = tagger.model().header.tag(c.tag_id).unwrap_or("?");
+                eprintln!("  {:>6} {:.4}", tag, c.lex_prob);
+            }
+            // Also probe the raw suffix-trie distribution (before
+            // NP boost) — if Tagger drops down to it.
+            if let Some(tries) = tagger.model().tries.as_ref() {
+                let trie_dist = tries.suffix.lookup(w.chars().rev());
+                eprintln!("  raw suffix-trie lookup: {}", match trie_dist {
+                    Some(d) => {
+                        let mut top: Vec<_> = d.probs.iter().collect();
+                        top.sort_by(|a, b| b.prob.partial_cmp(&a.prob).unwrap());
+                        let tags: Vec<(String, f32)> = top.iter().take(4).map(|tp| {
+                            (
+                                tagger.model().header.tag(tp.tag_id as u32).unwrap_or("?").to_string(),
+                                tp.prob,
+                            )
+                        }).collect();
+                        format!("{tags:?}")
+                    }
+                    None => "(no match — fell through)".to_string(),
+                });
+            }
+        }
+    }
+
     /// Sweep Viterbi's relative-pruning threshold over the 10 KB
     /// Gutenberg sample, printing pos_acc for each value. Ignored.
     #[test]
