@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  # Create an empty draft release first so the matrix jobs can upload
+  # into it. The workflow that publishes the release is triggered by
+  # pushing a `v*` tag — usually after bumping the workspace version
+  # (see RELEASING.md).
+  create-release:
+    name: draft release
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.id }}
+      upload_url: ${{ steps.create.outputs.upload_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: create draft release
+        id: create
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          body: |
+            Automated release for `${{ github.ref_name }}`.
+
+            Artifacts are attached below — pick the one for your
+            platform. The CLI binary is the standalone `corpust`
+            (or `corpust.exe`) executable; the Tauri bundles are the
+            desktop app.
+          generate_release_notes: true
+
+  build-cli:
+    name: cli (${{ matrix.target }})
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: corpust
+            asset_name: corpust-x86_64-linux
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: corpust
+            asset_name: corpust-aarch64-macos
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: corpust
+            asset_name: corpust-x86_64-macos
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: corpust.exe
+            asset_name: corpust-x86_64-windows.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: cargo build --release -p corpust-cli
+        run: cargo build --release -p corpust-cli --target ${{ matrix.target }}
+      - name: upload cli binary
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          fail_on_unmatched_files: true
+
+  build-tauri:
+    name: tauri (${{ matrix.platform }})
+    needs: create-release
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tauri-${{ matrix.platform }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: install ubuntu deps
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+      - name: install app deps
+        working-directory: app
+        run: npm ci
+      - name: build + bundle
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: app
+          tagName: ${{ github.ref_name }}
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+
+  publish:
+    name: publish release
+    needs: [build-cli, build-tauri]
+    runs-on: ubuntu-latest
+    steps:
+      - name: flip draft → published
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: false
