@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: create draft release
         id: create
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           name: ${{ github.ref_name }}
@@ -75,7 +75,7 @@ jobs:
       - name: cargo build --release -p corpust-cli
         run: cargo build --release -p corpust-cli --target ${{ matrix.target }}
       - name: upload cli binary
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           files: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
@@ -132,7 +132,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: flip draft → published
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           draft: false
