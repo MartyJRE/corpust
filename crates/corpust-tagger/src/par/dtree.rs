@@ -831,6 +831,14 @@ pub fn read(cur: &mut Cursor<'_>, header: &Header) -> Result<DecisionTree> {
         );
     }
 
+    if !matches!(records.last(), Some(DTreeRecord::Default(_))) {
+        bail!(
+            "decision tree didn't terminate with a Default record \
+             (last kind: {:?})",
+            records.last().map(|r| r.kind())
+        );
+    }
+
     cur.advance(len)
         .context("advancing cursor to EOF after decision tree")?;
 
@@ -976,6 +984,13 @@ mod tests {
         out
     }
 
+    /// 4-byte Context_Size header that every dtree section starts
+    /// with. Value is arbitrary for our synth tests; the parser just
+    /// reads it and stores it on the `DecisionTree`.
+    fn synth_context_size(cl: u32) -> Vec<u8> {
+        cl.to_le_bytes().to_vec()
+    }
+
     fn stub_header(num_tags: u32) -> Header {
         Header {
             field_a: 0,
@@ -990,7 +1005,7 @@ mod tests {
     #[test]
     fn walks_all_four_kinds_in_order() {
         let n = 3u32;
-        let mut bytes = Vec::new();
+        let mut bytes = synth_context_size(7);
         bytes.extend_from_slice(&synth_internal(2, 1, 42));
         bytes.extend_from_slice(&synth_leaf(7, n, 10));
         bytes.extend_from_slice(&synth_internal(1, 0, 99));
@@ -1040,7 +1055,8 @@ mod tests {
     #[test]
     fn walks_default_only() {
         let n = 3u32;
-        let bytes = synth_default(n, 55);
+        let mut bytes = synth_context_size(0);
+        bytes.extend_from_slice(&synth_default(n, 55));
         let header = stub_header(n);
         let mut cur = Cursor::new(&bytes);
         let tree = read(&mut cur, &header).unwrap();
@@ -1060,7 +1076,7 @@ mod tests {
         // Followed by a trailing default so the section is still
         // terminated (otherwise we'd get the trailing-default error
         // instead of the record-kind error).
-        let mut bytes = Vec::new();
+        let mut bytes = synth_context_size(0);
         bytes.extend_from_slice(&5u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
@@ -1073,7 +1089,7 @@ mod tests {
             msg.contains("unrecognized decision-tree record"),
             "expected a walker-error message, got: {msg}"
         );
-        assert!(msg.contains("section-offset 0"), "missing offset in: {msg}");
+        assert!(msg.contains("section-offset 4"), "missing offset in: {msg}");
     }
 
     /// Must terminate on a Default — otherwise inference has no
@@ -1085,7 +1101,7 @@ mod tests {
         // parse both and then complain that there's no Default at
         // EOF. But the second leaf's trailing bytes exactly fill
         // the file, so the trailing-default check kicks in.
-        let mut bytes = Vec::new();
+        let mut bytes = synth_context_size(0);
         bytes.extend_from_slice(&synth_leaf(1, n, 5));
         bytes.extend_from_slice(&synth_leaf(2, n, 6));
         let header = stub_header(n);
@@ -1101,11 +1117,13 @@ mod tests {
     /// Preorder-DFS reconstruction on a tree with known shape:
     /// Internal(Leaf, Internal(Leaf, Default)) — 2 internals, 3
     /// leaves, with the trailing Default acting as the rightmost
-    /// leaf of the last tree.
+    /// leaf of the last tree. Serialized child order is yes-first,
+    /// then no, so the Default lands at EOF as required by the
+    /// section format.
     #[test]
     fn reconstructs_small_tree() {
         let n = 3u32;
-        let mut bytes = Vec::new();
+        let mut bytes = synth_context_size(0);
         bytes.extend_from_slice(&synth_internal(1, 0, 10)); // root
         bytes.extend_from_slice(&synth_pruned(n, 5)); // root yes-child (leaf)
         bytes.extend_from_slice(&synth_internal(2, 1, 20)); // root no-child (internal)
@@ -1162,7 +1180,7 @@ mod tests {
     #[test]
     fn predict_follows_yes_no_branches() {
         let n = 3u32;
-        let mut bytes = Vec::new();
+        let mut bytes = synth_context_size(0);
         bytes.extend_from_slice(&synth_internal(0, 0, 1)); // root: tag_{-1} == 1?
         bytes.extend_from_slice(&synth_pruned(n, 100));    // yes leaf
         bytes.extend_from_slice(&synth_internal(0, 1, 2)); // inner: tag_{-2} == 2?
@@ -1182,10 +1200,15 @@ mod tests {
         assert_eq!(traversal.predict(&[]).weight, 300);
     }
 
-    /// English.par is known to reconstruct as a forest of 4 trees
-    /// (Prior Leaf, Unigram Switch, Bigram Tree, Fallback Leaf).
+    /// English.par reconstructs as a forest of 3 trees: a single
+    /// prior leaf, a 63-node unigram switch chain, and the 1501-node
+    /// bigram tree (which terminates in the trailing Default). The
+    /// math is forced — strict binary forest, so
+    /// `#trees = #leaves - #internals = 784 - 781 = 3`. The
+    /// `predict_combined` ensemble logic relies on this exact shape
+    /// at `roots[0..3]`.
     #[test]
-    fn reconstructs_english_as_four_trees() {
+    fn reconstructs_english_as_three_trees() {
         let Some(par) = english_par_path() else {
             return;
         };
@@ -1201,17 +1224,15 @@ mod tests {
         };
         let tree = read(&mut cur, &header).unwrap();
         let forest = tree.reconstruct().unwrap();
-        assert_eq!(forest.roots.len(), 4, "english.par should be a 4-tree forest");
+        assert_eq!(forest.roots.len(), 3, "english.par should be a 3-tree forest");
         let n0 = subtree_size(&forest.nodes, forest.roots[0]);
         let n1 = subtree_size(&forest.nodes, forest.roots[1]);
         let n2 = subtree_size(&forest.nodes, forest.roots[2]);
-        let n3 = subtree_size(&forest.nodes, forest.roots[3]);
-        eprintln!("english.par forest: tree[0]={n0}, tree[1]={n1}, tree[2]={n2}, tree[3]={n3}");
+        eprintln!("english.par forest: tree[0]={n0}, tree[1]={n1}, tree[2]={n2}");
         assert_eq!(n0, 1, "first tree should be a single prior Leaf");
         assert_eq!(n1, 63, "second tree should be the 63-node switch chain");
-        assert_eq!(n2, 1500, "third tree should be the 1500-node main tree");
-        assert_eq!(n3, 1, "fourth tree should be the trailing fallback Leaf");
-        assert_eq!(n0 + n1 + n2 + n3, 1565);
+        assert_eq!(n2, 1501, "third tree should be the 1501-node bigram tree");
+        assert_eq!(n0 + n1 + n2, 1565);
     }
 
     fn subtree_size(nodes: &[TreeNode], root: usize) -> usize {
