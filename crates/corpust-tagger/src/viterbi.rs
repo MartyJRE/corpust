@@ -103,7 +103,7 @@ pub fn tag_sequence(
     header: &Header,
     tag_prior: &[f64],
 ) -> Vec<Tagged> {
-    tag_sequence_with(cands_per_token, traversal, header, tag_prior, 0.01)
+    tag_sequence_with(cands_per_token, traversal, header, tag_prior, 0.001)
 }
 
 /// Like [`tag_sequence`] but with the relative-pruning threshold

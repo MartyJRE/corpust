@@ -62,6 +62,11 @@ pub struct Tagger {
     /// token are dropped before the dtree weighs in. `0.0` disables
     /// pruning entirely; higher values trust the lexicon more.
     pruning_threshold: f64,
+    /// Override for the per-tag marginal `P(t)` used in Viterbi's
+    /// Bayes-correction step. `None` falls back to
+    /// `normalize_prior(tries.tag_prelude)`. Mostly for diagnostic
+    /// sweeps; not normally exposed.
+    tag_prior_override: Option<Vec<f64>>,
 }
 
 impl Tagger {
@@ -85,7 +90,8 @@ impl Tagger {
             tokenizer: tokenize::Tokenizer::new(abbreviations),
             language,
             id: format!("treetagger-rs-{language}"),
-            pruning_threshold: 0.01,
+            pruning_threshold: 0.001,
+            tag_prior_override: None,
         })
     }
 
@@ -289,9 +295,12 @@ impl Tagger {
     }
 }
 
-/// Normalize per-tag training counts (`Tries::tag_prelude`) to a
-/// proper probability distribution. Returns an empty Vec if the
-/// prelude is empty or sums to zero.
+/// Normalize per-tag values from the tries slab into a proper
+/// probability distribution. Kept around as a building block for
+/// the `compare_tag_prior_sources` diagnostic. Not used in the
+/// default Viterbi path — `tag_prelude`'s values disagree with
+/// real-text marginal frequencies, see `Annotator::annotate`.
+#[allow(dead_code)]
 fn normalize_prior(prelude: &[f64]) -> Vec<f64> {
     let total: f64 = prelude.iter().sum();
     if total <= 0.0 {
@@ -307,12 +316,21 @@ impl Annotator for Tagger {
             tokens.iter().map(|t| self.candidates_for(t)).collect();
         let tagged: Vec<viterbi::Tagged> = match self.dtree.as_ref() {
             Some(traversal) => {
-                let tag_prior = self
-                    .model
-                    .tries
-                    .as_ref()
-                    .map(|t| normalize_prior(&t.tag_prelude))
-                    .unwrap_or_default();
+                // Default prior: the dtree's averaged-leaf marginal,
+                // which is the per-tag frequency the tree itself was
+                // trained against. The `tries.tag_prelude` block in
+                // the .par file looks like training counts at first
+                // glance but emits values that disagree wildly with
+                // any English-text distribution (`#`=6.8 %, `,`=0.02 %
+                // on `english.par`); using it as `P(t)` shifts
+                // Viterbi's argmax in the wrong direction. The dtree
+                // marginal `(#=0.015 %, ,=5.2 %)` matches what we'd
+                // expect from training corpora.
+                let tag_prior: Vec<f64> = if let Some(ov) = &self.tag_prior_override {
+                    ov.clone()
+                } else {
+                    traversal.marginal.probs.iter().map(|tp| tp.prob).collect()
+                };
                 viterbi::tag_sequence_with(
                     &cands,
                     traversal,
@@ -985,6 +1003,41 @@ mod tests {
         }
     }
 
+    /// Compare different `tag_prior` sources in Viterbi end-to-end.
+    /// Ignored.
+    #[test]
+    #[ignore]
+    fn compare_tag_prior_sources() {
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap();
+        let text_path = repo.join("testdata/gutenberg/1251.txt");
+        if !text_path.exists() { return }
+        let sample: String = std::fs::read_to_string(&text_path).unwrap()
+            .chars().take(10_000).collect();
+        let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
+
+        // Source 1: default (normalized tag_prelude).
+        let tagger = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        let r = testkit::diff(&oracle, &tagger, &sample).unwrap();
+        eprintln!("tag_prelude (default): POS-err={} pos_acc={:.4}", r.pos_errors(), r.pos_accuracy());
+
+        // Source 2: no prior at all.
+        let mut tagger2 = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        tagger2.tag_prior_override = Some(Vec::new());
+        let r = testkit::diff(&oracle, &tagger2, &sample).unwrap();
+        eprintln!("no prior:              POS-err={} pos_acc={:.4}", r.pos_errors(), r.pos_accuracy());
+
+        // Source 3: dtree-leaves marginal.
+        let mut tagger3 = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        let marginal: Vec<f64> = tagger3.dtree.as_ref().unwrap()
+            .marginal.probs.iter().map(|tp| tp.prob).collect();
+        tagger3.tag_prior_override = Some(marginal);
+        let r = testkit::diff(&oracle, &tagger3, &sample).unwrap();
+        eprintln!("dtree marginal:        POS-err={} pos_acc={:.4}", r.pos_errors(), r.pos_accuracy());
+    }
+
     /// Sweep Viterbi's relative-pruning threshold over the 10 KB
     /// Gutenberg sample, printing pos_acc for each value. Ignored.
     #[test]
@@ -997,10 +1050,10 @@ mod tests {
         let text_path = repo.join("testdata/gutenberg/1251.txt");
         if !text_path.exists() { return }
         let full = std::fs::read_to_string(&text_path).unwrap();
-        let sample: String = full.chars().take(10_000).collect();
+        let sample: String = full.chars().take(50_000).collect();
         let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
         let mut subject = Tagger::load(&par, "english", english_abbreviations()).unwrap();
-        let thresholds = [0.0, 0.001, 0.005, 0.01, 0.05, 0.10, 0.25, 0.75];
+        let thresholds = [0.0, 0.001, 0.01, 0.05, 0.10, 0.25, 0.75];
         for &t in &thresholds {
             subject.set_pruning_threshold(t);
             let r = testkit::diff(&oracle, &subject, &sample).unwrap();
