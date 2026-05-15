@@ -501,6 +501,7 @@ mod tests {
     ///
     /// Run with `cargo test -p corpust-tagger --release --lib
     /// tests::speed_bench -- --nocapture --ignored`.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn speed_bench() {
@@ -577,6 +578,7 @@ mod tests {
     /// Sample 20 remaining unknown-word POS errors so we can see the
     /// kind of word where the suffix-trie guess still disagrees with
     /// the oracle.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn unknown_error_clustering() {
@@ -644,6 +646,7 @@ mod tests {
     /// errors on the gutenberg sample. Lets us see whether the
     /// remaining gap is concentrated on a few high-frequency words
     /// or spread thin.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn ambiguous_error_clustering() {
@@ -706,6 +709,7 @@ mod tests {
     /// (unknown vs ambiguous-known) so we can see where the remaining
     /// POS errors live. Informs where to invest next: trie-based
     /// unknown-word guessing vs dtree-based context disambiguation.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn baseline_error_breakdown_on_gutenberg_sample() {
@@ -765,6 +769,7 @@ mod tests {
     /// with `cargo test -p corpust-tagger --lib -- --nocapture --ignored`
     /// to print the number; useful when validating a proposed Viterbi
     /// change against the current lexicon-first baseline.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn baseline_vs_oracle_on_gutenberg_sample() {
@@ -801,6 +806,7 @@ mod tests {
     /// `/tmp/unsc-sample-*.txt`. Reads `$CORPUST_BENCH_SAMPLE` if
     /// set, falls back to `/tmp/unsc-sample-100.txt`. Returns early
     /// if the sample isn't present. Ignored.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn baseline_vs_oracle_on_unsc_sample() {
@@ -836,6 +842,7 @@ mod tests {
     /// run with `cargo test -p corpust-tagger --lib
     /// sweep_lambda_bigram_on_gutenberg_sample --
     /// --nocapture --ignored`.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn sweep_lambda_bigram_on_gutenberg_sample() {
@@ -873,6 +880,7 @@ mod tests {
     /// Returns a human-readable summary ending with the leaf's
     /// argmax. Kept around as a diagnostic helper; not currently
     /// called by any test.
+    #[cfg(feature = "diagnostics")]
     #[allow(dead_code)]
     fn trace_traversal(
         forest: &par::dtree::TreeForest,
@@ -944,6 +952,7 @@ mod tests {
     /// Ignored by default — needs `/tmp/print-prob-tree.txt`:
     ///
     ///     tree-tagger -print-prob-tree english.par > /tmp/print-prob-tree.txt
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn diff_bigram_tree_vs_oracle() {
@@ -1067,6 +1076,7 @@ mod tests {
     /// wrong but the override gets right — those are the errors
     /// caused specifically by our tree disagreeing with oracle on
     /// the (t_-1, t_-2) → distribution mapping. Ignored.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn errors_we_lose_to_oracle_override() {
@@ -1197,6 +1207,7 @@ mod tests {
 
     /// Compare different `tag_prior` sources in Viterbi end-to-end.
     /// Ignored.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn compare_tag_prior_sources() {
@@ -1261,6 +1272,7 @@ mod tests {
     /// total prob-array record count. If so, the per-entry `count`
     /// is the authoritative distribution length and our prob-curve
     /// segmentation was wrong.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn verify_leaf_count_segmentation_hypothesis() {
@@ -1291,6 +1303,7 @@ mod tests {
     /// Dump literal 8 bytes per record around hart's distribution
     /// (record 4502). Note: prob-array-2 starts at slab-offset
     /// 0x01d255 already past the 0x15 prelude byte.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn dump_hart_bytes_corrected() {
@@ -1321,6 +1334,7 @@ mod tests {
 
     /// Dump our parsed lexicon entries for a handful of words to
     /// compare against `tree-tagger -prob`. Ignored.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn probe_lexicon_entries() {
@@ -1362,6 +1376,7 @@ mod tests {
     /// against `tree-tagger -prob` to see if the trie itself, the
     /// post-trie heuristics (NP boost, fallback), or downstream
     /// Viterbi is the source of the disagreement.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn probe_unknown_word_candidates() {
@@ -1415,6 +1430,7 @@ mod tests {
     /// Sweep the capitalized-word NP boost. We can't reach it via
     /// a setter so this test rebuilds the tagger and patches the
     /// boost via a thread-local override (added below). Ignored.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn sweep_np_boost_on_gutenberg() {
@@ -1449,6 +1465,7 @@ mod tests {
 
     /// Sweep Viterbi's relative-pruning threshold over the 10 KB
     /// Gutenberg sample, printing pos_acc for each value. Ignored.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn sweep_pruning_threshold_on_gutenberg() {
@@ -1488,6 +1505,7 @@ mod tests {
     ///
     /// Ignored by default. Useful for end-to-end parity archaeology
     /// once the dtree side is bit-identical (see `diff_bigram_tree_vs_oracle`).
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn categorize_residual_errors_on_gutenberg() {
@@ -1622,6 +1640,7 @@ mod tests {
     ///
     /// Requires `/tmp/print-prob-tree.txt`:
     /// `tree-tagger -print-prob-tree english.par > /tmp/print-prob-tree.txt`.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn binary_prob_tree_upper_bound() {
@@ -1751,6 +1770,7 @@ mod tests {
     }
 
     /// Probe specific lexicon entries to debug Viterbi mistakes.
+    #[cfg(feature = "diagnostics")]
     #[test]
     #[ignore]
     fn lexicon_probe_words() {

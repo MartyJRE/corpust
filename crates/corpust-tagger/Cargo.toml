@@ -7,6 +7,12 @@ repository.workspace = true
 authors.workspace = true
 description = "Corpust: pure-Rust POS / lemma tagger reading TreeTagger .par files."
 
+[features]
+# Heavy oracle-comparison + accuracy-sweep tests. Off by default —
+# requires running the TreeTagger subprocess and large external corpora
+# (Gutenberg, UNSC). Enabled when iterating on tagger accuracy locally.
+diagnostics = []
+
 [dependencies]
 corpust-core.workspace = true
 corpust-annotate.workspace = true
