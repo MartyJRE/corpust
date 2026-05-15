@@ -130,3 +130,78 @@ pub fn iso_now() -> String {
         .unwrap_or(0);
     format!("unix:{secs}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stub_has_sane_defaults() {
+        let meta = CorpusMeta::stub("abc".into(), "My Corpus".into(), "/p".into());
+        assert_eq!(meta.id, "abc");
+        assert_eq!(meta.name, "My Corpus");
+        assert_eq!(meta.kind, "mixed");
+        assert_eq!(meta.index_path, "/p");
+        assert_eq!(meta.source_path, "/p");
+        assert!(!meta.annotated);
+        assert_eq!(meta.languages, vec!["en".to_owned()]);
+        assert_eq!(meta.tokeniser, "corpust");
+        assert!(meta.annotator.is_none());
+        assert!(meta.tagger_id.is_none());
+    }
+
+    #[test]
+    fn envelope_wraps_at_current_version() {
+        let meta = CorpusMeta::stub("id".into(), "n".into(), "p".into());
+        let envelope = CorpusMetaEnvelope::wrap(meta);
+        assert_eq!(envelope.schema_version, CorpusMetaEnvelope::CURRENT_VERSION);
+        assert_eq!(envelope.corpus.id, "id");
+    }
+
+    #[test]
+    fn write_metadata_file_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        let mut meta = CorpusMeta::stub("xyz".into(), "Roundtrip".into(), "/idx".into());
+        meta.doc_count = 7;
+        meta.annotator = Some("treetagger:en".to_owned());
+
+        write_metadata_file(&path, &meta).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let env: CorpusMetaEnvelope = serde_json::from_str(&raw).unwrap();
+        assert_eq!(env.schema_version, CorpusMetaEnvelope::CURRENT_VERSION);
+        assert_eq!(env.corpus.id, "xyz");
+        assert_eq!(env.corpus.doc_count, 7);
+        assert_eq!(env.corpus.annotator.as_deref(), Some("treetagger:en"));
+        // camelCase serialisation contract — UI consumes this.
+        assert!(raw.contains("\"schemaVersion\""));
+        assert!(raw.contains("\"docCount\""));
+    }
+
+    #[test]
+    fn dir_size_sums_files_recursively() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested/b.txt"), b"world!").unwrap();
+
+        let size = dir_size(dir.path()).unwrap();
+        assert_eq!(size, 5 + 6);
+    }
+
+    #[test]
+    fn dir_size_returns_none_for_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(dir_size(&missing).is_none());
+    }
+
+    #[test]
+    fn iso_now_emits_unix_prefix() {
+        let s = iso_now();
+        assert!(s.starts_with("unix:"), "got {s:?}");
+        let secs: u64 = s.trim_start_matches("unix:").parse().unwrap();
+        assert!(secs > 1_700_000_000);
+    }
+}

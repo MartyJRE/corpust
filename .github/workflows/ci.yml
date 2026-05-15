@@ -80,7 +80,11 @@ jobs:
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: generate coverage
-        run: cargo llvm-cov --workspace --exclude corpust-ui --lcov --output-path lcov.info
+        # par_explore is a dev-only inspection bin — skip it.
+        run: |
+          cargo llvm-cov --workspace --exclude corpust-ui \
+            --ignore-filename-regex 'par_explore\.rs' \
+            --lcov --output-path lcov.info
       - name: upload to codecov
         uses: codecov/codecov-action@v5
         with:

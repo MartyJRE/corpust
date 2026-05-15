@@ -48,3 +48,53 @@ impl<'a> KwicRequest<'a> {
 pub fn kwic(index: &CorpusIndex, request: KwicRequest<'_>) -> Result<Vec<KwicHit>> {
     index.kwic(request.term, request.layer, request.context, request.limit)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use corpust_core::Document;
+    use std::path::PathBuf;
+
+    fn tiny_index() -> (tempfile::TempDir, CorpusIndex) {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = CorpusIndex::create(tmp.path()).unwrap();
+        idx.add_documents(
+            [Document {
+                id: 0,
+                path: PathBuf::from("a.txt"),
+                text: "the quick brown fox jumps over the lazy dog".to_string(),
+            }],
+            None,
+        )
+        .unwrap();
+        (tmp, idx)
+    }
+
+    #[test]
+    fn builder_defaults() {
+        let req = KwicRequest::new("foo");
+        assert_eq!(req.term, "foo");
+        assert!(matches!(req.layer, QueryLayer::Word));
+        assert_eq!(req.context, DEFAULT_CONTEXT);
+        assert_eq!(req.limit, DEFAULT_LIMIT);
+    }
+
+    #[test]
+    fn builder_overrides() {
+        let req = KwicRequest::new("foo")
+            .layer(QueryLayer::Lemma)
+            .context(7)
+            .limit(3);
+        assert!(matches!(req.layer, QueryLayer::Lemma));
+        assert_eq!(req.context, 7);
+        assert_eq!(req.limit, 3);
+    }
+
+    #[test]
+    fn kwic_facade_returns_index_hits() {
+        let (_tmp, idx) = tiny_index();
+        let hits = kwic(&idx, KwicRequest::new("the").context(2).limit(10)).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.hit == "the"));
+    }
+}

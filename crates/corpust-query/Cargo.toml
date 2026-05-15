@@ -11,3 +11,7 @@ description = "Corpust: query layer over the index."
 corpust-core.workspace = true
 corpust-index.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+corpust-annotate.workspace = true
+tempfile = "3"

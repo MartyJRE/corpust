@@ -141,10 +141,10 @@ mod tests {
     }
 
     /// Combined to avoid a cargo-default-parallelism race on the
-    /// shared `CORPUST_DATA_ROOT` env var: both default-resolution
-    /// and override-resolution are verified in one test.
+    /// shared `CORPUST_DATA_ROOT` env var: all env-driven paths are
+    /// verified in one test.
     #[test]
-    fn data_root_default_and_override() {
+    fn env_driven_paths_compose_under_override() {
         let prev = std::env::var("CORPUST_DATA_ROOT").ok();
         // SAFETY: setting/removing env vars is unsafe in Rust 2024
         // because other threads might read concurrently. This crate
@@ -158,11 +158,47 @@ mod tests {
             default_root.ends_with("corpust"),
             "default root should end in `corpust`, got {default_root:?}"
         );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().to_path_buf();
         unsafe {
-            std::env::set_var("CORPUST_DATA_ROOT", "/tmp/corpust-test-override");
+            std::env::set_var("CORPUST_DATA_ROOT", &tmp_root);
         }
-        let override_root = data_root().unwrap();
-        assert_eq!(override_root, PathBuf::from("/tmp/corpust-test-override"));
+
+        assert_eq!(data_root().unwrap(), tmp_root);
+        assert_eq!(corpora_root().unwrap(), tmp_root.join("corpora"));
+        assert_eq!(corpus_dir("foo").unwrap(), tmp_root.join("corpora/foo"));
+        assert_eq!(
+            index_path("foo").unwrap(),
+            tmp_root.join("corpora/foo/index")
+        );
+        assert_eq!(
+            metadata_path("foo").unwrap(),
+            tmp_root.join("corpora/foo/metadata.json")
+        );
+
+        // Empty CORPUST_DATA_ROOT falls back to the default lookup.
+        unsafe {
+            std::env::set_var("CORPUST_DATA_ROOT", "");
+        }
+        assert!(data_root().unwrap().ends_with("corpust"));
+
+        // unique_slug: walks through `base`, `base-2`, … as dirs exist.
+        unsafe {
+            std::env::set_var("CORPUST_DATA_ROOT", &tmp_root);
+        }
+        // corpora root missing → returns the base verbatim.
+        assert_eq!(unique_slug("fresh").unwrap(), "fresh");
+
+        std::fs::create_dir_all(tmp_root.join("corpora")).unwrap();
+        assert_eq!(unique_slug("fresh").unwrap(), "fresh");
+
+        std::fs::create_dir(tmp_root.join("corpora/taken")).unwrap();
+        assert_eq!(unique_slug("taken").unwrap(), "taken-2");
+
+        std::fs::create_dir(tmp_root.join("corpora/taken-2")).unwrap();
+        assert_eq!(unique_slug("taken").unwrap(), "taken-3");
+
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("CORPUST_DATA_ROOT", v),
