@@ -140,35 +140,29 @@ mod tests {
         assert_eq!(slugify("my_corpus-1"), "my_corpus-1");
     }
 
+    /// Combined to avoid a cargo-default-parallelism race on the
+    /// shared `CORPUST_DATA_ROOT` env var: both default-resolution
+    /// and override-resolution are verified in one test.
     #[test]
-    fn data_root_is_a_path() {
-        // Can't assert a specific value across platforms, but it
-        // should at least resolve without error on any CI host.
-        // Skip when the test env happens to have the override set;
-        // in that case it just resolves to the override verbatim.
-        if std::env::var("CORPUST_DATA_ROOT").is_ok() {
-            return;
-        }
-        let root = data_root().unwrap();
-        assert!(root.ends_with("corpust"));
-    }
-
-    #[test]
-    fn data_root_honors_env_override() {
-        // SAFETY: tests in this module are #[test]-serialized only
-        // when cargo's --test-threads=1 is set, but the env var is
-        // read+restored within this single test so it's robust either
-        // way as long as no other test reads the same var concurrently.
+    fn data_root_default_and_override() {
         let prev = std::env::var("CORPUST_DATA_ROOT").ok();
         // SAFETY: setting/removing env vars is unsafe in Rust 2024
-        // because other threads might read concurrently. This test
-        // crate only reads CORPUST_DATA_ROOT here, so the race window
-        // is bounded.
+        // because other threads might read concurrently. This crate
+        // only reads `CORPUST_DATA_ROOT` from `data_root()` and only
+        // in this test, so the race window is bounded.
+        unsafe {
+            std::env::remove_var("CORPUST_DATA_ROOT");
+        }
+        let default_root = data_root().unwrap();
+        assert!(
+            default_root.ends_with("corpust"),
+            "default root should end in `corpust`, got {default_root:?}"
+        );
         unsafe {
             std::env::set_var("CORPUST_DATA_ROOT", "/tmp/corpust-test-override");
         }
-        let root = data_root().unwrap();
-        assert_eq!(root, PathBuf::from("/tmp/corpust-test-override"));
+        let override_root = data_root().unwrap();
+        assert_eq!(override_root, PathBuf::from("/tmp/corpust-test-override"));
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("CORPUST_DATA_ROOT", v),

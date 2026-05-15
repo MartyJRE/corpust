@@ -85,20 +85,44 @@ impl TreeTagger {
         };
 
         let tagger = bundle_root.join("bin").join(platform).join(binary_name);
-        let abbr = bundle_root
-            .join("lib")
-            .join(format!("{language}-abbreviations"));
-        let model = bundle_root.join("lib").join(format!("{language}.par"));
-
-        for p in [&tagger, &abbr, &model] {
-            if !p.exists() {
-                bail!(
-                    "TreeTagger bundle missing: {} (bundle_root = {})",
-                    p.display(),
-                    bundle_root.display()
-                );
-            }
+        if !tagger.exists() {
+            bail!(
+                "TreeTagger binary missing: {} (bundle_root = {})",
+                tagger.display(),
+                bundle_root.display()
+            );
         }
+
+        // Model + abbreviations fall back to the platform data dir
+        // when missing from the bundle. That's where
+        // `corpust annotate install-lang <code>` drops files. The
+        // bundled English files always live in the repo bundle, so
+        // English keeps working without any data-dir setup.
+        let model_name = format!("{language}.par");
+        let abbr_name = format!("{language}-abbreviations");
+        let bundled_model = bundle_root.join("lib").join(&model_name);
+        let bundled_abbr = bundle_root.join("lib").join(&abbr_name);
+        let data_model = corpust_io::paths::data_root()
+            .ok()
+            .map(|root| root.join("treetagger").join("lib").join(&model_name));
+        let data_abbr = corpust_io::paths::data_root()
+            .ok()
+            .map(|root| root.join("treetagger").join("lib").join(&abbr_name));
+
+        let model = first_existing([Some(bundled_model.clone()), data_model.clone()])
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "TreeTagger model file missing for {language}: \
+                     looked at {} and {}",
+                    bundled_model.display(),
+                    data_model
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(no data dir)".to_owned())
+                )
+            })?;
+        let abbr = first_existing([Some(bundled_abbr), data_abbr])
+            .unwrap_or_else(|| bundle_root.join("lib").join(&abbr_name));
 
         Self::new(tagger, abbr, model, language)
     }
@@ -186,6 +210,16 @@ impl Annotator for TreeTagger {
     fn id(&self) -> &str {
         &self.id
     }
+}
+
+/// Return the first existing path in the candidate list, skipping
+/// `None` slots. Used to overlay the platform data dir on top of the
+/// bundled TreeTagger layout in `from_bundle`.
+fn first_existing<const N: usize>(candidates: [Option<PathBuf>; N]) -> Option<PathBuf> {
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|p| p.exists())
 }
 
 fn current_platform_dir() -> Result<&'static str> {

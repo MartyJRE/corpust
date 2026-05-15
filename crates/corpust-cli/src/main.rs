@@ -86,6 +86,27 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_LIMIT)]
         limit: usize,
     },
+    /// Annotation tooling (install language packs, …).
+    Annotate {
+        #[command(subcommand)]
+        sub: AnnotateCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum AnnotateCmd {
+    /// Download a TreeTagger parameter file from the upstream
+    /// Stuttgart server and drop it into the platform data
+    /// directory under `treetagger/lib/<lang>.par`.
+    InstallLang {
+        /// ISO 639-1 language code (`cs`, `de`, `fr`, `it`, `nl`,
+        /// `pl`, `pt`, `ru`, `sk`, `es`). Mapped internally to the
+        /// upstream language name.
+        code: String,
+        /// Force-overwrite an existing installed file.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -127,7 +148,80 @@ fn main() -> Result<()> {
             context,
             limit,
         } => run_kwic(index, &term, layer.into(), context, limit),
+        Command::Annotate { sub } => match sub {
+            AnnotateCmd::InstallLang { code, force } => run_install_lang(&code, force),
+        },
     }
+}
+
+/// ISO 639-1 → upstream TreeTagger language name. Covers the
+/// non-toy languages Stuttgart ships parameter files for. New entries
+/// can be added freely; if an unknown code shows up the command bails
+/// with a helpful message.
+fn iso_to_treetagger_language(code: &str) -> Option<&'static str> {
+    match code {
+        "cs" => Some("czech"),
+        "de" => Some("german"),
+        "en" => Some("english"),
+        "es" => Some("spanish"),
+        "fr" => Some("french"),
+        "it" => Some("italian"),
+        "nl" => Some("dutch"),
+        "pl" => Some("polish"),
+        "pt" => Some("portuguese"),
+        "ru" => Some("russian"),
+        "sk" => Some("slovak"),
+        _ => None,
+    }
+}
+
+fn run_install_lang(code: &str, force: bool) -> Result<()> {
+    let lang = iso_to_treetagger_language(code)
+        .with_context(|| format!("unsupported ISO 639-1 code: {code:?}"))?;
+    // Install under <data_root>/treetagger/lib/, mirroring the
+    // bundled layout so `from_bundle(<data_root>/treetagger, lang)`
+    // works once we wire that lookup. For now the file just lives in
+    // a stable place users can point `--tagger-bundle` at.
+    let data_root = corpust_io::paths::data_root()
+        .context("resolving data root")?;
+    let lib_dir = data_root.join("treetagger").join("lib");
+    std::fs::create_dir_all(&lib_dir)
+        .with_context(|| format!("creating {}", lib_dir.display()))?;
+    let par_path = lib_dir.join(format!("{lang}.par"));
+    if par_path.exists() && !force {
+        eprintln!(
+            "already installed: {} (use --force to overwrite)",
+            par_path.display()
+        );
+        return Ok(());
+    }
+    let url = format!(
+        "https://www.cis.uni-muenchen.de/~schmid/tools/TreeTagger/data/{lang}.par.gz"
+    );
+    eprintln!("downloading {url}");
+    let response = ureq::get(&url)
+        .call()
+        .with_context(|| format!("requesting {url}"))?;
+    let mut gz = response.into_reader();
+    let mut decoder = flate2::read::GzDecoder::new(&mut gz);
+    let tmp = par_path.with_extension("par.part");
+    let written = {
+        let mut out = std::fs::File::create(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        std::io::copy(&mut decoder, &mut out)
+            .with_context(|| format!("writing {}", tmp.display()))?
+    };
+    std::fs::rename(&tmp, &par_path)
+        .with_context(|| format!("moving {} into place", par_path.display()))?;
+    eprintln!(
+        "installed {lang} parameter file ({written} bytes) to {}",
+        par_path.display()
+    );
+    eprintln!(
+        "TreeTagger will pick it up when `--tagger-bundle {}` is passed.",
+        data_root.join("treetagger").display()
+    );
+    Ok(())
 }
 
 fn run_index(
