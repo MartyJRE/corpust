@@ -117,6 +117,14 @@ pub struct Trie {
     /// Leaf distributions in walk-order. Parallel to the sequence
     /// of leaves produced by a pre-order DFS from `root_index`.
     pub distributions: Vec<Distribution>,
+    /// Aggregate distribution per *interior* node, built from
+    /// descendant leaves. Indexed by entry idx; `None` for leaves.
+    /// Used as a fallback when an unknown word's suffix doesn't
+    /// reach an exact leaf. The aggregate is the weighted sum of
+    /// descendant-leaf distributions, weight = leaf's own probs sum
+    /// (which is < 1 for partial leaves, so this acts as a count
+    /// proxy), re-normalized so the aggregate is also partial.
+    pub interior_aggregate: Vec<Option<Distribution>>,
 }
 
 impl Trie {
@@ -138,32 +146,47 @@ impl Trie {
 
     /// For an unknown word, walk the trie (suffix trie: consume the
     /// word's trailing characters; prefix trie: consume the leading
-    /// characters) and return the distribution at the deepest leaf
-    /// reached. Returns `None` if the walk never hits a leaf — e.g.
-    /// the first char has no matching child, or the word is shorter
-    /// than the deepest path.
+    /// characters) and return the distribution at the deepest node
+    /// reached.
+    ///
+    /// If the walk lands on a **leaf**, returns the leaf's stored
+    /// distribution. If the walk stops at an **interior** node
+    /// (because no matching child exists for the next character),
+    /// returns the precomputed aggregate at that interior node —
+    /// effectively the "shorter-suffix" backoff. Returns `None`
+    /// only when the very first character has no matching child.
     ///
     /// `chars` is an iterator of the characters in the order they
     /// should be matched (last-to-first for suffix trie,
     /// first-to-last for prefix trie).
     pub fn lookup<I: IntoIterator<Item = char>>(&self, chars: I) -> Option<&Distribution> {
         let mut cur = self.root_index;
-        let mut best: Option<usize> = None;
+        let mut best: Option<&Distribution> = None;
         for ch in chars {
             let entry = &self.entries[cur];
             let kids = self.children(entry);
-            let found = kids
-                .iter()
-                .position(|e| e.as_char() == Some(ch));
-            let Some(pos) = found else { break };
+            let found = kids.iter().position(|e| e.as_char() == Some(ch));
+            let Some(pos) = found else {
+                // No more depth available — back off to current
+                // interior node's aggregate.
+                if let Some(d) = self.interior_aggregate.get(cur).and_then(|o| o.as_ref()) {
+                    best = Some(d);
+                }
+                break;
+            };
             let child_idx = entry.offset as usize + pos;
-            if let Some(d) = self.leaf_dist[child_idx] {
+            if let Some(d_idx) = self.leaf_dist[child_idx] {
+                best = self.distributions.get(d_idx);
+                break;
+            }
+            // Track interior aggregate as we descend, in case we run
+            // out of input characters before reaching a leaf.
+            if let Some(d) = self.interior_aggregate.get(child_idx).and_then(|o| o.as_ref()) {
                 best = Some(d);
-                break; // leaves have no children to descend into
             }
             cur = child_idx;
         }
-        best.and_then(|d| self.distributions.get(d))
+        best
     }
 }
 
@@ -490,11 +513,80 @@ fn build_trie(entries: Vec<TrieEntry>, distributions: Vec<Distribution>) -> Resu
         }
     }
 
+    // Post-order pass: compute aggregate distributions for interior
+    // nodes by summing the children's distributions (leaves) or
+    // child interiors' aggregates. Each entry contributes only its
+    // own probability mass — partial distributions accumulate to a
+    // bigger partial distribution at the parent.
+    let mut interior_aggregate: Vec<Option<Distribution>> = vec![None; entries.len()];
+    // Build child index list so we can recurse iteratively.
+    let mut order: Vec<usize> = Vec::with_capacity(entries.len());
+    let mut stack: Vec<(usize, bool)> = vec![(0, false)];
+    while let Some((idx, visited)) = stack.pop() {
+        if visited {
+            order.push(idx);
+            continue;
+        }
+        let e = &entries[idx];
+        if e.flag != 0 {
+            order.push(idx);
+            continue;
+        }
+        stack.push((idx, true));
+        let start = e.offset as usize;
+        let end = start + e.count as usize;
+        if end > entries.len() {
+            continue;
+        }
+        for c in start..end {
+            stack.push((c, false));
+        }
+    }
+    for idx in &order {
+        let e = &entries[*idx];
+        if e.flag != 0 {
+            continue;
+        }
+        let mut accum: std::collections::BTreeMap<u8, f32> = Default::default();
+        let start = e.offset as usize;
+        let end = start + e.count as usize;
+        if end > entries.len() {
+            continue;
+        }
+        for c in start..end {
+            let child = &entries[c];
+            let child_dist: Option<&Distribution> = if child.flag != 0 {
+                leaf_dist[c].and_then(|d| distributions.get(d))
+            } else {
+                interior_aggregate[c].as_ref()
+            };
+            if let Some(d) = child_dist {
+                for tp in &d.probs {
+                    *accum.entry(tp.tag_id).or_insert(0.0) += tp.prob;
+                }
+            }
+        }
+        if accum.is_empty() {
+            continue;
+        }
+        let total: f32 = accum.values().sum();
+        if total <= 0.0 {
+            continue;
+        }
+        let mut probs: Vec<TagProb> = accum
+            .into_iter()
+            .map(|(tag_id, prob)| TagProb { tag_id, prob: prob / total })
+            .collect();
+        probs.sort_by(|a, b| b.prob.partial_cmp(&a.prob).unwrap());
+        interior_aggregate[*idx] = Some(Distribution { probs });
+    }
+
     Ok(Trie {
         entries,
         root_index: 0,
         leaf_dist,
         distributions,
+        interior_aggregate,
     })
 }
 
