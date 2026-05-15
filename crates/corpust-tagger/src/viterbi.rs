@@ -103,6 +103,20 @@ pub fn tag_sequence(
     header: &Header,
     tag_prior: &[f64],
 ) -> Vec<Tagged> {
+    tag_sequence_with(cands_per_token, traversal, header, tag_prior, 0.01)
+}
+
+/// Like [`tag_sequence`] but with the relative-pruning threshold
+/// exposed. Callers can disable lexical pruning entirely by passing
+/// `0.0` (keep every candidate) or be more aggressive with a higher
+/// fraction (keep only candidates within `threshold × max_lex_prob`).
+pub fn tag_sequence_with(
+    cands_per_token: &[Vec<Cand>],
+    traversal: &Traversal,
+    header: &Header,
+    tag_prior: &[f64],
+    pruning_threshold: f64,
+) -> Vec<Tagged> {
     let n = cands_per_token.len();
     if n == 0 {
         return Vec::new();
@@ -126,11 +140,7 @@ pub fn tag_sequence(
 
     // Relative pruning: candidates with `lex_prob < threshold ×
     // max_lex_prob` are dropped before the dtree gets to vote.
-    // Threshold 0.75 protects words where one tag dominates
-    // ("King" → NP at 0.97 vs NN at 0.03) from the dtree's
-    // domain-general preferences without losing genuine
-    // ambiguities (saved/looked at ~0.3/0.7 lex split).
-    let pruning_threshold = 0.75_f64;
+    // Passed in by the caller; see `tag_sequence` for the default.
     let mut ctx_buf: Vec<u32> = Vec::with_capacity(2);
     for i in 0..n {
         let cands = &cands_per_token[i];

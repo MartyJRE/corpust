@@ -57,6 +57,11 @@ pub struct Tagger {
     tokenizer: tokenize::Tokenizer,
     language: &'static str,
     id: String,
+    /// Viterbi's relative-pruning threshold. Candidates whose
+    /// `lex_prob` is below `threshold × max_lex_prob` for a given
+    /// token are dropped before the dtree weighs in. `0.0` disables
+    /// pruning entirely; higher values trust the lexicon more.
+    pruning_threshold: f64,
 }
 
 impl Tagger {
@@ -80,6 +85,7 @@ impl Tagger {
             tokenizer: tokenize::Tokenizer::new(abbreviations),
             language,
             id: format!("treetagger-rs-{language}"),
+            pruning_threshold: 0.01,
         })
     }
 
@@ -97,6 +103,12 @@ impl Tagger {
         if let Some(tr) = self.dtree.as_mut() {
             tr.lambda_bigram = lambda;
         }
+    }
+
+    /// Override the Viterbi pruning threshold; `0.0` disables
+    /// pruning entirely, `1.0` keeps only the top-lex candidate(s).
+    pub fn set_pruning_threshold(&mut self, threshold: f64) {
+        self.pruning_threshold = threshold;
     }
 
     /// Build the candidate list for one token: lexicon entries when
@@ -301,7 +313,13 @@ impl Annotator for Tagger {
                     .as_ref()
                     .map(|t| normalize_prior(&t.tag_prelude))
                     .unwrap_or_default();
-                viterbi::tag_sequence(&cands, traversal, &self.model.header, &tag_prior)
+                viterbi::tag_sequence_with(
+                    &cands,
+                    traversal,
+                    &self.model.header,
+                    &tag_prior,
+                    self.pruning_threshold,
+                )
             }
             None => cands
                 .iter()
@@ -963,6 +981,147 @@ mod tests {
             let m = r_ours.mismatches.iter().find(|m| m.position as usize == pos);
             if let Some(m) = m {
                 eprintln!("  pos {}: word={:?} ours={:?} oracle={:?}", pos, m.oracle_word, m.subject_pos, m.oracle_pos);
+            }
+        }
+    }
+
+    /// Sweep Viterbi's relative-pruning threshold over the 10 KB
+    /// Gutenberg sample, printing pos_acc for each value. Ignored.
+    #[test]
+    #[ignore]
+    fn sweep_pruning_threshold_on_gutenberg() {
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap();
+        let text_path = repo.join("testdata/gutenberg/1251.txt");
+        if !text_path.exists() { return }
+        let full = std::fs::read_to_string(&text_path).unwrap();
+        let sample: String = full.chars().take(10_000).collect();
+        let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
+        let mut subject = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        let thresholds = [0.0, 0.001, 0.005, 0.01, 0.05, 0.10, 0.25, 0.75];
+        for &t in &thresholds {
+            subject.set_pruning_threshold(t);
+            let r = testkit::diff(&oracle, &subject, &sample).unwrap();
+            eprintln!(
+                "prune={t:.3}  POS-err={}  pos_acc={:.4}",
+                r.pos_errors(),
+                r.pos_accuracy()
+            );
+        }
+    }
+
+    /// Dump every per-token disagreement against the oracle on the
+    /// 10 KB Gutenberg sample, with enough context to categorize.
+    /// Per error: word, our tag, oracle tag, whether the word is in
+    /// our lexicon, our top lexical candidates, and the few preceding
+    /// tokens. Categorizes by (in-lexicon? / our-pick-was-a-candidate?)
+    /// so the dominant failure mode pops out.
+    ///
+    /// Ignored by default. Useful for end-to-end parity archaeology
+    /// once the dtree side is bit-identical (see `diff_bigram_tree_vs_oracle`).
+    #[test]
+    #[ignore]
+    fn categorize_residual_errors_on_gutenberg() {
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap();
+        let text_path = repo.join("testdata/gutenberg/1251.txt");
+        if !text_path.exists() { return }
+        let sample: String = std::fs::read_to_string(&text_path).unwrap()
+            .chars().take(10_000).collect();
+
+        let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
+        let ours = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        let report = testkit::diff(&oracle, &ours, &sample).unwrap();
+        eprintln!(
+            "ours: {} POS-err / {} ({:.4})",
+            report.pos_errors(),
+            report.oracle_tokens,
+            report.pos_accuracy()
+        );
+
+        // For each POS mismatch, look up the word in our lexicon and
+        // assemble candidate info.
+        let mut by_category: std::collections::HashMap<&str, Vec<&testkit::Mismatch>> =
+            Default::default();
+        for m in &report.mismatches {
+            if m.kind != testkit::MismatchKind::Pos {
+                continue;
+            }
+            let word = &m.oracle_word;
+            let in_lex = ours.model().lexicon.lookup(word).is_some();
+            let our_pos = m.subject_pos.as_deref().unwrap_or("?");
+            let oracle_pos = m.oracle_pos.as_deref().unwrap_or("?");
+            let category = if !in_lex {
+                "unknown-word"
+            } else {
+                let entry = ours.model().lexicon.lookup(word).unwrap();
+                let cand_tags: Vec<&str> = entry
+                    .candidates
+                    .iter()
+                    .filter_map(|c| ours.model().header.tag(c.tag_id))
+                    .collect();
+                let our_in_cands = cand_tags.iter().any(|t| *t == our_pos);
+                let oracle_in_cands = cand_tags.iter().any(|t| *t == oracle_pos);
+                match (our_in_cands, oracle_in_cands) {
+                    (true, true) => "both-in-lex",
+                    (true, false) => "we-picked-from-lex_oracle-didnt",
+                    (false, true) => "we-picked-outside-lex",
+                    (false, false) => "neither-in-lex",
+                }
+            };
+            by_category.entry(category).or_default().push(m);
+        }
+
+        eprintln!("\nresidual POS errors by category:");
+        let mut cats: Vec<_> = by_category.iter().collect();
+        cats.sort_by_key(|(_, ms)| std::cmp::Reverse(ms.len()));
+        for (cat, ms) in &cats {
+            eprintln!("  {cat}: {} errors", ms.len());
+        }
+
+        eprintln!("\nfirst 15 per category:");
+        for (cat, ms) in &cats {
+            eprintln!("--- {cat} ---");
+            for m in ms.iter().take(15) {
+                let word = &m.oracle_word;
+                let lex_summary = match ours.model().lexicon.lookup(word) {
+                    Some(entry) => {
+                        let mut cands: Vec<(String, f32)> = entry
+                            .candidates
+                            .iter()
+                            .map(|c| {
+                                (
+                                    ours.model()
+                                        .header
+                                        .tag(c.tag_id)
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_default(),
+                                    c.prob,
+                                )
+                            })
+                            .collect();
+                        cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                        cands
+                            .iter()
+                            .take(4)
+                            .map(|(t, p)| format!("{t}={p:.3}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    }
+                    None => "(not in lex)".to_string(),
+                };
+                eprintln!(
+                    "  pos={:>4} {:<18} ours={:>4} oracle={:>4}  lex=[{}]",
+                    m.position,
+                    format!("\"{}\"", word),
+                    m.subject_pos.as_deref().unwrap_or("?"),
+                    m.oracle_pos.as_deref().unwrap_or("?"),
+                    lex_summary
+                );
             }
         }
     }
