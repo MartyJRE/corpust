@@ -96,3 +96,81 @@ fn install_lang_rejects_unknown_code() {
         .failure()
         .stderr(contains("zz"));
 }
+
+#[test]
+fn index_without_name_falls_back_to_input_basename() {
+    let data_root = tempdir().unwrap();
+    let work = tempdir().unwrap();
+    let input = work.path().join("my-folder");
+    fs::create_dir(&input).unwrap();
+    fs::write(input.join("a.txt"), "hello world\n").unwrap();
+
+    // No --out, no --name: slug should derive from "my-folder" and
+    // land under CORPUST_DATA_ROOT/corpora/my-folder/.
+    corpust()
+        .env("CORPUST_DATA_ROOT", data_root.path())
+        .args(["index"])
+        .arg(&input)
+        .assert()
+        .success()
+        .stdout(contains("indexed 1 doc"));
+
+    let landed = data_root.path().join("corpora/my-folder/index");
+    assert!(landed.exists(), "expected {landed:?} to exist");
+    let meta = data_root.path().join("corpora/my-folder/metadata.json");
+    assert!(meta.exists(), "expected {meta:?} to exist");
+}
+
+#[test]
+fn index_with_annotate_writes_lemma_and_pos() {
+    let work = tempdir().unwrap();
+    let input = work.path().join("docs");
+    fs::create_dir(&input).unwrap();
+    fs::write(input.join("a.txt"), "The cat sat on the mat.\n").unwrap();
+    let out = work.path().join("idx");
+
+    // resources/treetagger lives at the workspace root; tests run from
+    // the crate dir, so step two parents up to find it.
+    let bundle = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("resources/treetagger");
+    if !bundle.exists() {
+        // Bundle not vendored in this checkout — skip.
+        return;
+    }
+
+    corpust()
+        .args(["index"])
+        .arg(&input)
+        .args(["--name", "annotated"])
+        .args(["--out"])
+        .arg(&out)
+        .args(["--annotate"])
+        .args(["--tagger-bundle"])
+        .arg(&bundle)
+        .assert()
+        .success()
+        .stdout(contains("annotation enabled"))
+        .stdout(contains("indexed 1 doc"));
+
+    // KWIC by lemma and POS — both go through the LayerArg conversion
+    // arms that were uncovered.
+    corpust()
+        .args(["kwic", "--index"])
+        .arg(&out)
+        .arg("sit")
+        .args(["--layer", "lemma"])
+        .assert()
+        .success();
+
+    corpust()
+        .args(["kwic", "--index"])
+        .arg(&out)
+        .arg("NN")
+        .args(["--layer", "pos"])
+        .assert()
+        .success();
+}
