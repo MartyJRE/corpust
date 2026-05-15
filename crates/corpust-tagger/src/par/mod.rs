@@ -79,7 +79,7 @@ fn try_read_english_tries(
     header: &header::Header,
 ) -> Option<tries::Tries> {
     const ENGLISH_TRIES_START: usize = 0xcf9cc3;
-    const ENGLISH_DTREE_START: usize = 0xd231bb;
+    const ENGLISH_DTREE_START: usize = 0xd231a3;
     if header.tags.len() != 58 || bytes.len() <= ENGLISH_DTREE_START {
         return None;
     }
@@ -90,14 +90,14 @@ fn try_read_english_tries(
 
 /// Best-effort dtree load for the bundled `english.par`. Returns
 /// `None` if the file isn't the exact shape we've reverse-engineered
-/// so far (58 tags, dtree at `0xd231bb`), or if the walker rejects
+/// so far (58 tags, dtree at `0xd231a3`), or if the walker rejects
 /// some bytes — the header + lexicon are still useful in that case,
 /// so we don't propagate the error.
 fn try_read_english_dtree(
     bytes: &[u8],
     header: &header::Header,
 ) -> Option<dtree::DecisionTree> {
-    const ENGLISH_DTREE_START: usize = 0xd231bb;
+    const ENGLISH_DTREE_START: usize = 0xd231a3;
     if header.tags.len() != 58 || bytes.len() <= ENGLISH_DTREE_START {
         return None;
     }

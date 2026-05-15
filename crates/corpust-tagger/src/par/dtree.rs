@@ -1228,21 +1228,27 @@ mod tests {
         assert_eq!(traversal.predict(&[]).weight, 300);
     }
 
-    /// English.par reconstructs as a forest of 3 trees: a single
-    /// prior leaf, a 63-node unigram switch chain, and the 1501-node
-    /// bigram tree (which terminates in the trailing Default). The
-    /// math is forced — strict binary forest, so
-    /// `#trees = #leaves - #internals = 784 - 781 = 3`. The
-    /// `predict_combined` ensemble logic relies on this exact shape
-    /// at `roots[0..3]`.
+    /// English.par reconstructs as a **single** tree rooted at the
+    /// `t_-1 == NP` test. Confirmed via lldb-traced `read_subtree`
+    /// invocations of the bundled `tree-tagger` binary: first call
+    /// at file-offset 0xd231a7 (just after the 4-byte
+    /// `context_size = 2` header at 0xd231a3), then recursive
+    /// descent through all 1567 records.
+    ///
+    /// Earlier drafts of the offset (`0xd231bb`) skipped past the
+    /// first two internal predicates, producing what looked like a
+    /// 3-tree forest of (single-leaf, 63-node switch, 1501-node
+    /// bigram). With the correct offset, the same records form one
+    /// tree whose root tests `t_-1 == NP` — matching the oracle's
+    /// `tag[-1] = NP` first-chain entry in `-print-prob-tree`.
     #[test]
-    fn reconstructs_english_as_three_trees() {
+    fn reconstructs_english_as_single_tree() {
         let Some(par) = english_par_path() else {
             return;
         };
         let bytes = std::fs::read(&par).unwrap();
         let mut cur = Cursor::new(&bytes);
-        cur.advance(0xd231bb).unwrap();
+        cur.advance(0xd231a3).unwrap();
         let header = Header {
             field_a: 0,
             field_b: 0,
@@ -1251,16 +1257,18 @@ mod tests {
             end_offset: 0,
         };
         let tree = read(&mut cur, &header).unwrap();
+        assert_eq!(tree.context_size, 2, "english.par cl should be 2");
         let forest = tree.reconstruct().unwrap();
-        assert_eq!(forest.roots.len(), 3, "english.par should be a 3-tree forest");
-        let n0 = subtree_size(&forest.nodes, forest.roots[0]);
-        let n1 = subtree_size(&forest.nodes, forest.roots[1]);
-        let n2 = subtree_size(&forest.nodes, forest.roots[2]);
-        eprintln!("english.par forest: tree[0]={n0}, tree[1]={n1}, tree[2]={n2}");
-        assert_eq!(n0, 1, "first tree should be a single prior Leaf");
-        assert_eq!(n1, 63, "second tree should be the 63-node switch chain");
-        assert_eq!(n2, 1501, "third tree should be the 1501-node bigram tree");
-        assert_eq!(n0 + n1 + n2, 1565);
+        assert_eq!(forest.roots.len(), 1, "english.par should be a single tree");
+        let total = subtree_size(&forest.nodes, forest.roots[0]);
+        eprintln!("english.par tree: {total} nodes");
+        match &forest.nodes[forest.roots[0]] {
+            TreeNode::Internal { predicate, .. } => {
+                assert_eq!(predicate.back_pos_i, 1, "root should test t_-1");
+                assert_eq!(predicate.test_tag_id, 21, "root should test for NP (id=21)");
+            }
+            _ => panic!("root should be an Internal"),
+        }
     }
 
     fn subtree_size(nodes: &[TreeNode], root: usize) -> usize {
@@ -1281,7 +1289,7 @@ mod tests {
             return;
         };
         let bytes = std::fs::read(&par).unwrap();
-        let tree_start = 0xd231bb;
+        let tree_start = 0xd231a3;
         let mut cur = Cursor::new(&bytes);
         cur.advance(tree_start).unwrap();
         let header = Header {

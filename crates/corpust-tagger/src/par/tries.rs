@@ -475,7 +475,7 @@ mod tests {
         };
         let bytes = std::fs::read(&par).unwrap();
         const SLAB_START: usize = 0xcf9cc3;
-        const DTREE_START: usize = 0xd231bb;
+        const DTREE_START: usize = 0xd231a3;
 
         // Need the real header so _header: &Header is available. Just
         // parse it in-place from file-start to keep the test self-

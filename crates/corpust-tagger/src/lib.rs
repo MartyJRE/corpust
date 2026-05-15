@@ -663,11 +663,82 @@ mod tests {
         }
     }
 
-    /// Per-context diff: for every `(tag_-1, tag_-2)` in
-    /// `/tmp/print-prob-tree.txt`, look up the oracle distribution
-    /// and traverse our bigram tree on the same context, then report
-    /// disagreement statistics. Localizes whether the bigram tree is
-    /// parsed correctly. Ignored by default.
+    /// Walk the tree like `traverse_tree`, but record every
+    /// predicate along the path: which back-position was tested,
+    /// what tag value was checked, what the observed context tag
+    /// actually was, and whether the predicate evaluated true.
+    /// Returns a human-readable summary ending with the leaf's
+    /// argmax. Kept around as a diagnostic helper; not currently
+    /// called by any test.
+    #[allow(dead_code)]
+    fn trace_traversal(
+        forest: &par::dtree::TreeForest,
+        root_idx: usize,
+        context: &[u32],
+        model: &par::Model,
+    ) -> String {
+        let tag_name = |t: u32| {
+            model
+                .header
+                .tags
+                .get(t as usize)
+                .map(String::as_str)
+                .unwrap_or("?")
+                .to_string()
+        };
+        let mut idx = root_idx;
+        let mut steps: Vec<String> = Vec::new();
+        loop {
+            match &forest.nodes[idx] {
+                par::dtree::TreeNode::Leaf { distribution, .. } => {
+                    let argmax = distribution
+                        .probs
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.prob.partial_cmp(&b.prob).unwrap())
+                        .map(|(i, _)| i as u32)
+                        .unwrap_or(0);
+                    steps.push(format!(
+                        "→ leaf[w={},argmax={}]",
+                        distribution.weight,
+                        tag_name(argmax)
+                    ));
+                    return steps.join(" ");
+                }
+                par::dtree::TreeNode::Internal { predicate, yes, no, .. } => {
+                    let back = predicate.back_pos_i as usize;
+                    let observed = context.get(back).copied();
+                    let hit = observed == Some(predicate.test_tag_id);
+                    steps.push(format!(
+                        "ctx[{}]={} ==? {} → {}",
+                        back,
+                        observed.map(tag_name).unwrap_or_else(|| "OOB".to_string()),
+                        tag_name(predicate.test_tag_id),
+                        if hit { "Y" } else { "N" }
+                    ));
+                    idx = if hit { *yes } else { *no };
+                }
+            }
+        }
+    }
+
+    /// Bit-identical parity check between our parsed bigram tree
+    /// and the oracle binary's per-context distribution dump (from
+    /// `tree-tagger -print-prob-tree english.par`). For every
+    /// `(t_-1, t_-2)` context the oracle emits, our `traverse_tree`
+    /// at the inference root must produce the same argmax and
+    /// near-identical probabilities.
+    ///
+    /// This nails down the end-to-end dtree layout: section offset
+    /// (0xd231a3 — discovered via lldb tracing of `read_subtree`,
+    /// see #13), 4-byte `Context_Size` header, internal predicate
+    /// direction (`context[back_pos_i] == test_tag_id` with `0=t_-2`,
+    /// `1=t_-1`), yes-first child order, and 12-byte distribution
+    /// entries summing to ~1.0.
+    ///
+    /// Ignored by default — needs `/tmp/print-prob-tree.txt`:
+    ///
+    ///     tree-tagger -print-prob-tree english.par > /tmp/print-prob-tree.txt
     #[test]
     #[ignore]
     fn diff_bigram_tree_vs_oracle() {
@@ -725,59 +796,18 @@ mod tests {
             }
         }
         flush(cur_t1, cur_t2, &cur_probs, &mut oracle_table);
-        eprintln!("oracle contexts: {}", oracle_table.len());
 
-        // Build our traversal and walk the inference tree (last root,
-        // i.e. the bigram tree on english.par's 3-tree forest).
+        // Walk our reconstructed tree's inference root.
         let dt = model.dtree.as_ref().expect("model has no dtree");
         let traversal = dt.traversal().unwrap();
-        let bigram_root = *traversal.forest.roots.last().unwrap();
-
-        // Try BOTH context orderings — if one matches the oracle far
-        // better than the other, the convention is inverted somewhere.
-        // ctx_ab: [t2, t1] (current code; "oldest first")
-        // ctx_ba: [t1, t2] (reversed; "newest first")
-        let try_orders = [("ctx=[t2,t1]", true), ("ctx=[t1,t2]", false)];
-        for &(label, oldest_first) in &try_orders {
-            let mut argmax_disagree_local = 0usize;
-            let mut total_local = 0usize;
-            for (&(t1, t2), oracle_probs) in &oracle_table {
-                total_local += 1;
-                let ctx = if oldest_first { [t2, t1] } else { [t1, t2] };
-                let ours = par::dtree::traverse_tree(&traversal.forest, bigram_root, &ctx);
-                let our_argmax = ours
-                    .probs
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.prob.partial_cmp(&b.prob).unwrap())
-                    .map(|(i, _)| i as u32)
-                    .unwrap();
-                let oracle_argmax = oracle_probs
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                    .map(|(i, _)| i as u32)
-                    .unwrap();
-                if our_argmax != oracle_argmax {
-                    argmax_disagree_local += 1;
-                }
-            }
-            eprintln!(
-                "{label}: argmax disagrees on {argmax_disagree_local}/{total_local}",
-            );
-        }
+        let inference_root = traversal.root;
 
         let mut argmax_disagree = 0usize;
-        let mut total = 0usize;
         let mut max_abs = 0.0f64;
-        let mut sum_kl_ours_to_oracle = 0.0f64;
-        let mut samples: Vec<(u32, u32, f64, u32, u32)> = Vec::new();
+        let mut sum_kl = 0.0f64;
         for (&(t1, t2), oracle_probs) in &oracle_table {
-            total += 1;
-            // Context is [tag_-2, tag_-1] — oldest first per the
-            // back_pos_i convention.
             let ctx = [t2, t1];
-            let ours = par::dtree::traverse_tree(&traversal.forest, bigram_root, &ctx);
+            let ours = par::dtree::traverse_tree(&traversal.forest, inference_root, &ctx);
             let mut abs_per_ctx: f64 = 0.0;
             let mut kl = 0.0f64;
             for k in 0..n_tags {
@@ -792,43 +822,148 @@ mod tests {
                 }
             }
             max_abs = max_abs.max(abs_per_ctx);
-            sum_kl_ours_to_oracle += kl.max(0.0);
+            sum_kl += kl.max(0.0);
 
-            let our_argmax = ours
-                .probs
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.prob.partial_cmp(&b.prob).unwrap())
-                .map(|(i, _)| i as u32)
-                .unwrap();
-            let oracle_argmax = oracle_probs
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(i, _)| i as u32)
-                .unwrap();
-            if our_argmax != oracle_argmax {
+            let argmax = |probs: &[f64]| {
+                probs.iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .map(|(i, _)| i as u32)
+                    .unwrap()
+            };
+            let our_probs: Vec<f64> = ours.probs.iter().map(|tp| tp.prob).collect();
+            if argmax(&our_probs) != argmax(oracle_probs) {
                 argmax_disagree += 1;
-                samples.push((t1, t2, abs_per_ctx, our_argmax, oracle_argmax));
             }
         }
-        samples.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
         eprintln!(
-            "compared {total} contexts: argmax disagrees on {argmax_disagree}, \
-             max abs-diff = {max_abs:.4}, mean KL(oracle||ours) = {:.4}",
-            sum_kl_ours_to_oracle / total as f64,
+            "compared {} contexts: argmax disagrees on {}, max abs-diff={:.6}, mean KL={:.6}",
+            oracle_table.len(),
+            argmax_disagree,
+            max_abs,
+            sum_kl / oracle_table.len() as f64,
         );
-        eprintln!("top 10 worst contexts:");
-        let tag_name = |t: u32| model.header.tags.get(t as usize).map(String::as_str).unwrap_or("?");
-        for &(t1, t2, d, ours, oracle) in samples.iter().take(10) {
-            eprintln!(
-                "  t_-1={}, t_-2={}: max-abs={:.4} | ours→{} vs oracle→{}",
-                tag_name(t1),
-                tag_name(t2),
-                d,
-                tag_name(ours),
-                tag_name(oracle),
-            );
+        assert_eq!(
+            argmax_disagree, 0,
+            "expected bit-identical parity with oracle's per-context distributions; \
+             a drift here means the dtree byte layout or traversal has changed"
+        );
+        assert!(
+            max_abs < 1e-5,
+            "per-context probability disagreement exceeds 1e-5 (max_abs={max_abs:e})"
+        );
+        let _ = tag_to_id; // keep symbol live for future diagnostics
+    }
+
+    /// Compare per-token tagging output of our pipeline against the
+    /// oracle-override pipeline. Find the tokens our pipeline gets
+    /// wrong but the override gets right — those are the errors
+    /// caused specifically by our tree disagreeing with oracle on
+    /// the (t_-1, t_-2) → distribution mapping. Ignored.
+    #[test]
+    #[ignore]
+    fn errors_we_lose_to_oracle_override() {
+        use std::collections::HashMap;
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let dump_path = "/tmp/print-prob-tree.txt";
+        if !Path::new(dump_path).exists() {
+            return;
+        }
+        let raw = std::fs::read_to_string(dump_path).unwrap();
+        let model = par::load(&par).unwrap();
+        let n_tags = model.header.tags.len();
+        let tag_to_id: HashMap<String, u32> = model
+            .header
+            .tags
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i as u32))
+            .collect();
+        let mut table: HashMap<(u32, u32), par::dtree::Distribution> = HashMap::new();
+        let mut cur_t1: Option<u32> = None;
+        let mut cur_t2: Option<u32> = None;
+        let mut cur_probs: Vec<f64> = vec![0.0; n_tags];
+        let mut cur_idx = 0usize;
+        let flush =
+            |t1: Option<u32>, t2: Option<u32>, probs: &[f64], tbl: &mut HashMap<(u32, u32), par::dtree::Distribution>| {
+                if let (Some(t1), Some(t2)) = (t1, t2) {
+                    tbl.insert(
+                        (t1, t2),
+                        par::dtree::Distribution {
+                            weight: 0,
+                            probs: probs
+                                .iter()
+                                .enumerate()
+                                .map(|(i, p)| par::dtree::TagProb {
+                                    tag_id: i as u32,
+                                    prob: *p,
+                                })
+                                .collect(),
+                        },
+                    );
+                }
+            };
+        for line in raw.lines() {
+            if let Some(rest) = line.strip_prefix("tag[-1] = ") {
+                flush(cur_t1, cur_t2, &cur_probs, &mut table);
+                cur_t1 = tag_to_id.get(rest.trim()).copied();
+                cur_t2 = None;
+            } else if let Some(rest) = line.strip_prefix("\ttag[-2] = ") {
+                flush(cur_t1, cur_t2, &cur_probs, &mut table);
+                cur_t2 = tag_to_id.get(rest.trim()).copied();
+                cur_probs = vec![0.0; n_tags];
+                cur_idx = 0;
+            } else if line.starts_with("\t\t") && cur_t1.is_some() && cur_t2.is_some() {
+                let trimmed = line.trim();
+                if let Some((_tag, prob_str)) = trimmed.rsplit_once(' ') {
+                    let p: f64 = prob_str.parse().unwrap_or(0.0);
+                    if cur_idx < n_tags {
+                        cur_probs[cur_idx] = p;
+                        cur_idx += 1;
+                    }
+                }
+            }
+        }
+        flush(cur_t1, cur_t2, &cur_probs, &mut table);
+
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap();
+        let text_path = repo.join("testdata/gutenberg/1251.txt");
+        if !text_path.exists() { return }
+        let sample: String = std::fs::read_to_string(&text_path).unwrap()
+            .chars().take(10_000).collect();
+
+        let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
+        let ours = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        let mut with_table = Tagger::load(&par, "english", english_abbreviations()).unwrap();
+        if let Some(t) = with_table.dtree.as_mut() {
+            t.override_table = Some(table);
+        }
+
+        let r_ours = testkit::diff(&oracle, &ours, &sample).unwrap();
+        let r_table = testkit::diff(&oracle, &with_table, &sample).unwrap();
+        eprintln!("ours: {} POS-err / 2032 ({:.4})", r_ours.pos_errors(), r_ours.pos_accuracy());
+        eprintln!("table: {} POS-err / 2032 ({:.4})", r_table.pos_errors(), r_table.pos_accuracy());
+
+        // The mismatches list (token, our_pos, oracle_pos, prev_ctx)
+        // tells us exactly which contexts our tree gets wrong.
+        // Find tokens where ours is wrong but table is right.
+        let mut errs_ours: std::collections::HashSet<usize> = Default::default();
+        for m in &r_ours.mismatches {
+            errs_ours.insert(m.position as usize);
+        }
+        let mut errs_table: std::collections::HashSet<usize> = Default::default();
+        for m in &r_table.mismatches {
+            errs_table.insert(m.position as usize);
+        }
+        let we_lose: Vec<_> = errs_ours.difference(&errs_table).collect();
+        eprintln!("tokens we lose specifically vs override: {}", we_lose.len());
+        for &&pos in we_lose.iter().take(20) {
+            let m = r_ours.mismatches.iter().find(|m| m.position as usize == pos);
+            if let Some(m) = m {
+                eprintln!("  pos {}: word={:?} ours={:?} oracle={:?}", pos, m.oracle_word, m.subject_pos, m.oracle_pos);
+            }
         }
     }
 
