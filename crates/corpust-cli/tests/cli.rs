@@ -58,10 +58,7 @@ fn index_then_kwic_word_layer() {
         .stdout(contains("indexed 2 doc"));
 
     // metadata sidecar should sit next to the index, not inside it.
-    let meta_path = out
-        .parent()
-        .unwrap()
-        .join("metadata.json");
+    let meta_path = out.parent().unwrap().join("metadata.json");
     assert!(
         meta_path.exists(),
         "expected metadata.json at {meta_path:?}"

@@ -1819,4 +1819,157 @@ mod tests {
             "at least some tokens should match exactly"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Targeted fast tests for the public/private surface. These do not
+    // need the TreeTagger oracle subprocess and only depend on the
+    // bundled `resources/treetagger/lib/english.par`.
+    // -----------------------------------------------------------------
+
+    fn english_tagger() -> Option<Tagger> {
+        let bundle = bundle_path()?;
+        let par = bundle.join("lib/english.par");
+        Tagger::load(&par, "english", english_abbreviations()).ok()
+    }
+
+    #[test]
+    fn annotator_metadata_is_consistent() {
+        let Some(tagger) = english_tagger() else {
+            return;
+        };
+        assert_eq!(tagger.supported_languages(), &["english"]);
+        assert_eq!(tagger.id(), "treetagger-rs-english");
+    }
+
+    #[test]
+    fn annotate_byte_offsets_are_within_source() {
+        let Some(tagger) = english_tagger() else {
+            return;
+        };
+        let text = "The quick brown fox.";
+        let toks = tagger.annotate(text).unwrap();
+        assert!(!toks.is_empty());
+        for t in &toks {
+            assert!(t.byte_start <= t.byte_end, "{t:?}");
+            assert!(t.byte_end <= text.len(), "{t:?} overruns input");
+        }
+        let positions: Vec<_> = toks.iter().map(|t| t.position).collect();
+        let mut sorted = positions.clone();
+        sorted.sort();
+        assert_eq!(positions, sorted, "positions must increase monotonically");
+    }
+
+    #[test]
+    fn setters_take_effect() {
+        let Some(mut tagger) = english_tagger() else {
+            return;
+        };
+        tagger.set_lambda_bigram(0.25);
+        tagger.set_pruning_threshold(0.5);
+        tagger.set_np_boost(0.6);
+        assert_eq!(tagger.pruning_threshold, 0.5);
+        assert_eq!(tagger.np_boost, 0.6);
+        if let Some(tr) = tagger.dtree.as_ref() {
+            assert!((tr.lambda_bigram - 0.25).abs() < 1e-9);
+        }
+        // Should still tag without panicking.
+        let _ = tagger.annotate("The cat sat.").unwrap();
+    }
+
+    #[test]
+    fn unknown_word_pure_digits_tag_as_cd() {
+        let Some(tagger) = english_tagger() else {
+            return;
+        };
+        let cd = tagger.tag_id_by_name("CD").map(u32::from).unwrap();
+        let cands = tagger.unknown_word_candidates("123456789");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].tag_id, cd);
+    }
+
+    #[test]
+    fn unknown_word_ordinal_suffix_tags_as_jj() {
+        let Some(tagger) = english_tagger() else {
+            return;
+        };
+        let jj = tagger.tag_id_by_name("JJ").map(u32::from).unwrap();
+        let cands = tagger.unknown_word_candidates("39th");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].tag_id, jj);
+    }
+
+    #[test]
+    fn unknown_word_roman_numeral_tags_as_np() {
+        let Some(tagger) = english_tagger() else {
+            return;
+        };
+        let np = tagger.tag_id_by_name("NP").map(u32::from).unwrap();
+        let cands = tagger.unknown_word_candidates("XLIV");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].tag_id, np);
+    }
+
+    #[test]
+    fn unknown_word_capitalized_proper_noun_gets_np_boost() {
+        let Some(tagger) = english_tagger() else {
+            return;
+        };
+        let np = tagger.tag_id_by_name("NP").map(u32::from).unwrap();
+        // Pick an invented capitalized word whose lowercase is also
+        // missing from the lexicon, so the NP-boost path fires instead
+        // of the lowercase-fallback path. The exact word doesn't
+        // matter — we just need to assert the NP candidate appears
+        // and that np_boost dominates the suffix-trie mass.
+        let mut probe = None;
+        for w in ["Zorglax", "Plumblort", "Xqztron", "Vrelltik"] {
+            let lc: String = w.chars().flat_map(|c| c.to_lowercase()).collect();
+            let in_lex = tagger
+                .model
+                .lexicon
+                .lookup(&lc)
+                .is_some_and(|e| !e.candidates.is_empty());
+            if !in_lex {
+                probe = Some(w);
+                break;
+            }
+        }
+        let probe = probe.expect("at least one invented word should miss the lexicon");
+        let cands = tagger.unknown_word_candidates(probe);
+        let np_cand = cands.iter().find(|c| c.tag_id == np);
+        assert!(np_cand.is_some(), "no NP candidate produced for {probe:?}");
+        let top = cands
+            .iter()
+            .max_by(|a, b| a.lex_prob.partial_cmp(&b.lex_prob).unwrap())
+            .unwrap();
+        assert_eq!(top.tag_id, np, "NP should win after boost for {probe:?}");
+    }
+
+    #[test]
+    fn unknown_word_all_caps_falls_back_to_lowercase_lexicon() {
+        let Some(tagger) = english_tagger() else {
+            return;
+        };
+        // "BOOK" isn't in the lexicon as-is; lowercasing to "book"
+        // should hit the lexicon path. The returned set should not be
+        // an NP-only fallback — there should be at least one non-NP
+        // common-class candidate.
+        let np = tagger.tag_id_by_name("NP").map(u32::from).unwrap();
+        let cands = tagger.unknown_word_candidates("BOOK");
+        assert!(!cands.is_empty());
+        assert!(
+            cands.iter().any(|c| c.tag_id != np),
+            "expected at least one non-NP candidate for BOOK"
+        );
+    }
+
+    #[test]
+    fn normalize_prior_handles_empty_and_zero_sum() {
+        assert!(normalize_prior(&[]).is_empty());
+        assert!(normalize_prior(&[0.0, 0.0, 0.0]).is_empty());
+        let p = normalize_prior(&[1.0, 1.0, 2.0]);
+        assert_eq!(p.len(), 3);
+        let sum: f64 = p.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9);
+        assert!((p[2] - 0.5).abs() < 1e-9);
+    }
 }
