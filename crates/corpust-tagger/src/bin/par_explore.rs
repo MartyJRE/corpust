@@ -115,7 +115,10 @@ fn dump_header(bytes: &[u8]) -> Result<()> {
         println!("  [{i:>3}] {tag}");
     }
     println!();
-    println!("section ends at offset {} (0x{:x})", header.end_offset, header.end_offset);
+    println!(
+        "section ends at offset {} (0x{:x})",
+        header.end_offset, header.end_offset
+    );
     println!("file size = {} bytes", bytes.len());
     Ok(())
 }
@@ -134,7 +137,11 @@ fn dump_hex(bytes: &[u8], from: usize, len: usize) -> Result<()> {
         }
         line.push_str(" |");
         for b in chunk {
-            line.push(if (0x20..0x7f).contains(b) { *b as char } else { '.' });
+            line.push(if (0x20..0x7f).contains(b) {
+                *b as char
+            } else {
+                '.'
+            });
         }
         line.push('|');
         println!("{line}");
@@ -172,9 +179,7 @@ fn dump_u32s(bytes: &[u8], from: usize, count: usize) -> Result<()> {
         }
         let v = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
         let vi = v as i32;
-        println!(
-            "0x{off:08x}  u32 LE = {v:>12}  (i32 = {vi:>12}, hex = 0x{v:08x})"
-        );
+        println!("0x{off:08x}  u32 LE = {v:>12}  (i32 = {vi:>12}, hex = 0x{v:08x})");
     }
     Ok(())
 }
@@ -200,7 +205,10 @@ fn dump_dtree_walk(bytes: &[u8], from: usize, count: usize) -> Result<()> {
     let mut section_off = 0usize;
     for (i, rec) in tree.records.iter().enumerate() {
         if i >= count {
-            println!("  … (truncated; pass --count {} to see all)", tree.records.len());
+            println!(
+                "  … (truncated; pass --count {} to see all)",
+                tree.records.len()
+            );
             break;
         }
         let file_off = from + section_off;
@@ -299,9 +307,7 @@ fn dump_dtree_walk_auto(bytes: &[u8], from: usize, count: usize) -> Result<()> {
         })?
     };
 
-    println!(
-        "dtree at offset {dtree_start} (0x{dtree_start:x})"
-    );
+    println!("dtree at offset {dtree_start} (0x{dtree_start:x})");
 
     let mut cur = par::Cursor::new(bytes);
     cur.advance(dtree_start)?;
@@ -336,8 +342,7 @@ fn dump_dtree_walk_auto(bytes: &[u8], from: usize, count: usize) -> Result<()> {
         "fnidx", "depth", "i", "tt", "test_tag", "ysz", "nsz"
     );
     let mut shown = 0usize;
-    let mut by_back_pos: std::collections::BTreeMap<u32, usize> =
-        std::collections::BTreeMap::new();
+    let mut by_back_pos: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
     for (fnidx, node) in forest.nodes.iter().enumerate() {
         let par::dtree::TreeNode::Internal { predicate, yes, no } = node else {
             continue;
@@ -474,8 +479,7 @@ fn annotate(
     let s = match &nodes[idx] {
         par::dtree::TreeNode::Leaf { .. } => 1,
         par::dtree::TreeNode::Internal { yes, no, .. } => {
-            1 + annotate(nodes, *yes, d + 1, depth, size)
-                + annotate(nodes, *no, d + 1, depth, size)
+            1 + annotate(nodes, *yes, d + 1, depth, size) + annotate(nodes, *no, d + 1, depth, size)
         }
     };
     size[idx] = s;

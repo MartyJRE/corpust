@@ -109,8 +109,8 @@ impl TreeTagger {
             .ok()
             .map(|root| root.join("treetagger").join("lib").join(&abbr_name));
 
-        let model = first_existing([Some(bundled_model.clone()), data_model.clone()])
-            .ok_or_else(|| {
+        let model =
+            first_existing([Some(bundled_model.clone()), data_model.clone()]).ok_or_else(|| {
                 anyhow::anyhow!(
                     "TreeTagger model file missing for {language}: \
                      looked at {} and {}",
@@ -216,10 +216,7 @@ impl Annotator for TreeTagger {
 /// `None` slots. Used to overlay the platform data dir on top of the
 /// bundled TreeTagger layout in `from_bundle`.
 fn first_existing<const N: usize>(candidates: [Option<PathBuf>; N]) -> Option<PathBuf> {
-    candidates
-        .into_iter()
-        .flatten()
-        .find(|p| p.exists())
+    candidates.into_iter().flatten().find(|p| p.exists())
 }
 
 fn current_platform_dir() -> Result<&'static str> {
@@ -334,7 +331,11 @@ mod tests {
     #[test]
     fn align_to_source_missing_token_keeps_stream_intact() {
         let text = "hello world";
-        let tags = vec![raw("hello", "X", "x"), raw("WIDGET", "X", "x"), raw("world", "X", "x")];
+        let tags = vec![
+            raw("hello", "X", "x"),
+            raw("WIDGET", "X", "x"),
+            raw("world", "X", "x"),
+        ];
         let aligned = align_to_source(tags, text);
         assert_eq!(aligned.len(), 3);
         assert_eq!(aligned[1].byte_start, aligned[1].byte_end);

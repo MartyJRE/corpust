@@ -138,18 +138,18 @@ impl Tagger {
     /// suffix trie (with prefix trie / dtree default as fallbacks
     /// and a capitalized → NP boost). Lemma is pre-resolved.
     fn candidates_for(&self, word: &str) -> Vec<viterbi::Cand> {
-        if let Some(entry) = self.model.lexicon.lookup(word) {
-            if !entry.candidates.is_empty() {
-                return entry
-                    .candidates
-                    .iter()
-                    .map(|c| viterbi::Cand {
-                        tag_id: c.tag_id,
-                        lex_prob: c.prob as f64,
-                        lemma: self.model.lexicon.lemma(c.lemma_index).map(str::to_owned),
-                    })
-                    .collect();
-            }
+        if let Some(entry) = self.model.lexicon.lookup(word)
+            && !entry.candidates.is_empty()
+        {
+            return entry
+                .candidates
+                .iter()
+                .map(|c| viterbi::Cand {
+                    tag_id: c.tag_id,
+                    lex_prob: c.prob as f64,
+                    lemma: self.model.lexicon.lemma(c.lemma_index).map(str::to_owned),
+                })
+                .collect();
         }
         self.unknown_word_candidates(word)
     }
@@ -166,9 +166,13 @@ impl Tagger {
     /// 5. Last resort: peak of the dtree Default leaf.
     fn unknown_word_candidates(&self, word: &str) -> Vec<viterbi::Cand> {
         let chars: Vec<char> = word.chars().collect();
-        let first_upper = chars.first().copied().map(|c| c.is_uppercase()).unwrap_or(false);
-        let all_upper = !chars.is_empty()
-            && chars.iter().all(|c| !c.is_alphabetic() || c.is_uppercase());
+        let first_upper = chars
+            .first()
+            .copied()
+            .map(|c| c.is_uppercase())
+            .unwrap_or(false);
+        let all_upper =
+            !chars.is_empty() && chars.iter().all(|c| !c.is_alphabetic() || c.is_uppercase());
         // Boost NP for any first-uppercase word that survives the
         // numeric / Roman / lowercase-lexicon fallbacks. Mixed-case
         // ("Pendragon") and all-caps ("WILLIAM") tokens both
@@ -194,25 +198,27 @@ impl Tagger {
                 || lc.ends_with("st")
                 || lc.ends_with("nd");
             let digit_prefix_then_ordinal = ordinal_suffix
-                && chars.iter().take(chars.len().saturating_sub(2)).any(|c| c.is_ascii_digit())
-                && chars.iter().take(chars.len().saturating_sub(2)).all(|c| c.is_ascii_digit());
-            if all_digits_or_sep {
-                if let Some(cd) = self.tag_id_by_name("CD") {
-                    return vec![viterbi::Cand {
-                        tag_id: u32::from(cd),
-                        lex_prob: 1.0,
-                        lemma: None,
-                    }];
-                }
+                && chars
+                    .iter()
+                    .take(chars.len().saturating_sub(2))
+                    .any(|c| c.is_ascii_digit())
+                && chars
+                    .iter()
+                    .take(chars.len().saturating_sub(2))
+                    .all(|c| c.is_ascii_digit());
+            if all_digits_or_sep && let Some(cd) = self.tag_id_by_name("CD") {
+                return vec![viterbi::Cand {
+                    tag_id: u32::from(cd),
+                    lex_prob: 1.0,
+                    lemma: None,
+                }];
             }
-            if digit_prefix_then_ordinal {
-                if let Some(jj) = self.tag_id_by_name("JJ") {
-                    return vec![viterbi::Cand {
-                        tag_id: u32::from(jj),
-                        lex_prob: 1.0,
-                        lemma: None,
-                    }];
-                }
+            if digit_prefix_then_ordinal && let Some(jj) = self.tag_id_by_name("JJ") {
+                return vec![viterbi::Cand {
+                    tag_id: u32::from(jj),
+                    lex_prob: 1.0,
+                    lemma: None,
+                }];
             }
             // Otherwise fall through — mixed alphanumeric, let
             // suffix-trie + NP boost handle.
@@ -223,15 +229,16 @@ impl Tagger {
         // (the pronoun) before we get here, so single-letter false
         // positives like "V" alone are vanishingly rare.
         if all_upper
-            && chars.iter().all(|c| matches!(*c, 'I' | 'V' | 'X' | 'L' | 'C' | 'D' | 'M'))
+            && chars
+                .iter()
+                .all(|c| matches!(*c, 'I' | 'V' | 'X' | 'L' | 'C' | 'D' | 'M'))
+            && let Some(np) = self.tag_id_by_name("NP")
         {
-            if let Some(np) = self.tag_id_by_name("NP") {
-                return vec![viterbi::Cand {
-                    tag_id: u32::from(np),
-                    lex_prob: 1.0,
-                    lemma: None,
-                }];
-            }
+            return vec![viterbi::Cand {
+                tag_id: u32::from(np),
+                lex_prob: 1.0,
+                lemma: None,
+            }];
         }
 
         // 3. Capitalized lowercase fallback. For all-caps headings
@@ -244,24 +251,19 @@ impl Tagger {
         // that means the original lookup already exhausted lexicon.
         if first_upper {
             let lc: String = word.chars().flat_map(|c| c.to_lowercase()).collect();
-            if lc != word {
-                if let Some(entry) = self.model.lexicon.lookup(&lc) {
-                    if !entry.candidates.is_empty() {
-                        return entry
-                            .candidates
-                            .iter()
-                            .map(|c| viterbi::Cand {
-                                tag_id: c.tag_id,
-                                lex_prob: c.prob as f64,
-                                lemma: self
-                                    .model
-                                    .lexicon
-                                    .lemma(c.lemma_index)
-                                    .map(str::to_owned),
-                            })
-                            .collect();
-                    }
-                }
+            if lc != word
+                && let Some(entry) = self.model.lexicon.lookup(&lc)
+                && !entry.candidates.is_empty()
+            {
+                return entry
+                    .candidates
+                    .iter()
+                    .map(|c| viterbi::Cand {
+                        tag_id: c.tag_id,
+                        lex_prob: c.prob as f64,
+                        lemma: self.model.lexicon.lemma(c.lemma_index).map(str::to_owned),
+                    })
+                    .collect();
             }
         }
 
@@ -289,23 +291,21 @@ impl Tagger {
         // boost NP to a meaningful share so context-aware Viterbi
         // can still pick it. Without this, suffix-trie alone tags
         // "Accolon" as VVN (the -lon ending) regardless of context.
-        if np_candidate {
-            if let Some(np) = self.tag_id_by_name("NP") {
-                let np_id = u32::from(np);
-                let np_boost = self.np_boost;
-                let scale = (1.0 - np_boost).max(0.0);
-                for c in cands.iter_mut() {
-                    c.lex_prob *= scale;
-                }
-                if let Some(c) = cands.iter_mut().find(|c| c.tag_id == np_id) {
-                    c.lex_prob += np_boost;
-                } else {
-                    cands.push(viterbi::Cand {
-                        tag_id: np_id,
-                        lex_prob: np_boost,
-                        lemma: None,
-                    });
-                }
+        if np_candidate && let Some(np) = self.tag_id_by_name("NP") {
+            let np_id = u32::from(np);
+            let np_boost = self.np_boost;
+            let scale = (1.0 - np_boost).max(0.0);
+            for c in cands.iter_mut() {
+                c.lex_prob *= scale;
+            }
+            if let Some(c) = cands.iter_mut().find(|c| c.tag_id == np_id) {
+                c.lex_prob += np_boost;
+            } else {
+                cands.push(viterbi::Cand {
+                    tag_id: np_id,
+                    lex_prob: np_boost,
+                    lemma: None,
+                });
             }
         }
 
@@ -327,7 +327,7 @@ impl Tagger {
                         })
                         .map(|tp| tp.tag_id)
                 })
-                .unwrap_or(self.model.header.sent_tag_index as u32);
+                .unwrap_or(self.model.header.sent_tag_index);
             cands.push(viterbi::Cand {
                 tag_id: fallback,
                 lex_prob: 1.0,
@@ -338,7 +338,10 @@ impl Tagger {
     }
 
     fn tag_id_by_name(&self, name: &str) -> Option<u8> {
-        self.model.header.tag_id(name).and_then(|v| u8::try_from(v).ok())
+        self.model
+            .header
+            .tag_id(name)
+            .and_then(|v| u8::try_from(v).ok())
     }
 }
 
@@ -505,11 +508,19 @@ mod tests {
         let Some(bundle) = bundle_path() else { return };
         let par = bundle.join("lib/english.par");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap();
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let text_path = repo.join("testdata/gutenberg/1251.txt");
-        if !text_path.exists() { return }
-        let sample: String = std::fs::read_to_string(&text_path).unwrap()
-            .chars().take(10_000).collect();
+        if !text_path.exists() {
+            return;
+        }
+        let sample: String = std::fs::read_to_string(&text_path)
+            .unwrap()
+            .chars()
+            .take(10_000)
+            .collect();
         let token_estimate = sample.split_whitespace().count();
 
         let t0 = Instant::now();
@@ -548,9 +559,18 @@ mod tests {
         let speedup = o_per / s_per;
 
         eprintln!();
-        eprintln!("Per-call .annotate() on {} tokens (~{} whitespace words):", tokens_o, token_estimate);
-        eprintln!("  oracle:   {o_per:8.2} ms/call  ({:.2} tokens/ms)", tokens_o as f64 / o_per);
-        eprintln!("  subject:  {s_per:8.2} ms/call  ({:.2} tokens/ms)", tokens_s as f64 / s_per);
+        eprintln!(
+            "Per-call .annotate() on {} tokens (~{} whitespace words):",
+            tokens_o, token_estimate
+        );
+        eprintln!(
+            "  oracle:   {o_per:8.2} ms/call  ({:.2} tokens/ms)",
+            tokens_o as f64 / o_per
+        );
+        eprintln!(
+            "  subject:  {s_per:8.2} ms/call  ({:.2} tokens/ms)",
+            tokens_s as f64 / s_per
+        );
         eprintln!("  speedup:  {speedup:.1}× (pure-Rust vs spawn-per-call subprocess)");
     }
 
@@ -562,31 +582,62 @@ mod tests {
     fn unknown_error_clustering() {
         let Some(bundle) = bundle_path() else { return };
         let par = bundle.join("lib/english.par");
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let text_path = repo.join("testdata/gutenberg/1251.txt");
-        if !text_path.exists() { return }
-        let sample: String = std::fs::read_to_string(&text_path).unwrap().chars().take(10_000).collect();
+        if !text_path.exists() {
+            return;
+        }
+        let sample: String = std::fs::read_to_string(&text_path)
+            .unwrap()
+            .chars()
+            .take(10_000)
+            .collect();
         let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
         let subject = Tagger::load(&par, "english", english_abbreviations()).unwrap();
         let report = testkit::diff(&oracle, &subject, &sample).unwrap();
 
-        let mut errors: Vec<_> = report.mismatches.iter()
-            .filter(|m| m.kind == testkit::MismatchKind::Pos
-                && subject.model.lexicon.lookup(&m.subject_word).is_none())
+        let mut errors: Vec<_> = report
+            .mismatches
+            .iter()
+            .filter(|m| {
+                m.kind == testkit::MismatchKind::Pos
+                    && subject.model.lexicon.lookup(&m.subject_word).is_none()
+            })
             .collect();
         errors.sort_by(|a, b| a.subject_word.cmp(&b.subject_word));
-        eprintln!("Unknown-word POS errors (showing first 25 of {}):", errors.len());
+        eprintln!(
+            "Unknown-word POS errors (showing first 25 of {}):",
+            errors.len()
+        );
         for m in errors.iter().take(25) {
             let first_char = m.subject_word.chars().next().unwrap_or('?');
-            let cap = if first_char.is_uppercase() { "CAP" } else { "   " };
-            eprintln!("  {} {:<15} oracle={:<5} subject={}",
-                cap, m.subject_word,
+            let cap = if first_char.is_uppercase() {
+                "CAP"
+            } else {
+                "   "
+            };
+            eprintln!(
+                "  {} {:<15} oracle={:<5} subject={}",
+                cap,
+                m.subject_word,
                 m.oracle_pos.as_deref().unwrap_or("-"),
-                m.subject_pos.as_deref().unwrap_or("-"));
+                m.subject_pos.as_deref().unwrap_or("-")
+            );
         }
-        let cap_errors = errors.iter().filter(|m| m.subject_word.chars().next().unwrap_or('?').is_uppercase()).count();
-        eprintln!("\nOf {} unknown-word POS errors: {} are capitalized, {} are not",
-            errors.len(), cap_errors, errors.len() - cap_errors);
+        let cap_errors = errors
+            .iter()
+            .filter(|m| m.subject_word.chars().next().unwrap_or('?').is_uppercase())
+            .count();
+        eprintln!(
+            "\nOf {} unknown-word POS errors: {} are capitalized, {} are not",
+            errors.len(),
+            cap_errors,
+            errors.len() - cap_errors
+        );
     }
 
     /// Dump the top-20 words responsible for ambiguous-known-word POS
@@ -598,10 +649,20 @@ mod tests {
     fn ambiguous_error_clustering() {
         let Some(bundle) = bundle_path() else { return };
         let par = bundle.join("lib/english.par");
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let text_path = repo.join("testdata/gutenberg/1251.txt");
-        if !text_path.exists() { return }
-        let sample: String = std::fs::read_to_string(&text_path).unwrap().chars().take(10_000).collect();
+        if !text_path.exists() {
+            return;
+        }
+        let sample: String = std::fs::read_to_string(&text_path)
+            .unwrap()
+            .chars()
+            .take(10_000)
+            .collect();
         let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
         let subject = Tagger::load(&par, "english", english_abbreviations()).unwrap();
         let report = testkit::diff(&oracle, &subject, &sample).unwrap();
@@ -609,10 +670,18 @@ mod tests {
         use std::collections::HashMap;
         let mut by_word: HashMap<(String, String, String), usize> = HashMap::new();
         for m in &report.mismatches {
-            if m.kind != testkit::MismatchKind::Pos { continue }
-            let n_cand = subject.model.lexicon.lookup(&m.subject_word)
-                .map(|e| e.candidates.len()).unwrap_or(0);
-            if n_cand <= 1 { continue }
+            if m.kind != testkit::MismatchKind::Pos {
+                continue;
+            }
+            let n_cand = subject
+                .model
+                .lexicon
+                .lookup(&m.subject_word)
+                .map(|e| e.candidates.len())
+                .unwrap_or(0);
+            if n_cand <= 1 {
+                continue;
+            }
             let key = (
                 m.subject_word.clone(),
                 m.oracle_pos.clone().unwrap_or_default(),
@@ -627,7 +696,10 @@ mod tests {
             eprintln!("  {c:>3}× {w:<15} oracle={op:<6} subject={sp}");
         }
         let total: usize = pairs.iter().map(|(_, c)| c).sum();
-        eprintln!("Total ambiguous-known POS errors: {total} across {} distinct (word, pos-diff) tuples", pairs.len());
+        eprintln!(
+            "Total ambiguous-known POS errors: {total} across {} distinct (word, pos-diff) tuples",
+            pairs.len()
+        );
     }
 
     /// Same #[ignored] baseline but broken down by error source
@@ -640,10 +712,19 @@ mod tests {
         let Some(bundle) = bundle_path() else { return };
         let par = bundle.join("lib/english.par");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap();
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let text_path = repo.join("testdata/gutenberg/1251.txt");
-        if !text_path.exists() { return }
-        let sample: String = std::fs::read_to_string(&text_path).unwrap().chars().take(10_000).collect();
+        if !text_path.exists() {
+            return;
+        }
+        let sample: String = std::fs::read_to_string(&text_path)
+            .unwrap()
+            .chars()
+            .take(10_000)
+            .collect();
         let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
         let subject = Tagger::load(&par, "english", english_abbreviations()).unwrap();
         let report = testkit::diff(&oracle, &subject, &sample).unwrap();
@@ -652,7 +733,9 @@ mod tests {
         let mut ambig_known_pos_err = 0;
         let mut single_known_pos_err = 0;
         for m in &report.mismatches {
-            if m.kind != testkit::MismatchKind::Pos { continue }
+            if m.kind != testkit::MismatchKind::Pos {
+                continue;
+            }
             match subject.model.lexicon.lookup(&m.subject_word) {
                 None => unknown_pos_err += 1,
                 Some(entry) => {
@@ -669,8 +752,11 @@ mod tests {
              \t{} unknown-word errors (fixable by trie prob linkage)\n\
              \t{} ambiguous known-word errors (fixable by dtree Viterbi)\n\
              \t{} single-candidate known errors (impossible without context or bug)",
-            report.oracle_tokens, report.pos_errors(),
-            unknown_pos_err, ambig_known_pos_err, single_known_pos_err,
+            report.oracle_tokens,
+            report.pos_errors(),
+            unknown_pos_err,
+            ambig_known_pos_err,
+            single_known_pos_err,
         );
     }
 
@@ -822,7 +908,9 @@ mod tests {
                     ));
                     return steps.join(" ");
                 }
-                par::dtree::TreeNode::Internal { predicate, yes, no, .. } => {
+                par::dtree::TreeNode::Internal {
+                    predicate, yes, no, ..
+                } => {
                     let back = predicate.back_pos_i as usize;
                     let observed = context.get(back).copied();
                     let hit = observed == Some(predicate.test_tag_id);
@@ -885,12 +973,14 @@ mod tests {
         let mut cur_t2: Option<u32> = None;
         let mut cur_probs: Vec<f64> = vec![0.0; n_tags];
         let mut cur_idx = 0usize;
-        let flush =
-            |t1: Option<u32>, t2: Option<u32>, probs: &[f64], tbl: &mut HashMap<(u32, u32), Vec<f64>>| {
-                if let (Some(t1), Some(t2)) = (t1, t2) {
-                    tbl.insert((t1, t2), probs.to_vec());
-                }
-            };
+        let flush = |t1: Option<u32>,
+                     t2: Option<u32>,
+                     probs: &[f64],
+                     tbl: &mut HashMap<(u32, u32), Vec<f64>>| {
+            if let (Some(t1), Some(t2)) = (t1, t2) {
+                tbl.insert((t1, t2), probs.to_vec());
+            }
+        };
         for line in raw.lines() {
             if let Some(rest) = line.strip_prefix("tag[-1] = ") {
                 flush(cur_t1, cur_t2, &cur_probs, &mut oracle_table);
@@ -927,14 +1017,13 @@ mod tests {
             let ours = par::dtree::traverse_tree(&traversal.forest, inference_root, &ctx);
             let mut abs_per_ctx: f64 = 0.0;
             let mut kl = 0.0f64;
-            for k in 0..n_tags {
-                let p_ours = ours.probs[k].prob;
-                let p_oracle = oracle_probs[k];
+            for (p_oracle, tp) in oracle_probs.iter().zip(ours.probs.iter()).take(n_tags) {
+                let p_ours = tp.prob;
                 let d = (p_ours - p_oracle).abs();
                 if d > abs_per_ctx {
                     abs_per_ctx = d;
                 }
-                if p_ours > 1e-12 && p_oracle > 1e-12 {
+                if p_ours > 1e-12 && *p_oracle > 1e-12 {
                     kl += p_oracle * (p_oracle.ln() - p_ours.ln());
                 }
             }
@@ -942,7 +1031,8 @@ mod tests {
             sum_kl += kl.max(0.0);
 
             let argmax = |probs: &[f64]| {
-                probs.iter()
+                probs
+                    .iter()
                     .enumerate()
                     .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
                     .map(|(i, _)| i as u32)
@@ -1002,25 +1092,27 @@ mod tests {
         let mut cur_t2: Option<u32> = None;
         let mut cur_probs: Vec<f64> = vec![0.0; n_tags];
         let mut cur_idx = 0usize;
-        let flush =
-            |t1: Option<u32>, t2: Option<u32>, probs: &[f64], tbl: &mut HashMap<(u32, u32), par::dtree::Distribution>| {
-                if let (Some(t1), Some(t2)) = (t1, t2) {
-                    tbl.insert(
-                        (t1, t2),
-                        par::dtree::Distribution {
-                            weight: 0,
-                            probs: probs
-                                .iter()
-                                .enumerate()
-                                .map(|(i, p)| par::dtree::TagProb {
-                                    tag_id: i as u32,
-                                    prob: *p,
-                                })
-                                .collect(),
-                        },
-                    );
-                }
-            };
+        let flush = |t1: Option<u32>,
+                     t2: Option<u32>,
+                     probs: &[f64],
+                     tbl: &mut HashMap<(u32, u32), par::dtree::Distribution>| {
+            if let (Some(t1), Some(t2)) = (t1, t2) {
+                tbl.insert(
+                    (t1, t2),
+                    par::dtree::Distribution {
+                        weight: 0,
+                        probs: probs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, p)| par::dtree::TagProb {
+                                tag_id: i as u32,
+                                prob: *p,
+                            })
+                            .collect(),
+                    },
+                );
+            }
+        };
         for line in raw.lines() {
             if let Some(rest) = line.strip_prefix("tag[-1] = ") {
                 flush(cur_t1, cur_t2, &cur_probs, &mut table);
@@ -1045,11 +1137,19 @@ mod tests {
         flush(cur_t1, cur_t2, &cur_probs, &mut table);
 
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap();
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let text_path = repo.join("testdata/gutenberg/1251.txt");
-        if !text_path.exists() { return }
-        let sample: String = std::fs::read_to_string(&text_path).unwrap()
-            .chars().take(10_000).collect();
+        if !text_path.exists() {
+            return;
+        }
+        let sample: String = std::fs::read_to_string(&text_path)
+            .unwrap()
+            .chars()
+            .take(10_000)
+            .collect();
 
         let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
         let ours = Tagger::load(&par, "english", english_abbreviations()).unwrap();
@@ -1060,26 +1160,37 @@ mod tests {
 
         let r_ours = testkit::diff(&oracle, &ours, &sample).unwrap();
         let r_table = testkit::diff(&oracle, &with_table, &sample).unwrap();
-        eprintln!("ours: {} POS-err / 2032 ({:.4})", r_ours.pos_errors(), r_ours.pos_accuracy());
-        eprintln!("table: {} POS-err / 2032 ({:.4})", r_table.pos_errors(), r_table.pos_accuracy());
+        eprintln!(
+            "ours: {} POS-err / 2032 ({:.4})",
+            r_ours.pos_errors(),
+            r_ours.pos_accuracy()
+        );
+        eprintln!(
+            "table: {} POS-err / 2032 ({:.4})",
+            r_table.pos_errors(),
+            r_table.pos_accuracy()
+        );
 
         // The mismatches list (token, our_pos, oracle_pos, prev_ctx)
         // tells us exactly which contexts our tree gets wrong.
         // Find tokens where ours is wrong but table is right.
         let mut errs_ours: std::collections::HashSet<usize> = Default::default();
         for m in &r_ours.mismatches {
-            errs_ours.insert(m.position as usize);
+            errs_ours.insert(m.position);
         }
         let mut errs_table: std::collections::HashSet<usize> = Default::default();
         for m in &r_table.mismatches {
-            errs_table.insert(m.position as usize);
+            errs_table.insert(m.position);
         }
         let we_lose: Vec<_> = errs_ours.difference(&errs_table).collect();
         eprintln!("tokens we lose specifically vs override: {}", we_lose.len());
         for &&pos in we_lose.iter().take(20) {
-            let m = r_ours.mismatches.iter().find(|m| m.position as usize == pos);
+            let m = r_ours.mismatches.iter().find(|m| m.position == pos);
             if let Some(m) = m {
-                eprintln!("  pos {}: word={:?} ours={:?} oracle={:?}", pos, m.oracle_word, m.subject_pos, m.oracle_pos);
+                eprintln!(
+                    "  pos {}: word={:?} ours={:?} oracle={:?}",
+                    pos, m.oracle_word, m.subject_pos, m.oracle_pos
+                );
             }
         }
     }
@@ -1092,31 +1203,58 @@ mod tests {
         let Some(bundle) = bundle_path() else { return };
         let par = bundle.join("lib/english.par");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap();
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let text_path = repo.join("testdata/gutenberg/1251.txt");
-        if !text_path.exists() { return }
-        let sample: String = std::fs::read_to_string(&text_path).unwrap()
-            .chars().take(10_000).collect();
+        if !text_path.exists() {
+            return;
+        }
+        let sample: String = std::fs::read_to_string(&text_path)
+            .unwrap()
+            .chars()
+            .take(10_000)
+            .collect();
         let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
 
         // Source 1: default (normalized tag_prelude).
         let tagger = Tagger::load(&par, "english", english_abbreviations()).unwrap();
         let r = testkit::diff(&oracle, &tagger, &sample).unwrap();
-        eprintln!("tag_prelude (default): POS-err={} pos_acc={:.4}", r.pos_errors(), r.pos_accuracy());
+        eprintln!(
+            "tag_prelude (default): POS-err={} pos_acc={:.4}",
+            r.pos_errors(),
+            r.pos_accuracy()
+        );
 
         // Source 2: no prior at all.
         let mut tagger2 = Tagger::load(&par, "english", english_abbreviations()).unwrap();
         tagger2.tag_prior_override = Some(Vec::new());
         let r = testkit::diff(&oracle, &tagger2, &sample).unwrap();
-        eprintln!("no prior:              POS-err={} pos_acc={:.4}", r.pos_errors(), r.pos_accuracy());
+        eprintln!(
+            "no prior:              POS-err={} pos_acc={:.4}",
+            r.pos_errors(),
+            r.pos_accuracy()
+        );
 
         // Source 3: dtree-leaves marginal.
         let mut tagger3 = Tagger::load(&par, "english", english_abbreviations()).unwrap();
-        let marginal: Vec<f64> = tagger3.dtree.as_ref().unwrap()
-            .marginal.probs.iter().map(|tp| tp.prob).collect();
+        let marginal: Vec<f64> = tagger3
+            .dtree
+            .as_ref()
+            .unwrap()
+            .marginal
+            .probs
+            .iter()
+            .map(|tp| tp.prob)
+            .collect();
         tagger3.tag_prior_override = Some(marginal);
         let r = testkit::diff(&oracle, &tagger3, &sample).unwrap();
-        eprintln!("dtree marginal:        POS-err={} pos_acc={:.4}", r.pos_errors(), r.pos_accuracy());
+        eprintln!(
+            "dtree marginal:        POS-err={} pos_acc={:.4}",
+            r.pos_errors(),
+            r.pos_accuracy()
+        );
     }
 
     /// Verify that summing trie leaf `count` fields equals the
@@ -1143,7 +1281,9 @@ mod tests {
             let leaves: usize = trie.entries.iter().filter(|e| e.is_leaf()).count();
             eprintln!(
                 "{label}: {} leaves, sum-of-counts={}, prob_array records={}",
-                leaves, leaf_count_sum, pa.records.len(),
+                leaves,
+                leaf_count_sum,
+                pa.records.len(),
             );
         }
     }
@@ -1165,7 +1305,16 @@ mod tests {
             let b: [u8; 8] = bytes[rec_off..rec_off + 8].try_into().unwrap();
             eprintln!(
                 "  rec[{}] at file_off=0x{:x}: bytes = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                target_rec - 2 + i, rec_off, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                target_rec - 2 + i,
+                rec_off,
+                b[0],
+                b[1],
+                b[2],
+                b[3],
+                b[4],
+                b[5],
+                b[6],
+                b[7],
             );
         }
     }
@@ -1179,12 +1328,18 @@ mod tests {
         let par = bundle.join("lib/english.par");
         let tagger = Tagger::load(&par, "english", english_abbreviations()).unwrap();
         let words = [
-            "Requests", "requests",
-            "Resolution", "resolution",
-            "Notes", "notes",
-            "Recalls", "recalls",
-            "Affirms", "affirms",
-            "Council", "council",
+            "Requests",
+            "requests",
+            "Resolution",
+            "resolution",
+            "Notes",
+            "notes",
+            "Recalls",
+            "recalls",
+            "Affirms",
+            "affirms",
+            "Council",
+            "council",
         ];
         for w in words {
             eprintln!("\n=== {w:?} ===");
@@ -1227,20 +1382,32 @@ mod tests {
             // NP boost) — if Tagger drops down to it.
             if let Some(tries) = tagger.model().tries.as_ref() {
                 let trie_dist = tries.suffix.lookup(w.chars().rev());
-                eprintln!("  raw suffix-trie lookup: {}", match trie_dist {
-                    Some(d) => {
-                        let mut top: Vec<_> = d.probs.iter().collect();
-                        top.sort_by(|a, b| b.prob.partial_cmp(&a.prob).unwrap());
-                        let tags: Vec<(String, f32)> = top.iter().take(4).map(|tp| {
-                            (
-                                tagger.model().header.tag(tp.tag_id as u32).unwrap_or("?").to_string(),
-                                tp.prob,
-                            )
-                        }).collect();
-                        format!("{tags:?}")
+                eprintln!(
+                    "  raw suffix-trie lookup: {}",
+                    match trie_dist {
+                        Some(d) => {
+                            let mut top: Vec<_> = d.probs.iter().collect();
+                            top.sort_by(|a, b| b.prob.partial_cmp(&a.prob).unwrap());
+                            let tags: Vec<(String, f32)> = top
+                                .iter()
+                                .take(4)
+                                .map(|tp| {
+                                    (
+                                        tagger
+                                            .model()
+                                            .header
+                                            .tag(tp.tag_id as u32)
+                                            .unwrap_or("?")
+                                            .to_string(),
+                                        tp.prob,
+                                    )
+                                })
+                                .collect();
+                            format!("{tags:?}")
+                        }
+                        None => "(no match — fell through)".to_string(),
                     }
-                    None => "(no match — fell through)".to_string(),
-                });
+                );
             }
         }
     }
@@ -1254,11 +1421,19 @@ mod tests {
         let Some(bundle) = bundle_path() else { return };
         let par = bundle.join("lib/english.par");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap();
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let text_path = repo.join("testdata/gutenberg/1251.txt");
-        if !text_path.exists() { return }
-        let sample: String = std::fs::read_to_string(&text_path).unwrap()
-            .chars().take(50_000).collect();
+        if !text_path.exists() {
+            return;
+        }
+        let sample: String = std::fs::read_to_string(&text_path)
+            .unwrap()
+            .chars()
+            .take(50_000)
+            .collect();
         let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
         let mut subject = Tagger::load(&par, "english", english_abbreviations()).unwrap();
         for &boost in &[0.5_f64, 0.7, 0.8, 0.9, 0.95, 0.99] {
@@ -1266,7 +1441,8 @@ mod tests {
             let r = testkit::diff(&oracle, &subject, &sample).unwrap();
             eprintln!(
                 "np_boost={boost:.2}  POS-err={}  pos_acc={:.4}",
-                r.pos_errors(), r.pos_accuracy(),
+                r.pos_errors(),
+                r.pos_accuracy(),
             );
         }
     }
@@ -1279,9 +1455,14 @@ mod tests {
         let Some(bundle) = bundle_path() else { return };
         let par = bundle.join("lib/english.par");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap();
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let text_path = repo.join("testdata/gutenberg/1251.txt");
-        if !text_path.exists() { return }
+        if !text_path.exists() {
+            return;
+        }
         let full = std::fs::read_to_string(&text_path).unwrap();
         let sample: String = full.chars().take(50_000).collect();
         let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
@@ -1316,14 +1497,26 @@ mod tests {
         let sample = if let Ok(path) = std::env::var("CORPUST_BENCH_SAMPLE") {
             match std::fs::read_to_string(&path) {
                 Ok(s) => s,
-                Err(_) => { eprintln!("missing {path}"); return }
+                Err(_) => {
+                    eprintln!("missing {path}");
+                    return;
+                }
             }
         } else {
             let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent().unwrap().parent().unwrap();
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap();
             let text_path = repo.join("testdata/gutenberg/1251.txt");
-            if !text_path.exists() { return }
-            std::fs::read_to_string(&text_path).unwrap().chars().take(10_000).collect()
+            if !text_path.exists() {
+                return;
+            }
+            std::fs::read_to_string(&text_path)
+                .unwrap()
+                .chars()
+                .take(10_000)
+                .collect()
         };
 
         let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
@@ -1357,8 +1550,8 @@ mod tests {
                     .iter()
                     .filter_map(|c| ours.model().header.tag(c.tag_id))
                     .collect();
-                let our_in_cands = cand_tags.iter().any(|t| *t == our_pos);
-                let oracle_in_cands = cand_tags.iter().any(|t| *t == oracle_pos);
+                let our_in_cands = cand_tags.contains(&our_pos);
+                let oracle_in_cands = cand_tags.contains(&oracle_pos);
                 match (our_in_cands, oracle_in_cands) {
                     (true, true) => "both-in-lex",
                     (true, false) => "we-picked-from-lex_oracle-didnt",
@@ -1465,33 +1658,34 @@ mod tests {
         let mut cur_probs: Vec<f64> = vec![0.0; n_tags];
         let mut cur_idx = 0usize;
 
-        let flush = |t1: Option<u32>,
-                     t2: Option<u32>,
-                     probs: &[f64],
-                     table: &mut HashMap<(u32, u32), par::dtree::Distribution>| {
-            if let (Some(t1), Some(t2)) = (t1, t2) {
-                let dist_probs = probs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| par::dtree::TagProb {
-                        tag_id: i as u32,
-                        prob: *p,
-                    })
-                    .collect();
-                // If context is [..., t_{-2}, t_{-1}], then predict uses context.last() as t1 and context[len-2] as t2.
-                // Binary output:
-                // tag[-1] = A
-                //   tag[-2] = B
-                // So the key should be (A, B).
-                table.insert(
-                    (t1, t2),
-                    par::dtree::Distribution {
-                        weight: 0,
-                        probs: dist_probs,
-                    },
-                );
-            }
-        };
+        let flush =
+            |t1: Option<u32>,
+             t2: Option<u32>,
+             probs: &[f64],
+             table: &mut HashMap<(u32, u32), par::dtree::Distribution>| {
+                if let (Some(t1), Some(t2)) = (t1, t2) {
+                    let dist_probs = probs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| par::dtree::TagProb {
+                            tag_id: i as u32,
+                            prob: *p,
+                        })
+                        .collect();
+                    // If context is [..., t_{-2}, t_{-1}], then predict uses context.last() as t1 and context[len-2] as t2.
+                    // Binary output:
+                    // tag[-1] = A
+                    //   tag[-2] = B
+                    // So the key should be (A, B).
+                    table.insert(
+                        (t1, t2),
+                        par::dtree::Distribution {
+                            weight: 0,
+                            probs: dist_probs,
+                        },
+                    );
+                }
+            };
 
         for line in raw.lines() {
             if let Some(rest) = line.strip_prefix("tag[-1] = ") {
@@ -1516,7 +1710,10 @@ mod tests {
         }
         flush(cur_t1, cur_t2, &cur_probs, &mut table);
 
-        eprintln!("parsed {} (tag_-1, tag_-2) → distribution entries", table.len());
+        eprintln!(
+            "parsed {} (tag_-1, tag_-2) → distribution entries",
+            table.len()
+        );
 
         // Build a tagger with the override table installed.
         let mut tagger = Tagger::load(&par, "english", english_abbreviations()).unwrap();
@@ -1529,11 +1726,19 @@ mod tests {
 
         // Run the diff against the oracle.
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap().parent().unwrap();
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let text_path = repo.join("testdata/gutenberg/1251.txt");
-        if !text_path.exists() { return }
-        let sample: String = std::fs::read_to_string(&text_path).unwrap()
-            .chars().take(10_000).collect();
+        if !text_path.exists() {
+            return;
+        }
+        let sample: String = std::fs::read_to_string(&text_path)
+            .unwrap()
+            .chars()
+            .take(10_000)
+            .collect();
         let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
         let report = testkit::diff(&oracle, &tagger, &sample).unwrap();
         eprintln!(
@@ -1553,8 +1758,8 @@ mod tests {
         let par = bundle.join("lib/english.par");
         let model = par::load(&par).unwrap();
         for word in [
-            "King", "king", "How", "how", "I", "Table", "table",
-            "saved", "made", "slew", "have", "that",
+            "King", "king", "How", "how", "I", "Table", "table", "saved", "made", "slew", "have",
+            "that",
         ] {
             match model.lexicon.lookup(word) {
                 Some(entry) => {
@@ -1605,8 +1810,13 @@ mod tests {
         // tokens at comparable count and get *some* matches. The
         // precise accuracy is informational — no hard floor until
         // the Viterbi path lands.
-        assert_eq!(report.oracle_tokens, report.subject_tokens,
-            "token counts should match — if they diverge, tokenizer parity is broken");
-        assert!(report.matches > 0, "at least some tokens should match exactly");
+        assert_eq!(
+            report.oracle_tokens, report.subject_tokens,
+            "token counts should match — if they diverge, tokenizer parity is broken"
+        );
+        assert!(
+            report.matches > 0,
+            "at least some tokens should match exactly"
+        );
     }
 }

@@ -34,10 +34,10 @@ use std::path::PathBuf;
 /// Honors `$CORPUST_DATA_ROOT` if set; otherwise falls back to the
 /// platform-specific data directory.
 pub fn data_root() -> Result<PathBuf> {
-    if let Ok(override_path) = std::env::var("CORPUST_DATA_ROOT") {
-        if !override_path.is_empty() {
-            return Ok(PathBuf::from(override_path));
-        }
+    if let Ok(override_path) = std::env::var("CORPUST_DATA_ROOT")
+        && !override_path.is_empty()
+    {
+        return Ok(PathBuf::from(override_path));
     }
     let base = BaseDirs::new().ok_or_else(|| anyhow!("no home directory available"))?;
     Ok(base.data_dir().join("corpust"))

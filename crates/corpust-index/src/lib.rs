@@ -88,8 +88,7 @@ impl CorpusIndex {
             std::fs::remove_dir_all(path)
                 .with_context(|| format!("clearing {}", path.display()))?;
         }
-        std::fs::create_dir_all(path)
-            .with_context(|| format!("creating {}", path.display()))?;
+        std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
 
         let (schema, fields) = build_schema();
         let index = Index::create_in_dir(path, schema)?;
@@ -319,8 +318,8 @@ impl CorpusIndex {
                 break;
             }
             let inv_idx = seg_reader.inverted_index(query_field)?;
-            let Some(mut postings) = inv_idx
-                .read_postings(&term_obj, IndexRecordOption::WithFreqsAndPositions)?
+            let Some(mut postings) =
+                inv_idx.read_postings(&term_obj, IndexRecordOption::WithFreqsAndPositions)?
             else {
                 continue;
             };

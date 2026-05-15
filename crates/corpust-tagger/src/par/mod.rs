@@ -52,8 +52,8 @@ pub struct Model {
 /// ~14 MB and only loaded once per process, so this is fine; if we
 /// ever want to `mmap` it we can swap this without touching callers.
 pub fn load(path: &Path) -> Result<Model> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("reading .par file {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading .par file {}", path.display()))?;
     let mut cur = Cursor::new(&bytes);
     let header = header::read(&mut cur).context("parsing .par header")?;
     let lexicon = lexicon::read(&mut cur, &header).context("parsing .par lexicon")?;
@@ -74,10 +74,7 @@ pub fn load(path: &Path) -> Result<Model> {
 
 /// Best-effort tries load for the bundled `english.par`. Returns
 /// `None` for any other shape of file.
-fn try_read_english_tries(
-    bytes: &[u8],
-    header: &header::Header,
-) -> Option<tries::Tries> {
+fn try_read_english_tries(bytes: &[u8], header: &header::Header) -> Option<tries::Tries> {
     const ENGLISH_TRIES_START: usize = 0xcf9cc3;
     const ENGLISH_DTREE_START: usize = 0xd231a3;
     if header.tags.len() != 58 || bytes.len() <= ENGLISH_DTREE_START {
@@ -93,10 +90,7 @@ fn try_read_english_tries(
 /// so far (58 tags, dtree at `0xd231a3`), or if the walker rejects
 /// some bytes — the header + lexicon are still useful in that case,
 /// so we don't propagate the error.
-fn try_read_english_dtree(
-    bytes: &[u8],
-    header: &header::Header,
-) -> Option<dtree::DecisionTree> {
+fn try_read_english_dtree(bytes: &[u8], header: &header::Header) -> Option<dtree::DecisionTree> {
     const ENGLISH_DTREE_START: usize = 0xd231a3;
     if header.tags.len() != 58 || bytes.len() <= ENGLISH_DTREE_START {
         return None;
@@ -187,9 +181,7 @@ impl<'a> Cursor<'a> {
             .iter()
             .position(|&b| b == 0)
             .map(|n| start + n)
-            .with_context(|| {
-                format!("unterminated C string starting at offset {start}")
-            })?;
+            .with_context(|| format!("unterminated C string starting at offset {start}"))?;
         let bytes = &self.bytes[start..end];
         let s = std::str::from_utf8(bytes).with_context(|| {
             format!(

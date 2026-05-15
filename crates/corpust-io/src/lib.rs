@@ -26,8 +26,8 @@ pub fn read_text_dir(dir: impl AsRef<Path>) -> Result<Vec<Document>> {
         if path.extension().and_then(|s| s.to_str()) != Some("txt") {
             continue;
         }
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         documents.push(Document {
             id: documents.len() as DocId,
             path: path.to_path_buf(),

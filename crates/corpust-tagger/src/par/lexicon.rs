@@ -301,7 +301,10 @@ fn read_entries(
             .to_owned();
 
         let cand_count = cur.read_u32_le().with_context(|| {
-            format!("reading candidate count for {word:?} at offset {}", cur.offset() - 4)
+            format!(
+                "reading candidate count for {word:?} at offset {}",
+                cur.offset() - 4
+            )
         })?;
         if cand_count == 0 || cand_count > 64 {
             bail!(
@@ -402,7 +405,7 @@ mod tests {
         bytes.extend_from_slice(&0xFFFF_FFFEu32.to_le_bytes());
 
         // Preamble filled with 0xBA canary (matches real-world padding)
-        bytes.extend(std::iter::repeat(0xBA).take(preamble_size));
+        bytes.extend(std::iter::repeat_n(0xBA, preamble_size));
 
         // One record: word "xA", count=1, leading=0, tag=A, prob=1.0, lemma=0
         bytes.extend_from_slice(b"xA\0");
@@ -464,8 +467,14 @@ mod tests {
             (",", ",", 1.0),
             (".", "SENT", 1.0),
         ] {
-            let entry = lex.lookup(word).unwrap_or_else(|| panic!("no entry for {word:?}"));
-            assert_eq!(entry.candidates.len(), 1, "{word:?} should have 1 candidate");
+            let entry = lex
+                .lookup(word)
+                .unwrap_or_else(|| panic!("no entry for {word:?}"));
+            assert_eq!(
+                entry.candidates.len(),
+                1,
+                "{word:?} should have 1 candidate"
+            );
             let cand = &entry.candidates[0];
             assert_eq!(
                 header.tag(cand.tag_id),
@@ -513,6 +522,9 @@ mod tests {
         // Log the end offset so the follow-on archaeology for
         // suffix/prefix/decision trees knows where to start. `cargo
         // test -- --nocapture` surfaces it.
-        eprintln!("lexicon ends at offset 0x{:x} ({})", lex.end_offset, lex.end_offset);
+        eprintln!(
+            "lexicon ends at offset 0x{:x} ({})",
+            lex.end_offset, lex.end_offset
+        );
     }
 }

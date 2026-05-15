@@ -182,11 +182,9 @@ fn run_install_lang(code: &str, force: bool) -> Result<()> {
     // bundled layout so `from_bundle(<data_root>/treetagger, lang)`
     // works once we wire that lookup. For now the file just lives in
     // a stable place users can point `--tagger-bundle` at.
-    let data_root = corpust_io::paths::data_root()
-        .context("resolving data root")?;
+    let data_root = corpust_io::paths::data_root().context("resolving data root")?;
     let lib_dir = data_root.join("treetagger").join("lib");
-    std::fs::create_dir_all(&lib_dir)
-        .with_context(|| format!("creating {}", lib_dir.display()))?;
+    std::fs::create_dir_all(&lib_dir).with_context(|| format!("creating {}", lib_dir.display()))?;
     let par_path = lib_dir.join(format!("{lang}.par"));
     if par_path.exists() && !force {
         eprintln!(
@@ -195,9 +193,8 @@ fn run_install_lang(code: &str, force: bool) -> Result<()> {
         );
         return Ok(());
     }
-    let url = format!(
-        "https://www.cis.uni-muenchen.de/~schmid/tools/TreeTagger/data/{lang}.par.gz"
-    );
+    let url =
+        format!("https://www.cis.uni-muenchen.de/~schmid/tools/TreeTagger/data/{lang}.par.gz");
     eprintln!("downloading {url}");
     let response = ureq::get(&url)
         .call()
@@ -206,8 +203,8 @@ fn run_install_lang(code: &str, force: bool) -> Result<()> {
     let mut decoder = flate2::read::GzDecoder::new(&mut gz);
     let tmp = par_path.with_extension("par.part");
     let written = {
-        let mut out = std::fs::File::create(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
+        let mut out =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         std::io::copy(&mut decoder, &mut out)
             .with_context(|| format!("writing {}", tmp.display()))?
     };
@@ -270,8 +267,7 @@ fn run_index(
                 .with_context(|| format!("allocating slug for {display_name:?}"))?;
             let dir = corpust_io::paths::corpus_dir(&slug)
                 .with_context(|| format!("resolving corpus dir for slug {slug:?}"))?;
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("creating {}", dir.display()))?;
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
             (dir.join("index"), slug, dir)
         }
     };
@@ -305,14 +301,8 @@ fn run_index(
     // Write the metadata.json sidecar next to the index so the
     // Tauri UI's `list_corpora` picks the corpus up. Mirrors the
     // structure the Tauri build path produces.
-    use corpust_io::metadata::{
-        CorpusMeta, dir_size, iso_now, write_metadata_file,
-    };
-    let mut meta = CorpusMeta::stub(
-        slug,
-        display_name,
-        out.to_string_lossy().into_owned(),
-    );
+    use corpust_io::metadata::{CorpusMeta, dir_size, iso_now, write_metadata_file};
+    let mut meta = CorpusMeta::stub(slug, display_name, out.to_string_lossy().into_owned());
     meta.source_path = input.to_string_lossy().into_owned();
     meta.annotated = annotate;
     meta.doc_count = doc_count as u64;
@@ -320,7 +310,11 @@ fn run_index(
     // the tantivy index would be more accurate but isn't needed
     // for the display-only header in the UI.
     meta.token_count = (byte_count / 6) as u64;
-    meta.avg_doc_len = if doc_count > 0 { (byte_count / doc_count) as u64 } else { 0 };
+    meta.avg_doc_len = if doc_count > 0 {
+        (byte_count / doc_count) as u64
+    } else {
+        0
+    };
     meta.built_at = iso_now();
     meta.build_ms = build_ms;
     meta.size_on_disk = dir_size(&out).unwrap_or(0);
@@ -344,7 +338,7 @@ fn run_index(
 
 fn build_tagger(
     kind: TaggerArg,
-    bundle_root: &PathBuf,
+    bundle_root: &std::path::Path,
     language: &'static str,
 ) -> Result<Box<dyn Annotator + Sync>> {
     match kind {
@@ -356,7 +350,9 @@ fn build_tagger(
         }
         TaggerArg::Rust => {
             let par = bundle_root.join("lib").join(format!("{language}.par"));
-            let abbr_path = bundle_root.join("lib").join(format!("{language}-abbreviations"));
+            let abbr_path = bundle_root
+                .join("lib")
+                .join(format!("{language}-abbreviations"));
             let abbr: Vec<String> = if abbr_path.exists() {
                 std::fs::read_to_string(&abbr_path)
                     .with_context(|| format!("reading {}", abbr_path.display()))?
@@ -396,15 +392,19 @@ fn run_kwic(
     )?;
     let elapsed = t0.elapsed();
 
-    let left_width = hits.iter().map(|h| h.left.chars().count()).max().unwrap_or(0);
-    let hit_width = hits.iter().map(|h| h.hit.chars().count()).max().unwrap_or(0);
+    let left_width = hits
+        .iter()
+        .map(|h| h.left.chars().count())
+        .max()
+        .unwrap_or(0);
+    let hit_width = hits
+        .iter()
+        .map(|h| h.hit.chars().count())
+        .max()
+        .unwrap_or(0);
 
     for hit in &hits {
-        let file = hit
-            .path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?");
+        let file = hit.path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
         println!(
             "{file:20} | {left:>lw$}  \x1b[1m{hit:^hw$}\x1b[0m  {right}",
             file = file,

@@ -151,9 +151,7 @@ mod tests {
 
     #[test]
     fn rejects_runaway_tag_count() {
-        let bytes: &[u8] = &[
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff,
-        ];
+        let bytes: &[u8] = &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff];
         let mut cur = Cursor::new(bytes);
         assert!(read(&mut cur).is_err());
     }
@@ -206,11 +204,7 @@ mod tests {
         assert_eq!(h.tags[57], "``");
 
         // Header is exactly 16 bytes + sum of (tag_len + 1).
-        let expected_end = 16
-            + h.tags
-                .iter()
-                .map(|t| t.len() + 1)
-                .sum::<usize>();
+        let expected_end = 16 + h.tags.iter().map(|t| t.len() + 1).sum::<usize>();
         assert_eq!(h.end_offset, expected_end);
     }
 

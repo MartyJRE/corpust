@@ -122,12 +122,16 @@ pub fn tag_sequence_with(
         return Vec::new();
     }
 
-    let sent_id = header.sent_tag_index as u32;
+    let sent_id = header.sent_tag_index;
+
+    // Per-DP-step map: state → (score, back-pointer to previous
+    // state). Kept as a type alias so the nested generic doesn't
+    // bloat signatures.
+    type Dp = HashMap<State, (f64, Option<(usize, State)>)>;
 
     // Initial state mirrors `tree-tagger` behavior — use the SENT
     // tag as the initial context.
-    let mut dps: Vec<HashMap<State, (f64, Option<(usize, State)>)>> =
-        Vec::with_capacity(n + 1);
+    let mut dps: Vec<Dp> = Vec::with_capacity(n + 1);
     let mut init = HashMap::new();
     init.insert(
         State {
@@ -144,12 +148,9 @@ pub fn tag_sequence_with(
     let mut ctx_buf: Vec<u32> = Vec::with_capacity(2);
     for i in 0..n {
         let cands = &cands_per_token[i];
-        let max_lex = cands
-            .iter()
-            .map(|c| c.lex_prob)
-            .fold(0.0_f64, f64::max);
+        let max_lex = cands.iter().map(|c| c.lex_prob).fold(0.0_f64, f64::max);
         let cutoff = max_lex * pruning_threshold;
-        let mut next: HashMap<State, (f64, Option<(usize, State)>)> = HashMap::new();
+        let mut next: Dp = HashMap::new();
         for (state, &(score, _)) in &dps[i] {
             state.write_context(&mut ctx_buf);
             let cond = traversal.predict_combined(&ctx_buf);
@@ -165,16 +166,14 @@ pub fn tag_sequence_with(
                     continue;
                 }
                 let mut local = c.lex_prob.ln() + p_cond.ln();
-                if let Some(&prior) = tag_prior.get(c.tag_id as usize) {
-                    if prior > 0.0 {
-                        local -= prior.ln();
-                    }
+                if let Some(&prior) = tag_prior.get(c.tag_id as usize)
+                    && prior > 0.0
+                {
+                    local -= prior.ln();
                 }
                 let new_score = score + local;
                 let new_state = state.shift(c.tag_id);
-                let entry = next
-                    .entry(new_state)
-                    .or_insert((f64::NEG_INFINITY, None));
+                let entry = next.entry(new_state).or_insert((f64::NEG_INFINITY, None));
                 if entry.0 < new_score {
                     *entry = (new_score, Some((cand_idx, *state)));
                 }
@@ -192,10 +191,9 @@ pub fn tag_sequence_with(
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .unwrap_or(0);
-            for (state, &(score, _)) in &dps[i] {
+            if let Some((state, &(score, _))) = dps[i].iter().next() {
                 let new_state = state.shift(cands[best_cand].tag_id);
                 next.insert(new_state, (score, Some((best_cand, *state))));
-                break; // any state suffices for the recovery path
             }
         }
         dps.push(next);
@@ -206,8 +204,7 @@ pub fn tag_sequence_with(
     if let Some(start) = dps[n]
         .iter()
         .max_by(|a, b| {
-            a.1
-                .0
+            a.1.0
                 .partial_cmp(&b.1.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
@@ -234,13 +231,12 @@ pub fn tag_sequence_with(
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::par::dtree::{
-        DTreeRecord, Distribution, Internal, Leaf, PrunedInternal, TagProb, TreeForest,
-        TreeNode, Traversal,
+        DTreeRecord, Distribution, Internal, Leaf, PrunedInternal, TagProb, Traversal, TreeForest,
+        TreeNode,
     };
 
     fn synth_dist(weights: &[f64]) -> Distribution {
@@ -310,7 +306,13 @@ mod tests {
             context_size: 2,
         };
         let marginal = synth_dist(&[1.0; 3]);
-        let traversal = Traversal { forest, root: 0, marginal, override_table: None, lambda_bigram: 0.80 };
+        let traversal = Traversal {
+            forest,
+            root: 0,
+            marginal,
+            override_table: None,
+            lambda_bigram: 0.80,
+        };
         let header = stub_header(n);
 
         // Token A: only candidate is tag 1 (forces context = [_, 1]).
@@ -375,7 +377,13 @@ mod tests {
             context_size: 2,
         };
         let marginal = synth_dist(&[1.0; 3]);
-        let traversal = Traversal { forest, root: 0, marginal, override_table: None, lambda_bigram: 0.80 };
+        let traversal = Traversal {
+            forest,
+            root: 0,
+            marginal,
+            override_table: None,
+            lambda_bigram: 0.80,
+        };
         let header = stub_header(n);
 
         let cands = vec![

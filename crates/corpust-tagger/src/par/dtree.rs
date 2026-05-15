@@ -296,14 +296,15 @@ impl DecisionTree {
         let mut roots: Vec<usize> = Vec::new();
         let mut cursor = 0usize;
         while cursor < self.records.len() {
-            let root = try_build_subtree(&self.records, &mut cursor, &mut nodes).with_context(|| {
-                format!(
-                    "preorder-DFS reconstruction ran off the end of the records \
+            let root =
+                try_build_subtree(&self.records, &mut cursor, &mut nodes).with_context(|| {
+                    format!(
+                        "preorder-DFS reconstruction ran off the end of the records \
                      at record {} (total_records={})",
-                    cursor,
-                    self.records.len()
-                )
-            })?;
+                        cursor,
+                        self.records.len()
+                    )
+                })?;
             roots.push(root);
         }
 
@@ -354,15 +355,14 @@ impl Traversal {
     /// If `override_table` is set and contains an entry for the
     /// current context, that wins over tree traversal.
     pub fn predict<'a>(&'a self, context: &[u32]) -> &'a Distribution {
-        if let Some(table) = self.override_table.as_ref() {
-            if let (Some(&t1), Some(&t2)) = (
+        if let Some(table) = self.override_table.as_ref()
+            && let (Some(&t1), Some(&t2)) = (
                 context.last(),
                 context.len().checked_sub(2).and_then(|i| context.get(i)),
-            ) {
-                if let Some(d) = table.get(&(t1, t2)) {
-                    return d;
-                }
-            }
+            )
+            && let Some(d) = table.get(&(t1, t2))
+        {
+            return d;
         }
         traverse_tree(&self.forest, self.root, context)
     }
@@ -381,7 +381,12 @@ impl Traversal {
         let n_tags = self.marginal.probs.len();
         if let Some(table) = self.override_table.as_ref() {
             let t1 = context.last().copied().unwrap_or(31);
-            let t2 = context.len().checked_sub(2).and_then(|i| context.get(i)).copied().unwrap_or(31);
+            let t2 = context
+                .len()
+                .checked_sub(2)
+                .and_then(|i| context.get(i))
+                .copied()
+                .unwrap_or(31);
             if let Some(d) = table.get(&(t1, t2)) {
                 return d.probs.iter().map(|tp| tp.prob).collect();
             }
@@ -428,7 +433,7 @@ impl Traversal {
         let w_sum = w0 + w1;
 
         let mut acc = vec![0.0f64; n_tags];
-        for k in 0..n_tags {
+        for (k, slot) in acc.iter_mut().enumerate() {
             let p0 = d0.probs[k].prob;
             let p1 = d1.probs[k].prob;
             let p2 = d2.probs[k].prob;
@@ -439,7 +444,7 @@ impl Traversal {
                 p0
             };
 
-            acc[k] = self.lambda_bigram * p2 + (1.0 - self.lambda_bigram) * p_prior;
+            *slot = self.lambda_bigram * p2 + (1.0 - self.lambda_bigram) * p_prior;
         }
         acc
     }
@@ -489,11 +494,7 @@ impl Traversal {
             SmoothingScheme::WittenBell => {
                 let n = dist.weight as f64;
                 let u = dist.probs.iter().filter(|tp| tp.prob > 0.0).count() as f64;
-                if u + n > 0.0 {
-                    u / (u + n)
-                } else {
-                    0.5
-                }
+                if u + n > 0.0 { u / (u + n) } else { 0.5 }
             }
         })
     }
@@ -743,11 +744,7 @@ fn try_build_subtree(
 /// start offset isn't known a priori. Linear in file length × section
 /// length: fine for toys (~hundreds of bytes), don't call on
 /// `english.par` — use the known constant there.
-pub fn find_dtree_start(
-    bytes: &[u8],
-    header: &Header,
-    search_from: usize,
-) -> Option<usize> {
+pub fn find_dtree_start(bytes: &[u8], header: &Header, search_from: usize) -> Option<usize> {
     let n_us = header.tags.len();
     let default_size = 12 + n_us * 12;
     if bytes.len() < default_size || search_from > bytes.len() - default_size {
@@ -837,7 +834,7 @@ pub fn read(cur: &mut Cursor<'_>, header: &Header) -> Result<DecisionTree> {
         if p + 12 <= len {
             let reserved = u32_at(data, p).unwrap();
             let back_pos_i = u32_at(data, p + 4).unwrap();
-            if matches!(reserved, 0 | 1 | 2 | 3) && back_pos_i < n {
+            if matches!(reserved, 0..=3) && back_pos_i < n {
                 let test_tag_id = u32_at(data, p + 8).unwrap();
                 records.push(DTreeRecord::Internal(Internal {
                     reserved,
@@ -868,7 +865,10 @@ pub fn read(cur: &mut Cursor<'_>, header: &Header) -> Result<DecisionTree> {
     cur.advance(len)
         .context("advancing cursor to EOF after decision tree")?;
 
-    Ok(DecisionTree { records, context_size })
+    Ok(DecisionTree {
+        records,
+        context_size,
+    })
 }
 
 fn u32_at(data: &[u8], off: usize) -> Option<u32> {
@@ -912,7 +912,7 @@ fn distribution_valid(data: &[u8], off: usize, num_tags: usize) -> bool {
         let Some(prob) = f64_at(data, rec + 4) else {
             return false;
         };
-        if !prob.is_finite() || prob < -1e-9 || prob > 1.0 + 1e-6 {
+        if !prob.is_finite() || !(-1e-9..=1.0 + 1e-6).contains(&prob) {
             return false;
         }
         sum += prob;
@@ -1163,7 +1163,14 @@ mod tests {
         let root = &forest.nodes[forest.roots[0]];
         match root {
             TreeNode::Internal { predicate, yes, no } => {
-                assert_eq!((predicate.reserved, predicate.back_pos_i, predicate.test_tag_id), (1, 0, 10));
+                assert_eq!(
+                    (
+                        predicate.reserved,
+                        predicate.back_pos_i,
+                        predicate.test_tag_id
+                    ),
+                    (1, 0, 10)
+                );
                 match &forest.nodes[*yes] {
                     TreeNode::Leaf { distribution, .. } => {
                         assert_eq!(distribution.weight, 5);
@@ -1171,8 +1178,16 @@ mod tests {
                     _ => panic!("root.yes should be a leaf"),
                 }
                 match &forest.nodes[*no] {
-                    TreeNode::Internal { predicate: inner, yes: iy, no: in_, .. } => {
-                        assert_eq!((inner.reserved, inner.back_pos_i, inner.test_tag_id), (2, 1, 20));
+                    TreeNode::Internal {
+                        predicate: inner,
+                        yes: iy,
+                        no: in_,
+                        ..
+                    } => {
+                        assert_eq!(
+                            (inner.reserved, inner.back_pos_i, inner.test_tag_id),
+                            (2, 1, 20)
+                        );
                         match &forest.nodes[*iy] {
                             TreeNode::Leaf { distribution, .. } => {
                                 assert_eq!(distribution.weight, 6);
@@ -1181,7 +1196,10 @@ mod tests {
                         }
                         match &forest.nodes[*in_] {
                             TreeNode::Leaf { distribution, .. } => {
-                                assert_eq!(distribution.weight, 99, "should be the Default acting as rightmost leaf");
+                                assert_eq!(
+                                    distribution.weight, 99,
+                                    "should be the Default acting as rightmost leaf"
+                                );
                             }
                             _ => panic!("inner.no should be a leaf (the Default)"),
                         }
@@ -1210,10 +1228,10 @@ mod tests {
         let n = 3u32;
         let mut bytes = synth_context_size(0);
         bytes.extend_from_slice(&synth_internal(0, 1, 1)); // root: context[1] (t_-1) == 1?
-        bytes.extend_from_slice(&synth_pruned(n, 100));    // yes leaf
+        bytes.extend_from_slice(&synth_pruned(n, 100)); // yes leaf
         bytes.extend_from_slice(&synth_internal(0, 0, 2)); // inner: context[0] (t_-2) == 2?
-        bytes.extend_from_slice(&synth_pruned(n, 200));    // inner yes leaf
-        bytes.extend_from_slice(&synth_default(n, 300));   // inner no leaf
+        bytes.extend_from_slice(&synth_pruned(n, 200)); // inner yes leaf
+        bytes.extend_from_slice(&synth_default(n, 300)); // inner no leaf
 
         let tree = read(&mut Cursor::new(&bytes), &stub_header(n)).unwrap();
         let traversal = tree.traversal().unwrap();

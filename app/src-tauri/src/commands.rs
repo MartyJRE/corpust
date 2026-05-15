@@ -81,8 +81,8 @@ pub fn list_corpora() -> Result<Vec<CorpusMeta>, String> {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    let entries = std::fs::read_dir(&root)
-        .map_err(|e| format!("reading {}: {e}", root.display()))?;
+    let entries =
+        std::fs::read_dir(&root).map_err(|e| format!("reading {}: {e}", root.display()))?;
     for entry in entries.filter_map(Result::ok) {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
@@ -104,10 +104,7 @@ pub fn list_corpora() -> Result<Vec<CorpusMeta>, String> {
 /// or `build_index`). Registers the handle in `AppState` so subsequent
 /// KWIC / collocate calls hit the same instance.
 #[tauri::command]
-pub fn open_corpus(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<CorpusMeta, String> {
+pub fn open_corpus(state: State<'_, AppState>, id: String) -> Result<CorpusMeta, String> {
     let (index, meta) = load_from_disk(&id)?;
     state
         .corpora
@@ -182,12 +179,10 @@ pub fn run_collocates(
     for (w, r) in right_counts {
         merged.entry(w).or_default().1 = r;
     }
-    let mut vec: Vec<(String, u32, u32)> = merged
-        .into_iter()
-        .map(|(w, (l, r))| (w, l, r))
-        .collect();
+    let mut vec: Vec<(String, u32, u32)> =
+        merged.into_iter().map(|(w, (l, r))| (w, l, r)).collect();
     vec.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
-    vec.truncate(req.limit.max(1).min(200));
+    vec.truncate(req.limit.clamp(1, 200));
 
     let collocates: Vec<CollocateDto> = vec
         .into_iter()
@@ -242,11 +237,12 @@ fn tokenize_for_collocates(s: &str) -> impl Iterator<Item = String> + '_ {
 }
 
 #[tauri::command]
-pub fn run_kwic(
-    state: State<'_, AppState>,
-    req: KwicRequest,
-) -> Result<KwicResult, String> {
-    let context = if req.context == 0 { DEFAULT_CONTEXT } else { req.context };
+pub fn run_kwic(state: State<'_, AppState>, req: KwicRequest) -> Result<KwicResult, String> {
+    let context = if req.context == 0 {
+        DEFAULT_CONTEXT
+    } else {
+        req.context
+    };
     let limit = req.limit.max(1);
     let kreq = CoreKwicRequest::new(&req.term)
         .layer(req.layer.into())
@@ -263,7 +259,7 @@ pub fn run_kwic(
         hits: hits
             .into_iter()
             .map(|h| KwicHitDto {
-                doc_id: h.doc_id as u64,
+                doc_id: h.doc_id,
                 path: h.path.to_string_lossy().into_owned(),
                 left: h.left,
                 hit: h.hit,
@@ -282,10 +278,7 @@ pub fn run_kwic(
 /// `spawn_blocking` keeps both sides happy: no UI freeze, and the
 /// file/I-O/annotator code inside stays synchronous.
 #[tauri::command]
-pub async fn build_index(
-    app: AppHandle,
-    req: BuildRequest,
-) -> Result<CorpusMeta, String> {
+pub async fn build_index(app: AppHandle, req: BuildRequest) -> Result<CorpusMeta, String> {
     let started = Instant::now();
     let handle = tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -340,8 +333,8 @@ fn build_index_inner(
     let base_slug = paths::slugify(&name);
     let slug = paths::unique_slug(&base_slug)
         .map_err(|e| format!("allocating slug for {name:?}: {e:#}"))?;
-    let corpus_dir = paths::corpus_dir(&slug)
-        .map_err(|e| format!("resolving corpus dir: {e:#}"))?;
+    let corpus_dir =
+        paths::corpus_dir(&slug).map_err(|e| format!("resolving corpus dir: {e:#}"))?;
     let out_path = corpus_dir.join("index");
     std::fs::create_dir_all(&corpus_dir)
         .map_err(|e| format!("creating {}: {e}", corpus_dir.display()))?;
@@ -399,7 +392,11 @@ fn build_index_inner(
         (None, None)
     };
 
-    let indexing_phase = if req.annotate { "annotating" } else { "indexing" };
+    let indexing_phase = if req.annotate {
+        "annotating"
+    } else {
+        "indexing"
+    };
     emit_progress(app, started, indexing_phase, 0, Some(doc_count as u64));
 
     let t_build = Instant::now();
@@ -419,20 +416,28 @@ fn build_index_inner(
                 || seen - last_emitted >= (doc_count / 200).max(1)
                 || elapsed.as_millis() >= 100
             {
-                emit_progress(app, started, indexing_phase, seen as u64, Some(doc_count as u64));
+                emit_progress(
+                    app,
+                    started,
+                    indexing_phase,
+                    seen as u64,
+                    Some(doc_count as u64),
+                );
                 last_emitted = seen;
                 last_instant = Instant::now();
             }
         })
         .map_err(|e| format!("indexing failed: {e:#}"))?;
     let build_ms = t_build.elapsed().as_millis() as u64;
-    emit_progress(app, started, "committing", doc_count as u64, Some(doc_count as u64));
-
-    let mut meta = CorpusMeta::stub(
-        slug.clone(),
-        name,
-        out_path.to_string_lossy().into_owned(),
+    emit_progress(
+        app,
+        started,
+        "committing",
+        doc_count as u64,
+        Some(doc_count as u64),
     );
+
+    let mut meta = CorpusMeta::stub(slug.clone(), name, out_path.to_string_lossy().into_owned());
     meta.source_path = source_path.to_string_lossy().into_owned();
     meta.annotated = req.annotate;
     meta.doc_count = doc_count as u64;
@@ -440,7 +445,11 @@ fn build_index_inner(
     // an aggregation pass over the index. Good enough for the UI's
     // "built: N tokens" header for now.
     meta.token_count = (byte_count / 6) as u64;
-    meta.avg_doc_len = if doc_count > 0 { (byte_count / doc_count) as u64 } else { 0 };
+    meta.avg_doc_len = if doc_count > 0 {
+        (byte_count / doc_count) as u64
+    } else {
+        0
+    };
     meta.built_at = iso_now();
     meta.build_ms = build_ms;
     meta.size_on_disk = dir_size(&out_path).unwrap_or(0);
@@ -454,7 +463,13 @@ fn build_index_inner(
     write_metadata_file(&corpus_dir.join("metadata.json"), &meta)
         .map_err(|e| format!("writing metadata: {e:#}"))?;
 
-    emit_progress(app, started, "done", doc_count as u64, Some(doc_count as u64));
+    emit_progress(
+        app,
+        started,
+        "done",
+        doc_count as u64,
+        Some(doc_count as u64),
+    );
     state
         .corpora
         .lock()
@@ -499,8 +514,8 @@ where
 /// Open an existing corpus from disk by slug. Returns the tantivy
 /// handle plus the persisted metadata.
 fn load_from_disk(slug: &str) -> Result<(CorpusIndex, CorpusMeta), String> {
-    let corpus_dir = paths::corpus_dir(slug)
-        .map_err(|e| format!("resolving corpus dir for {slug}: {e:#}"))?;
+    let corpus_dir =
+        paths::corpus_dir(slug).map_err(|e| format!("resolving corpus dir for {slug}: {e:#}"))?;
     let meta_file = corpus_dir.join("metadata.json");
     if !meta_file.exists() {
         return Err(format!(
@@ -553,9 +568,7 @@ fn resolve_treetagger_bundle(
             language
         ));
     }
-    let abbr = bundle
-        .join("lib")
-        .join(format!("{language}-abbreviations"));
+    let abbr = bundle.join("lib").join(format!("{language}-abbreviations"));
     Ok((par, abbr))
 }
 
@@ -629,7 +642,11 @@ fn resolve_treetagger_bundle_root(app: &AppHandle) -> Result<PathBuf, String> {
 
     // 4. cwd-relative — last-chance fallback, useful for
     // `cargo run` from the repo root.
-    for rel in ["resources/treetagger", "../resources/treetagger", "../../resources/treetagger"] {
+    for rel in [
+        "resources/treetagger",
+        "../resources/treetagger",
+        "../../resources/treetagger",
+    ] {
         if let Some(found) = try_path(PathBuf::from(rel), &mut tried) {
             return Ok(found);
         }
@@ -654,15 +671,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp_file(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
+        std::env::temp_dir().join(format!(
             "corpust-meta-{}-{}.json",
             name,
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
-        path
+        ))
     }
 
     #[test]
@@ -687,7 +703,10 @@ mod tests {
         assert_eq!(read_back.doc_count, 42);
         assert_eq!(read_back.token_count, 1234);
         assert!(read_back.annotated);
-        assert_eq!(read_back.annotator.as_deref(), Some("treetagger-rs-english"));
+        assert_eq!(
+            read_back.annotator.as_deref(),
+            Some("treetagger-rs-english")
+        );
     }
 
     #[test]
@@ -701,7 +720,8 @@ mod tests {
         let err = read_metadata_file(&path).unwrap_err();
         std::fs::remove_file(&path).ok();
         assert!(
-            err.to_string().contains("unsupported metadata schema version"),
+            err.to_string()
+                .contains("unsupported metadata schema version"),
             "unexpected error: {err}"
         );
     }

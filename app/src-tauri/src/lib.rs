@@ -19,6 +19,12 @@ pub struct AppState {
     pub corpora: Mutex<HashMap<String, OpenedCorpus>>,
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppState {
     pub fn new() -> Self {
         Self {

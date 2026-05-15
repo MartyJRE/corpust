@@ -19,8 +19,8 @@
 //! ```
 
 use anyhow::{Context, Result};
-use corpust_annotate::{AnnotatedToken, Annotator};
 use corpust_annotate::treetagger::TreeTagger;
+use corpust_annotate::{AnnotatedToken, Annotator};
 use std::path::Path;
 
 /// Ground-truth tagger backed by the bundled `tree-tagger` subprocess.
@@ -105,17 +105,26 @@ impl DiffReport {
 
     /// Number of POS-only disagreements.
     pub fn pos_errors(&self) -> usize {
-        self.mismatches.iter().filter(|m| m.kind == MismatchKind::Pos).count()
+        self.mismatches
+            .iter()
+            .filter(|m| m.kind == MismatchKind::Pos)
+            .count()
     }
 
     /// Number of lemma-only disagreements.
     pub fn lemma_errors(&self) -> usize {
-        self.mismatches.iter().filter(|m| m.kind == MismatchKind::Lemma).count()
+        self.mismatches
+            .iter()
+            .filter(|m| m.kind == MismatchKind::Lemma)
+            .count()
     }
 
     /// Number of tokenization/alignment disagreements.
     pub fn word_errors(&self) -> usize {
-        self.mismatches.iter().filter(|m| m.kind == MismatchKind::Word).count()
+        self.mismatches
+            .iter()
+            .filter(|m| m.kind == MismatchKind::Word)
+            .count()
     }
 
     /// POS accuracy across the aligned positions. `1.0` when every
@@ -140,11 +149,7 @@ impl DiffReport {
 /// This favors simplicity over robustness to mid-stream drift; real
 /// use cases should restart comparison after a Word mismatch rather
 /// than treat downstream Pos/Lemma mismatches as independent signals.
-pub fn diff(
-    oracle: &dyn Annotator,
-    subject: &dyn Annotator,
-    text: &str,
-) -> Result<DiffReport> {
+pub fn diff(oracle: &dyn Annotator, subject: &dyn Annotator, text: &str) -> Result<DiffReport> {
     let o = oracle.annotate(text).context("oracle tagging failed")?;
     let s = subject.annotate(text).context("subject tagging failed")?;
 
@@ -214,7 +219,10 @@ mod tests {
         let o1 = Oracle::from_bundle(&bundle, "english").unwrap();
         let o2 = Oracle::from_bundle(&bundle, "english").unwrap();
         let report = diff(&o1, &o2, "The quick brown fox jumps over the lazy dog.").unwrap();
-        assert!(report.is_exact(), "oracle disagreed with itself: {report:#?}");
+        assert!(
+            report.is_exact(),
+            "oracle disagreed with itself: {report:#?}"
+        );
         assert!(report.matches > 0);
     }
 
@@ -234,7 +242,12 @@ mod tests {
         // The oracle always emits a POS; WordOnlyAnnotator never does —
         // so across aligned positions we expect 100% POS-error on
         // whatever overlap exists.
-        assert!(report.mismatches.iter().any(|m| m.kind != MismatchKind::None));
+        assert!(
+            report
+                .mismatches
+                .iter()
+                .any(|m| m.kind != MismatchKind::None)
+        );
     }
 
     /// Synthetic annotator that mirrors the oracle exactly — checks
@@ -244,17 +257,26 @@ mod tests {
         struct Fixed(Vec<(String, String, String)>);
         impl Annotator for Fixed {
             fn annotate<'a>(&self, _text: &'a str) -> Result<Vec<AnnotatedToken<'a>>> {
-                Ok(self.0.iter().enumerate().map(|(i, (w, p, l))| AnnotatedToken {
-                    word: Cow::Owned(w.clone()),
-                    pos: Some(Cow::Owned(p.clone())),
-                    lemma: Some(Cow::Owned(l.clone())),
-                    byte_start: 0,
-                    byte_end: 0,
-                    position: i as u32,
-                }).collect())
+                Ok(self
+                    .0
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (w, p, l))| AnnotatedToken {
+                        word: Cow::Owned(w.clone()),
+                        pos: Some(Cow::Owned(p.clone())),
+                        lemma: Some(Cow::Owned(l.clone())),
+                        byte_start: 0,
+                        byte_end: 0,
+                        position: i as u32,
+                    })
+                    .collect())
             }
-            fn supported_languages(&self) -> &[&'static str] { &["*"] }
-            fn id(&self) -> &str { "fixed" }
+            fn supported_languages(&self) -> &[&'static str] {
+                &["*"]
+            }
+            fn id(&self) -> &str {
+                "fixed"
+            }
         }
         let pair = Fixed(vec![
             ("cat".into(), "NN".into(), "cat".into()),
@@ -275,25 +297,34 @@ mod tests {
         struct Fixed(Vec<(String, String, String)>);
         impl Annotator for Fixed {
             fn annotate<'a>(&self, _text: &'a str) -> Result<Vec<AnnotatedToken<'a>>> {
-                Ok(self.0.iter().enumerate().map(|(i, (w, p, l))| AnnotatedToken {
-                    word: Cow::Owned(w.clone()),
-                    pos: Some(Cow::Owned(p.clone())),
-                    lemma: Some(Cow::Owned(l.clone())),
-                    byte_start: 0,
-                    byte_end: 0,
-                    position: i as u32,
-                }).collect())
+                Ok(self
+                    .0
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (w, p, l))| AnnotatedToken {
+                        word: Cow::Owned(w.clone()),
+                        pos: Some(Cow::Owned(p.clone())),
+                        lemma: Some(Cow::Owned(l.clone())),
+                        byte_start: 0,
+                        byte_end: 0,
+                        position: i as u32,
+                    })
+                    .collect())
             }
-            fn supported_languages(&self) -> &[&'static str] { &["*"] }
-            fn id(&self) -> &str { "fixed" }
+            fn supported_languages(&self) -> &[&'static str] {
+                &["*"]
+            }
+            fn id(&self) -> &str {
+                "fixed"
+            }
         }
         let oracle = Fixed(vec![
             ("run".into(), "VV".into(), "run".into()),
             ("went".into(), "VVD".into(), "go".into()),
         ]);
         let subj = Fixed(vec![
-            ("run".into(), "NN".into(), "run".into()),       // pos differs
-            ("went".into(), "VVD".into(), "went".into()),    // lemma differs
+            ("run".into(), "NN".into(), "run".into()),    // pos differs
+            ("went".into(), "VVD".into(), "went".into()), // lemma differs
         ]);
         let r = diff(&oracle, &subj, "irrelevant").unwrap();
         assert_eq!(r.pos_errors(), 1);

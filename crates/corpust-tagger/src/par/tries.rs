@@ -97,9 +97,14 @@ pub struct Distribution {
 impl Distribution {
     /// Tag with the largest probability in the distribution.
     pub fn peak(&self) -> Option<TagProb> {
-        self.probs.iter().max_by(|a, b| {
-            a.prob.partial_cmp(&b.prob).unwrap_or(std::cmp::Ordering::Equal)
-        }).copied()
+        self.probs
+            .iter()
+            .max_by(|a, b| {
+                a.prob
+                    .partial_cmp(&b.prob)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied()
     }
 }
 
@@ -181,7 +186,11 @@ impl Trie {
             }
             // Track interior aggregate as we descend, in case we run
             // out of input characters before reaching a leaf.
-            if let Some(d) = self.interior_aggregate.get(child_idx).and_then(|o| o.as_ref()) {
+            if let Some(d) = self
+                .interior_aggregate
+                .get(child_idx)
+                .and_then(|o| o.as_ref())
+            {
                 best = Some(d);
             }
             cur = child_idx;
@@ -234,9 +243,7 @@ pub struct Tries {
 pub fn read(cur: &mut Cursor<'_>, header: &Header, dtree_start: usize) -> Result<Tries> {
     let slab_start = cur.offset();
     if dtree_start <= slab_start {
-        bail!(
-            "dtree start {dtree_start} must be past slab start {slab_start}"
-        );
+        bail!("dtree start {dtree_start} must be past slab start {slab_start}");
     }
     let bytes = cur.bytes_after_cursor();
     let remaining = dtree_start - slab_start;
@@ -249,8 +256,7 @@ pub fn read(cur: &mut Cursor<'_>, header: &Header, dtree_start: usize) -> Result
     let slab = &bytes[..remaining];
 
     // Locate prefix trie entry run.
-    let prefix_start = find_entry_run(slab, 0)
-        .context("could not locate prefix trie")?;
+    let prefix_start = find_entry_run(slab, 0).context("could not locate prefix trie")?;
 
     // Read the per-tag prelude — `num_tags` f64 values at the very
     // start of the slab, one per tag id. The remaining bytes between
@@ -328,22 +334,14 @@ fn is_entry_at(slab: &[u8], off: usize) -> bool {
     if off + 12 > slab.len() {
         return false;
     }
-    let footer = u32::from_le_bytes([
-        slab[off + 8],
-        slab[off + 9],
-        slab[off + 10],
-        slab[off + 11],
-    ]);
+    let footer = u32::from_le_bytes([slab[off + 8], slab[off + 9], slab[off + 10], slab[off + 11]]);
     footer == 0xBABABABA
 }
 
 fn find_entry_run(slab: &[u8], start: usize) -> Option<usize> {
     let mut off = start;
     while off + 36 <= slab.len() {
-        if is_entry_at(slab, off)
-            && is_entry_at(slab, off + 12)
-            && is_entry_at(slab, off + 24)
-        {
+        if is_entry_at(slab, off) && is_entry_at(slab, off + 12) && is_entry_at(slab, off + 24) {
             return Some(off);
         }
         off += 1;
@@ -400,9 +398,7 @@ fn segment_distributions(array: &ProbTagArray) -> Vec<Distribution> {
         // Only segment on clean records. Garbage-prob values at the
         // tail of a run (if any) get swept into the current segment
         // silently; real .par files seem not to have trailing junk.
-        if idx > start
-            && (rec.prob > cur_prev + 1e-4 || cur_sum + rec.prob > 1.001)
-        {
+        if idx > start && (rec.prob > cur_prev + 1e-4 || cur_sum + rec.prob > 1.001) {
             out.push(segment_to_dist(&array.records[start..idx]));
             start = idx;
             cur_sum = 0.0;
@@ -474,9 +470,7 @@ fn build_trie(entries: Vec<TrieEntry>, distributions: Vec<Distribution>) -> Resu
     }
     let root = &entries[0];
     if root.flag != 0 {
-        bail!(
-            "trie root is marked as a leaf (flag=1) — can't be, root must have children"
-        );
+        bail!("trie root is marked as a leaf (flag=1) — can't be, root must have children");
     }
     let root_end = root.offset as usize + root.count as usize;
     if root_end > entries.len() {
@@ -575,7 +569,10 @@ fn build_trie(entries: Vec<TrieEntry>, distributions: Vec<Distribution>) -> Resu
         }
         let mut probs: Vec<TagProb> = accum
             .into_iter()
-            .map(|(tag_id, prob)| TagProb { tag_id, prob: prob / total })
+            .map(|(tag_id, prob)| TagProb {
+                tag_id,
+                prob: prob / total,
+            })
             .collect();
         probs.sort_by(|a, b| b.prob.partial_cmp(&a.prob).unwrap());
         interior_aggregate[*idx] = Some(Distribution { probs });
@@ -628,11 +625,23 @@ mod tests {
 
         // Prob-arrays clean count
         assert!(
-            tries.prob_array_1.records.iter().filter(|r| r.flag == 0 && r.canary == 0xBABA).count() > 5700,
+            tries
+                .prob_array_1
+                .records
+                .iter()
+                .filter(|r| r.flag == 0 && r.canary == 0xBABA)
+                .count()
+                > 5700,
             "prob-array-1 should have >5700 clean records"
         );
         assert!(
-            tries.prob_array_2.records.iter().filter(|r| r.flag == 0 && r.canary == 0xBABA).count() > 6000,
+            tries
+                .prob_array_2
+                .records
+                .iter()
+                .filter(|r| r.flag == 0 && r.canary == 0xBABA)
+                .count()
+                > 6000,
             "prob-array-2 should have >6000 clean records"
         );
 
@@ -694,7 +703,14 @@ mod tests {
         // NN = 19 on english.par. 'sses' leaf had dist NN=0.98 in the
         // Python exploration — assert NN is the top tag and its prob
         // is high.
-        assert_eq!(peak.tag_id, 19, "peak tag for 'classes' should be NN (tag 19)");
-        assert!(peak.prob > 0.9, "peak prob for 'classes' should be > 0.9, was {}", peak.prob);
+        assert_eq!(
+            peak.tag_id, 19,
+            "peak tag for 'classes' should be NN (tag 19)"
+        );
+        assert!(
+            peak.prob > 0.9,
+            "peak prob for 'classes' should be > 0.9, was {}",
+            peak.prob
+        );
     }
 }

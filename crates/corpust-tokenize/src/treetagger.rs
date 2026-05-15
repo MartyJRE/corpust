@@ -1,3 +1,8 @@
+// The module docstring uses nested-list indentation that mirrors the
+// algorithm it describes. Clippy's `doc_overindented_list_items` lint
+// would flatten the nesting and lose that structure; allow it here.
+#![allow(clippy::doc_overindented_list_items)]
+
 //! Pure-Rust port of `utf8-tokenize.perl` (Helmut Schmid / Serge Sharoff).
 //!
 //! The upstream Perl script is the canonical pre-tokenizer for TreeTagger:
@@ -82,7 +87,9 @@ impl Tokenizer {
             }
             abbr.insert(t.to_owned());
         }
-        Ok(Self { abbreviations: abbr })
+        Ok(Self {
+            abbreviations: abbr,
+        })
     }
 
     /// Tokenize `text` into owned token strings, one per element.
@@ -281,10 +288,12 @@ fn split_sgml_chunks(text: &str) -> Vec<Chunk<'_>> {
 }
 
 fn utf8_char_len(b: u8) -> usize {
-    if b < 0x80 {
+    if b < 0xC0 {
+        // ASCII (b < 0x80) and continuation bytes (b < 0xC0)
+        // both contribute a single byte from this position —
+        // continuation bytes shouldn't start a char but we stay
+        // lenient.
         1
-    } else if b < 0xC0 {
-        1 // continuation; shouldn't start a char, but be lenient
     } else if b < 0xE0 {
         2
     } else if b < 0xF0 {
@@ -325,10 +334,10 @@ fn pad_punctuation(text: &str) -> String {
         // `;!?` before non-space → insert space.
         if matches!(c, ';' | '!' | '?') {
             out.push(c);
-            if let Some(&n) = chars.peek() {
-                if !n.is_whitespace() {
-                    out.push(' ');
-                }
+            if let Some(&n) = chars.peek()
+                && !n.is_whitespace()
+            {
+                out.push(' ');
             }
             continue;
         }
@@ -422,7 +431,7 @@ fn is_letter_period_abbrev(word: &str) -> bool {
         return false;
     }
     let bytes = word.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return false;
     }
     let mut i = 0;
@@ -438,7 +447,7 @@ fn is_letter_period_abbrev(word: &str) -> bool {
     true
 }
 
-fn peel_trailing_fclitic<'a>(word: &'a str) -> Option<(String, &'a str)> {
+fn peel_trailing_fclitic(word: &str) -> Option<(String, &str)> {
     // English FClitic: `['’´](s|re|ve|d|m|em|ll)|n['’´]t`
     //
     // Matched case-insensitively in the Perl (the `/i` flag on the `s///i`).
@@ -447,12 +456,7 @@ fn peel_trailing_fclitic<'a>(word: &'a str) -> Option<(String, &'a str)> {
     // Case 1: n + apostrophe + t (n't).
     // Work on the lowercased last 3 chars for the match, but return
     // the ORIGINAL case-preserved substring.
-    if let Some(boundary) = word
-        .char_indices()
-        .rev()
-        .nth(2)
-        .map(|(i, _)| i)
-    {
+    if let Some(boundary) = word.char_indices().rev().nth(2).map(|(i, _)| i) {
         let tail = &word[boundary..];
         let mut iter = tail.chars();
         let a = iter.next()?;
@@ -465,9 +469,29 @@ fn peel_trailing_fclitic<'a>(word: &'a str) -> Option<(String, &'a str)> {
     }
 
     // Case 2: apostrophe + one of (s re ve d m em ll) — case-insensitive.
-    for suf in ["'s", "'re", "'ve", "'d", "'m", "'em", "'ll",
-                "\u{2019}s", "\u{2019}re", "\u{2019}ve", "\u{2019}d", "\u{2019}m", "\u{2019}em", "\u{2019}ll",
-                "\u{00B4}s", "\u{00B4}re", "\u{00B4}ve", "\u{00B4}d", "\u{00B4}m", "\u{00B4}em", "\u{00B4}ll"] {
+    for suf in [
+        "'s",
+        "'re",
+        "'ve",
+        "'d",
+        "'m",
+        "'em",
+        "'ll",
+        "\u{2019}s",
+        "\u{2019}re",
+        "\u{2019}ve",
+        "\u{2019}d",
+        "\u{2019}m",
+        "\u{2019}em",
+        "\u{2019}ll",
+        "\u{00B4}s",
+        "\u{00B4}re",
+        "\u{00B4}ve",
+        "\u{00B4}d",
+        "\u{00B4}m",
+        "\u{00B4}em",
+        "\u{00B4}ll",
+    ] {
         if word.len() <= suf.len() {
             continue;
         }
@@ -499,10 +523,7 @@ mod tests {
     #[test]
     fn plain_sentence() {
         let got = tk().tokenize("The quick brown fox jumps.");
-        assert_eq!(
-            got,
-            vec!["The", "quick", "brown", "fox", "jumps", "."]
-        );
+        assert_eq!(got, vec!["The", "quick", "brown", "fox", "jumps", "."]);
     }
 
     #[test]
@@ -614,7 +635,11 @@ mod tests {
             .arg(&sample)
             .output()
             .expect("run perl tokenizer");
-        assert!(perl_out.status.success(), "perl tokenizer failed: {:?}", perl_out);
+        assert!(
+            perl_out.status.success(),
+            "perl tokenizer failed: {:?}",
+            perl_out
+        );
         let perl_text = String::from_utf8(perl_out.stdout).unwrap();
         let perl_lines: Vec<&str> = perl_text.lines().collect();
 
@@ -631,10 +656,7 @@ mod tests {
             perl_lines.len()
         );
         for (i, (r, p)) in rust_tokens.iter().zip(perl_lines.iter()).enumerate() {
-            assert_eq!(
-                r, p,
-                "token #{i} mismatch — rust={r:?} perl={p:?}"
-            );
+            assert_eq!(r, p, "token #{i} mismatch — rust={r:?} perl={p:?}");
         }
     }
 }
