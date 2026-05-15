@@ -651,7 +651,7 @@ mod tests {
         let sample: String = full.chars().take(50_000).collect();
         let oracle = testkit::Oracle::from_bundle(&bundle, "english").unwrap();
         let mut subject = Tagger::load(&par, "english", english_abbreviations()).unwrap();
-        let lambdas = [0.00, 0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 0.80, 1.00];
+        let lambdas = [0.00, 0.30, 0.50, 0.65, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00];
         for &lambda in &lambdas {
             subject.set_lambda_bigram(lambda);
             let report = testkit::diff(&oracle, &subject, &sample).unwrap();
@@ -659,6 +659,175 @@ mod tests {
                 "λ_bigram={lambda:.2}  pos_acc={:.4}  POS-err={}",
                 report.pos_accuracy(),
                 report.pos_errors()
+            );
+        }
+    }
+
+    /// Per-context diff: for every `(tag_-1, tag_-2)` in
+    /// `/tmp/print-prob-tree.txt`, look up the oracle distribution
+    /// and traverse our bigram tree on the same context, then report
+    /// disagreement statistics. Localizes whether the bigram tree is
+    /// parsed correctly. Ignored by default.
+    #[test]
+    #[ignore]
+    fn diff_bigram_tree_vs_oracle() {
+        use std::collections::HashMap;
+        let Some(bundle) = bundle_path() else { return };
+        let par = bundle.join("lib/english.par");
+        let path = "/tmp/print-prob-tree.txt";
+        if !Path::new(path).exists() {
+            eprintln!("missing {path} — generate with `tree-tagger -print-prob-tree english.par`");
+            return;
+        }
+        let raw = std::fs::read_to_string(path).unwrap();
+
+        let model = par::load(&par).unwrap();
+        let n_tags = model.header.tags.len();
+        let tag_to_id: HashMap<String, u32> = model
+            .header
+            .tags
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i as u32))
+            .collect();
+
+        // Parse oracle dump (mirrors binary_prob_tree_upper_bound).
+        let mut oracle_table: HashMap<(u32, u32), Vec<f64>> = HashMap::new();
+        let mut cur_t1: Option<u32> = None;
+        let mut cur_t2: Option<u32> = None;
+        let mut cur_probs: Vec<f64> = vec![0.0; n_tags];
+        let mut cur_idx = 0usize;
+        let flush =
+            |t1: Option<u32>, t2: Option<u32>, probs: &[f64], tbl: &mut HashMap<(u32, u32), Vec<f64>>| {
+                if let (Some(t1), Some(t2)) = (t1, t2) {
+                    tbl.insert((t1, t2), probs.to_vec());
+                }
+            };
+        for line in raw.lines() {
+            if let Some(rest) = line.strip_prefix("tag[-1] = ") {
+                flush(cur_t1, cur_t2, &cur_probs, &mut oracle_table);
+                cur_t1 = tag_to_id.get(rest.trim()).copied();
+                cur_t2 = None;
+            } else if let Some(rest) = line.strip_prefix("\ttag[-2] = ") {
+                flush(cur_t1, cur_t2, &cur_probs, &mut oracle_table);
+                cur_t2 = tag_to_id.get(rest.trim()).copied();
+                cur_probs = vec![0.0; n_tags];
+                cur_idx = 0;
+            } else if line.starts_with("\t\t") && cur_t1.is_some() && cur_t2.is_some() {
+                let trimmed = line.trim();
+                if let Some((_tag, prob_str)) = trimmed.rsplit_once(' ') {
+                    let p: f64 = prob_str.parse().unwrap_or(0.0);
+                    if cur_idx < n_tags {
+                        cur_probs[cur_idx] = p;
+                        cur_idx += 1;
+                    }
+                }
+            }
+        }
+        flush(cur_t1, cur_t2, &cur_probs, &mut oracle_table);
+        eprintln!("oracle contexts: {}", oracle_table.len());
+
+        // Build our traversal and walk the inference tree (last root,
+        // i.e. the bigram tree on english.par's 3-tree forest).
+        let dt = model.dtree.as_ref().expect("model has no dtree");
+        let traversal = dt.traversal().unwrap();
+        let bigram_root = *traversal.forest.roots.last().unwrap();
+
+        // Try BOTH context orderings — if one matches the oracle far
+        // better than the other, the convention is inverted somewhere.
+        // ctx_ab: [t2, t1] (current code; "oldest first")
+        // ctx_ba: [t1, t2] (reversed; "newest first")
+        let try_orders = [("ctx=[t2,t1]", true), ("ctx=[t1,t2]", false)];
+        for &(label, oldest_first) in &try_orders {
+            let mut argmax_disagree_local = 0usize;
+            let mut total_local = 0usize;
+            for (&(t1, t2), oracle_probs) in &oracle_table {
+                total_local += 1;
+                let ctx = if oldest_first { [t2, t1] } else { [t1, t2] };
+                let ours = par::dtree::traverse_tree(&traversal.forest, bigram_root, &ctx);
+                let our_argmax = ours
+                    .probs
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.prob.partial_cmp(&b.prob).unwrap())
+                    .map(|(i, _)| i as u32)
+                    .unwrap();
+                let oracle_argmax = oracle_probs
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .map(|(i, _)| i as u32)
+                    .unwrap();
+                if our_argmax != oracle_argmax {
+                    argmax_disagree_local += 1;
+                }
+            }
+            eprintln!(
+                "{label}: argmax disagrees on {argmax_disagree_local}/{total_local}",
+            );
+        }
+
+        let mut argmax_disagree = 0usize;
+        let mut total = 0usize;
+        let mut max_abs = 0.0f64;
+        let mut sum_kl_ours_to_oracle = 0.0f64;
+        let mut samples: Vec<(u32, u32, f64, u32, u32)> = Vec::new();
+        for (&(t1, t2), oracle_probs) in &oracle_table {
+            total += 1;
+            // Context is [tag_-2, tag_-1] — oldest first per the
+            // back_pos_i convention.
+            let ctx = [t2, t1];
+            let ours = par::dtree::traverse_tree(&traversal.forest, bigram_root, &ctx);
+            let mut abs_per_ctx: f64 = 0.0;
+            let mut kl = 0.0f64;
+            for k in 0..n_tags {
+                let p_ours = ours.probs[k].prob;
+                let p_oracle = oracle_probs[k];
+                let d = (p_ours - p_oracle).abs();
+                if d > abs_per_ctx {
+                    abs_per_ctx = d;
+                }
+                if p_ours > 1e-12 && p_oracle > 1e-12 {
+                    kl += p_oracle * (p_oracle.ln() - p_ours.ln());
+                }
+            }
+            max_abs = max_abs.max(abs_per_ctx);
+            sum_kl_ours_to_oracle += kl.max(0.0);
+
+            let our_argmax = ours
+                .probs
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.prob.partial_cmp(&b.prob).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            let oracle_argmax = oracle_probs
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            if our_argmax != oracle_argmax {
+                argmax_disagree += 1;
+                samples.push((t1, t2, abs_per_ctx, our_argmax, oracle_argmax));
+            }
+        }
+        samples.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+        eprintln!(
+            "compared {total} contexts: argmax disagrees on {argmax_disagree}, \
+             max abs-diff = {max_abs:.4}, mean KL(oracle||ours) = {:.4}",
+            sum_kl_ours_to_oracle / total as f64,
+        );
+        eprintln!("top 10 worst contexts:");
+        let tag_name = |t: u32| model.header.tags.get(t as usize).map(String::as_str).unwrap_or("?");
+        for &(t1, t2, d, ours, oracle) in samples.iter().take(10) {
+            eprintln!(
+                "  t_-1={}, t_-2={}: max-abs={:.4} | ours→{} vs oracle→{}",
+                tag_name(t1),
+                tag_name(t2),
+                d,
+                tag_name(ours),
+                tag_name(oracle),
             );
         }
     }

@@ -279,7 +279,9 @@ mod tests {
                 TreeNode::Internal {
                     predicate: Internal {
                         reserved: 0,
-                        back_pos_i: 0,
+                        // back_pos_i is a direct context-index; for
+                        // cl=2 [t_-2, t_-1] context, index 1 is t_-1.
+                        back_pos_i: 1,
                         test_tag_id: 1,
                     },
                     yes: 1,
@@ -298,7 +300,7 @@ mod tests {
             context_size: 2,
         };
         let marginal = synth_dist(&[1.0; 3]);
-        let traversal = Traversal { forest, root: 0, marginal, override_table: None, lambda_bigram: 0.10 };
+        let traversal = Traversal { forest, root: 0, marginal, override_table: None, lambda_bigram: 0.80 };
         let header = stub_header(n);
 
         // Token A: only candidate is tag 1 (forces context = [_, 1]).
@@ -342,7 +344,9 @@ mod tests {
                 TreeNode::Internal {
                     predicate: Internal {
                         reserved: 0,
-                        back_pos_i: 0,
+                        // back_pos_i is a direct context-index; for
+                        // cl=2 [t_-2, t_-1] context, index 1 is t_-1.
+                        back_pos_i: 1,
                         test_tag_id: 1,
                     },
                     yes: 1,
@@ -361,7 +365,7 @@ mod tests {
             context_size: 2,
         };
         let marginal = synth_dist(&[1.0; 3]);
-        let traversal = Traversal { forest, root: 0, marginal, override_table: None, lambda_bigram: 0.10 };
+        let traversal = Traversal { forest, root: 0, marginal, override_table: None, lambda_bigram: 0.80 };
         let header = stub_header(n);
 
         let cands = vec![

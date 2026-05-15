@@ -331,12 +331,12 @@ pub struct Traversal {
     pub override_table: Option<std::collections::HashMap<(u32, u32), Distribution>>,
     /// Mix weight on the bigram tree in `predict_combined`'s ensemble:
     /// `P_final = λ · tree[2] + (1 - λ) · weighted_avg(tree[0], tree[1])`.
-    /// Default is `0.10` — picked from a sweep over a 50 KB gutenberg
-    /// sample (`sweep_lambda_bigram_on_gutenberg_sample`). The U-shape
-    /// of the curve put the original `0.50` exactly at the worst point
-    /// (destructive mixing with the Bayes prior subtraction downstream
-    /// in Viterbi); shifting weight back onto the prior recovers
-    /// ~0.26 pp of POS accuracy on the larger sample.
+    /// Default is `0.80`, the plateau peak from
+    /// `sweep_lambda_bigram_on_gutenberg_sample` on a 50 KB gutenberg
+    /// sample after the predicate-direction fix (see #13). Pure bigram
+    /// (`λ=1.0`) cliffs hard — the prior subterm via Tree[1] (unigram
+    /// switch) contributes useful conditional information the bigram
+    /// tree alone misses.
     pub lambda_bigram: f64,
 }
 
@@ -595,16 +595,26 @@ impl DecisionTree {
             root,
             marginal,
             override_table: None,
-            lambda_bigram: 0.10,
+            lambda_bigram: 0.80,
         })
     }
 }
 
 /// Walk one tree of a `TreeForest` from `root_idx` with `context`
-/// = previous tags (oldest first). Each `Internal` predicate
-/// `[back_pos_i, test_tag_id]` evaluates as
-/// `context[len - 1 - back_pos_i] == test_tag_id`. Out-of-bounds
-/// reads (early in a sentence) take the no-branch.
+/// = previous tags (oldest first; for `cl=2` that's `[t_-2, t_-1]`).
+///
+/// Each `Internal` predicate `[back_pos_i, test_tag_id]` evaluates as
+/// `context[back_pos_i] == test_tag_id` — i.e. `back_pos_i` is a
+/// direct index into the oldest-first context array, **not** a
+/// "steps back from newest" offset. For `cl=2`: `back_pos_i=0` tests
+/// `t_-2`, `back_pos_i=1` tests `t_-1`. This was reverse-engineered
+/// 2026-05-15 from a per-context diff against
+/// `tree-tagger -print-prob-tree english.par` — the prior offset
+/// interpretation (`len - 1 - back_pos_i`) produced 578/722 argmax
+/// disagreements with the oracle; the direct-index interpretation
+/// drops that to 32/722. See issue #13.
+///
+/// Out-of-bounds reads (early in a sentence) take the no-branch.
 ///
 /// Returns the leaf distribution reached by the traversal.
 pub fn traverse_tree<'a>(
@@ -620,7 +630,7 @@ pub fn traverse_tree<'a>(
                 predicate, yes, no, ..
             } => {
                 let back = predicate.back_pos_i as usize;
-                let observed = context.len().checked_sub(back + 1).and_then(|k| context.get(k));
+                let observed = context.get(back);
                 idx = if observed.copied() == Some(predicate.test_tag_id) {
                     *yes
                 } else {
@@ -1178,12 +1188,14 @@ mod tests {
     }
 
     /// `predict()` follows yes/no branches according to the
-    /// reconstructed predicate. Tree shape:
+    /// reconstructed predicate. Context is oldest-first
+    /// `[t_-2, t_-1]`; `back_pos_i` is a direct index into that
+    /// array. Tree shape:
     ///
     /// ```text
-    /// root: tag_{-1} == 1?
+    /// root: context[1] (= t_-1) == 1?
     ///   yes → leaf weight=100
-    ///   no  → inner: tag_{-2} == 2?
+    ///   no  → inner: context[0] (= t_-2) == 2?
     ///           yes → leaf weight=200
     ///           no  → Default weight=300
     /// ```
@@ -1191,20 +1203,20 @@ mod tests {
     fn predict_follows_yes_no_branches() {
         let n = 3u32;
         let mut bytes = synth_context_size(0);
-        bytes.extend_from_slice(&synth_internal(0, 0, 1)); // root: tag_{-1} == 1?
+        bytes.extend_from_slice(&synth_internal(0, 1, 1)); // root: context[1] (t_-1) == 1?
         bytes.extend_from_slice(&synth_pruned(n, 100));    // yes leaf
-        bytes.extend_from_slice(&synth_internal(0, 1, 2)); // inner: tag_{-2} == 2?
+        bytes.extend_from_slice(&synth_internal(0, 0, 2)); // inner: context[0] (t_-2) == 2?
         bytes.extend_from_slice(&synth_pruned(n, 200));    // inner yes leaf
         bytes.extend_from_slice(&synth_default(n, 300));   // inner no leaf
 
         let tree = read(&mut Cursor::new(&bytes), &stub_header(n)).unwrap();
         let traversal = tree.traversal().unwrap();
 
-        // tag_{-1} == 1 → yes leaf
+        // t_-1 == 1 → yes leaf
         assert_eq!(traversal.predict(&[0, 1]).weight, 100);
-        // tag_{-1} != 1, tag_{-2} == 2 → inner yes leaf
+        // t_-1 != 1, t_-2 == 2 → inner yes leaf
         assert_eq!(traversal.predict(&[2, 0]).weight, 200);
-        // tag_{-1} != 1, tag_{-2} != 2 → default leaf
+        // t_-1 != 1, t_-2 != 2 → default leaf
         assert_eq!(traversal.predict(&[0, 0]).weight, 300);
         // empty context — predicates always evaluate false → all no
         assert_eq!(traversal.predict(&[]).weight, 300);
