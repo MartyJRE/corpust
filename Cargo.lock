@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "corpust-annotate"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "corpust-core",
@@ -697,7 +697,7 @@ dependencies = [
 
 [[package]]
 name = "corpust-cli"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -714,11 +714,11 @@ dependencies = [
 
 [[package]]
 name = "corpust-core"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 
 [[package]]
 name = "corpust-index"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "corpust-annotate",
@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "corpust-io"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "corpust-core",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "corpust-query"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "corpust-core",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "corpust-tagger"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "corpust-annotate",
@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "corpust-tokenize"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "corpust-core",
@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "corpust-ui"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "corpust-annotate",

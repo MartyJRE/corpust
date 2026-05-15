@@ -29,6 +29,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           name: ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
           body: |
@@ -74,11 +75,14 @@ jobs:
           key: release-${{ matrix.target }}
       - name: cargo build --release -p corpust-cli
         run: cargo build --release -p corpust-cli --target ${{ matrix.target }}
+      - name: rename binary for upload
+        shell: bash
+        run: cp "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" "${{ matrix.asset_name }}"
       - name: upload cli binary
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
-          files: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          files: ${{ matrix.asset_name }}
           fail_on_unmatched_files: true
 
   build-tauri:
@@ -136,3 +140,4 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
