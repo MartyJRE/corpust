@@ -631,14 +631,17 @@ mod tests {
     }
 
     fn tempdir() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("corpust-idx-{}", rand_suffix()))
-    }
-
-    fn rand_suffix() -> u64 {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64
+        // Atomic counter so tests running in parallel never collide
+        // on the same nanosecond. Process id keeps it unique across
+        // concurrent `cargo test` invocations too.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("corpust-idx-{pid}-{nanos}-{seq}"))
     }
 }
