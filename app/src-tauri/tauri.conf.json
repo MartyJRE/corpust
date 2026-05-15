@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "corpust",
-  "version": "0.1.0-alpha.2",
+  "version": "0.1.0-alpha.3",
   "identifier": "dev.corpust.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -27,7 +27,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["app", "dmg", "appimage", "deb", "nsis"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

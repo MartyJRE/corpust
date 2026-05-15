@@ -47,7 +47,7 @@ index format or the CLI flags. Once `1.0` lands:
 | Linux x86_64    | `corpust-x86_64-linux`           | `.deb` + `.AppImage`      |
 | macOS aarch64   | `corpust-aarch64-macos`          | `.dmg` + `.app`           |
 | macOS x86_64    | `corpust-x86_64-macos`           | `.dmg` + `.app`           |
-| Windows x86_64  | `corpust-x86_64-windows.exe`     | `.msi` + `.exe` installer |
+| Windows x86_64  | `corpust-x86_64-windows.exe`     | NSIS `.exe` installer     |
 
 Bundles are unsigned. macOS users will need to right-click → Open the first
 time, or run `xattr -d com.apple.quarantine corpust.app`. Windows users will
