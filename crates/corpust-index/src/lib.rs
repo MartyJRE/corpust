@@ -27,8 +27,8 @@ use tantivy::{
     DocAddress, DocSet, Index, IndexReader, ReloadPolicy, TERMINATED, TantivyDocument, Term, doc,
     postings::Postings,
     schema::{
-        BytesOptions, Field, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions,
-        Value,
+        BytesOptions, FAST, Field, IndexRecordOption, STORED, Schema, TextFieldIndexing,
+        TextOptions, Value,
     },
     tokenizer::{LowerCaser, PreTokenizedString, TextAnalyzer, Token, TokenStream, Tokenizer},
 };
@@ -68,8 +68,10 @@ struct Fields {
     body_lemma: Field,
     body_pos: Field,
     token_offsets: Field,
-    /// Metadata fields are optional so indexes built before metadata
-    /// extraction landed still open cleanly (their schema lacks them).
+    /// Optional so indexes built before these fields landed still open
+    /// cleanly (their schema lacks them). `token_count` is a FAST u64;
+    /// the metadata fields are stored text/u64.
+    token_count: Option<Field>,
     title: Option<Field>,
     author: Option<Field>,
     year: Option<Field>,
@@ -176,6 +178,7 @@ impl CorpusIndex {
             body_lemma: schema.get_field("body_lemma")?,
             body_pos: schema.get_field("body_pos")?,
             token_offsets: schema.get_field("token_offsets")?,
+            token_count: schema.get_field("token_count").ok(),
             title: schema.get_field("title").ok(),
             author: schema.get_field("author").ok(),
             year: schema.get_field("year").ok(),
@@ -295,6 +298,9 @@ impl CorpusIndex {
             self.fields.body => document.text.clone(),
             self.fields.token_offsets => offsets_bytes,
         );
+        if let Some(f) = self.fields.token_count {
+            tantivy_doc.add_u64(f, offsets.len() as u64);
+        }
         self.add_metadata_fields(&mut tantivy_doc, &document.text);
         writer.add_document(tantivy_doc)?;
         Ok(())
@@ -379,6 +385,9 @@ impl CorpusIndex {
             self.fields.body_pos => pos_pre,
             self.fields.token_offsets => offsets_bytes,
         );
+        if let Some(f) = self.fields.token_count {
+            tantivy_doc.add_u64(f, offsets.len() as u64);
+        }
         self.add_metadata_fields(&mut tantivy_doc, &document.text);
         writer.add_document(tantivy_doc)?;
         Ok(())
@@ -688,17 +697,27 @@ impl CorpusIndex {
             else {
                 continue;
             };
+            // Read the stored doc id from the FAST column when present —
+            // a columnar lookup, vs fetching the whole stored document
+            // (incl. the ~MB body) per matched doc. Falls back to the
+            // stored field on indexes built before doc_id was FAST.
+            let doc_id_col = seg_reader.fast_fields().u64("doc_id").ok();
             loop {
                 let doc = postings.doc();
                 if doc == TERMINATED {
                     break;
                 }
-                let doc_addr = DocAddress::new(seg_ord as u32, doc);
-                let retrieved: TantivyDocument = searcher.doc(doc_addr)?;
-                let stored_id = retrieved
-                    .get_first(self.fields.doc_id)
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let stored_id = match &doc_id_col {
+                    Some(col) => col.first(doc).unwrap_or(0),
+                    None => {
+                        let doc_addr = DocAddress::new(seg_ord as u32, doc);
+                        let retrieved: TantivyDocument = searcher.doc(doc_addr)?;
+                        retrieved
+                            .get_first(self.fields.doc_id)
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0)
+                    }
+                };
                 let freq = postings.term_freq() as u64;
                 *doc_hits.entry(stored_id).or_default() += freq;
                 total_hits += freq;
@@ -1082,8 +1101,14 @@ fn extract_year(body: &str) -> Option<u32> {
 
 fn build_schema() -> (Schema, Fields) {
     let mut builder = Schema::builder();
-    let doc_id = builder.add_u64_field("doc_id", STORED);
+    // doc_id is FAST so term_distribution can map a matched segment-doc to
+    // its stored id via a columnar read, instead of fetching the whole
+    // stored document (incl. the ~MB body) per match.
+    let doc_id = builder.add_u64_field("doc_id", STORED | FAST);
     let path = builder.add_text_field("path", STORED);
+    // Per-document token count, FAST so the distribution axis is built
+    // columnar without parsing every doc's token_offsets sidecar.
+    let token_count = builder.add_u64_field("token_count", STORED | FAST);
 
     let indexing = TextFieldIndexing::default()
         .set_tokenizer(TOKENIZER_NAME)
@@ -1118,6 +1143,7 @@ fn build_schema() -> (Schema, Fields) {
             body_lemma,
             body_pos,
             token_offsets,
+            token_count: Some(token_count),
             title: Some(title),
             author: Some(author),
             year: Some(year),
