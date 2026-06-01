@@ -53,6 +53,11 @@ export interface DocumentInfo {
   docId: number;
   path: string;
   tokenCount: number;
+  /** Title / author / year extracted from the document body at index
+   *  time. Null when the backend extractor found nothing confidently. */
+  title: string | null;
+  author: string | null;
+  year: number | null;
 }
 
 export interface FrequenciesRequest {

@@ -10,6 +10,22 @@ export interface CorpusDetailProps {
   onDismiss: () => void;
 }
 
+interface DocRow {
+  file: string;
+  title: string | null;
+  author: string | null;
+  year: number | null;
+  tokens: number;
+}
+
+/** Render a value or a muted em-dash when it's absent. */
+function orDash(value: string | number | null) {
+  if (value === null || value === "") {
+    return <span style={{ color: "var(--fg-subtle)" }}>—</span>;
+  }
+  return value;
+}
+
 export function CorpusDetail({ corpus, onDismiss }: CorpusDetailProps) {
   const wps = Math.round(corpus.tokenCount / (corpus.buildMs / 1000));
 
@@ -28,11 +44,24 @@ export function CorpusDetail({ corpus, onDismiss }: CorpusDetailProps) {
     };
   }, [corpus.id]);
 
-  // Real corpora show filename + token count (the only per-document data
-  // the index stores). Fixtures keep their richer demo metadata.
-  const docRows = docs
-    ? docs.map((d) => ({ file: basename(d.path), tokens: d.tokenCount }))
-    : DOCUMENTS.map((d) => ({ file: d.id, tokens: d.tokens }));
+  // Real corpora carry title / author / year extracted from the document
+  // body at index time (any of which may be absent). Fixtures supply their
+  // own demo metadata. A muted em-dash stands in for a missing field.
+  const docRows: DocRow[] = docs
+    ? docs.map((d) => ({
+        file: basename(d.path),
+        title: d.title ?? null,
+        author: d.author ?? null,
+        year: d.year ?? null,
+        tokens: d.tokenCount,
+      }))
+    : DOCUMENTS.map((d) => ({
+        file: d.id,
+        title: d.title ?? null,
+        author: d.author ?? null,
+        year: d.year ?? null,
+        tokens: d.tokens,
+      }));
   return (
     <div className="cx-detail">
       <div className="cx-detail-head">
@@ -117,6 +146,9 @@ export function CorpusDetail({ corpus, onDismiss }: CorpusDetailProps) {
         <thead>
           <tr>
             <th>file</th>
+            <th>title</th>
+            <th>author</th>
+            <th className="num">year</th>
             <th className="num">tokens</th>
           </tr>
         </thead>
@@ -124,6 +156,9 @@ export function CorpusDetail({ corpus, onDismiss }: CorpusDetailProps) {
           {docRows.map((d) => (
             <tr key={d.file}>
               <td style={{ color: "var(--fg-muted)" }}>{d.file}</td>
+              <td>{orDash(d.title)}</td>
+              <td>{orDash(d.author)}</td>
+              <td className="num">{orDash(d.year)}</td>
               <td className="num">{d.tokens.toLocaleString()}</td>
             </tr>
           ))}

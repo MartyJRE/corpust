@@ -75,6 +75,31 @@ describe("tauri wrappers", () => {
     expect(invokeMock).toHaveBeenCalledWith("list_documents", { corpusId: "c1" });
   });
 
+  it("listDocuments carries title/author/year through (incl. nulls)", async () => {
+    invokeMock.mockResolvedValue([
+      {
+        docId: 0,
+        path: "84.txt",
+        tokenCount: 75000,
+        title: "Frankenstein",
+        author: "Mary Shelley",
+        year: 1818,
+      },
+      {
+        docId: 1,
+        path: "unknown.txt",
+        tokenCount: 100,
+        title: null,
+        author: null,
+        year: null,
+      },
+    ]);
+    const { listDocuments } = await import("./tauri");
+    const docs = await listDocuments("c1");
+    expect(docs[0]).toMatchObject({ title: "Frankenstein", author: "Mary Shelley", year: 1818 });
+    expect(docs[1]).toMatchObject({ title: null, author: null, year: null });
+  });
+
   it("runFrequencies forwards the request under `req`", async () => {
     invokeMock.mockResolvedValue({ rows: [], totalTokens: 0, elapsedMs: 0 });
     const { runFrequencies } = await import("./tauri");

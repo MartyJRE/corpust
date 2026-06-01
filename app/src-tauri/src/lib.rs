@@ -195,6 +195,12 @@ pub struct DocumentInfo {
     pub doc_id: u64,
     pub path: String,
     pub token_count: usize,
+    /// Title / author / year extracted from the document body at index
+    /// time. `None` when the extractor couldn't confidently find them;
+    /// serialises to `null` so the frontend renders a muted fallback.
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub year: Option<u32>,
 }
 
 // ---- Frequency table (FrequencyView word/POS tables) ----

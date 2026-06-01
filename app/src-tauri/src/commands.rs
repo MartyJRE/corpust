@@ -291,6 +291,9 @@ pub fn list_documents(
                 doc_id: d.doc_id,
                 path: d.path.to_string_lossy().into_owned(),
                 token_count: d.token_count,
+                title: d.title,
+                author: d.author,
+                year: d.year,
             })
             .collect())
     })

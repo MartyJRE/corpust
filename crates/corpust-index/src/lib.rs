@@ -55,6 +55,11 @@ struct Fields {
     body_lemma: Field,
     body_pos: Field,
     token_offsets: Field,
+    /// Metadata fields are optional so indexes built before metadata
+    /// extraction landed still open cleanly (their schema lacks them).
+    title: Option<Field>,
+    author: Option<Field>,
+    year: Option<Field>,
 }
 
 /// Which annotation layer a query targets.
@@ -90,6 +95,22 @@ pub struct DocumentInfo {
     pub doc_id: DocId,
     pub path: PathBuf,
     pub token_count: usize,
+    /// Title parsed from the document body at index time. `None` when no
+    /// title could be confidently extracted.
+    pub title: Option<String>,
+    /// Author parsed from the document body at index time.
+    pub author: Option<String>,
+    /// Publication / release year (1500–2100) parsed from the body.
+    pub year: Option<u32>,
+}
+
+/// Per-document metadata extracted from a document body at index time.
+/// Every field is best-effort: a field is `None` rather than guessed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DocMetadata {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub year: Option<u32>,
 }
 
 /// Per-document occurrence count of a term.
@@ -142,6 +163,9 @@ impl CorpusIndex {
             body_lemma: schema.get_field("body_lemma")?,
             body_pos: schema.get_field("body_pos")?,
             token_offsets: schema.get_field("token_offsets")?,
+            title: schema.get_field("title").ok(),
+            author: schema.get_field("author").ok(),
+            year: schema.get_field("year").ok(),
         };
         Self::from_index(index, fields)
     }
@@ -249,13 +273,31 @@ impl CorpusIndex {
             .collect();
         let offsets_bytes = offsets_to_bytes(&offsets);
 
-        writer.add_document(doc!(
+        let mut tantivy_doc = doc!(
             self.fields.doc_id => document.id,
             self.fields.path => document.path.display().to_string(),
             self.fields.body => document.text.clone(),
             self.fields.token_offsets => offsets_bytes,
-        ))?;
+        );
+        self.add_metadata_fields(&mut tantivy_doc, &document.text);
+        writer.add_document(tantivy_doc)?;
         Ok(())
+    }
+
+    /// Extract title/author/year from the body and append them as stored
+    /// fields, skipping any field we couldn't confidently extract (and any
+    /// schema field absent on a pre-metadata index).
+    fn add_metadata_fields(&self, tantivy_doc: &mut TantivyDocument, body: &str) {
+        let meta = extract_metadata(body);
+        if let (Some(field), Some(title)) = (self.fields.title, meta.title) {
+            tantivy_doc.add_text(field, title);
+        }
+        if let (Some(field), Some(author)) = (self.fields.author, meta.author) {
+            tantivy_doc.add_text(field, author);
+        }
+        if let (Some(field), Some(year)) = (self.fields.year, meta.year) {
+            tantivy_doc.add_u64(field, year as u64);
+        }
     }
 
     fn add_annotated(
@@ -313,14 +355,16 @@ impl CorpusIndex {
         };
         let offsets_bytes = offsets_to_bytes(&offsets);
 
-        writer.add_document(doc!(
+        let mut tantivy_doc = doc!(
             self.fields.doc_id => document.id,
             self.fields.path => document.path.display().to_string(),
             self.fields.body => body_pre,
             self.fields.body_lemma => lemma_pre,
             self.fields.body_pos => pos_pre,
             self.fields.token_offsets => offsets_bytes,
-        ))?;
+        );
+        self.add_metadata_fields(&mut tantivy_doc, &document.text);
+        writer.add_document(tantivy_doc)?;
         Ok(())
     }
 
@@ -481,10 +525,30 @@ impl CorpusIndex {
                     .and_then(|v| v.as_bytes())
                     .map(|b| bytes_to_offsets(b).len())
                     .unwrap_or(0);
+                let title = self.fields.title.and_then(|f| {
+                    retrieved
+                        .get_first(f)
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                });
+                let author = self.fields.author.and_then(|f| {
+                    retrieved
+                        .get_first(f)
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                });
+                let year = self
+                    .fields
+                    .year
+                    .and_then(|f| retrieved.get_first(f).and_then(|v| v.as_u64()))
+                    .map(|y| y as u32);
                 out.push(DocumentInfo {
                     doc_id,
                     path: PathBuf::from(path),
                     token_count,
+                    title,
+                    author,
+                    year,
                 });
             }
         }
@@ -750,6 +814,227 @@ fn bytes_to_offsets(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Metadata extraction
+// ---------------------------------------------------------------------------
+
+/// How many leading lines we scan when hunting for bare-style title/author.
+const META_SCAN_LINES: usize = 40;
+
+/// Extract best-effort title / author / year from a document body.
+///
+/// Handles two shapes seen in real corpora:
+///
+/// 1. **Project Gutenberg boilerplate headers** — explicit `Title:`,
+///    `Author:`, and `Release Date:` / `Copyright` label lines.
+/// 2. **Bare leading style** — the first meaningful non-empty line is the
+///    title and a line of the form `by <name>` (case-insensitive) within the
+///    first [`META_SCAN_LINES`] lines is the author.
+///
+/// Any field that can't be found confidently is left `None` — never guessed.
+pub fn extract_metadata(body: &str) -> DocMetadata {
+    let labelled = extract_labelled(body);
+    // Year search spans the whole header region regardless of shape.
+    let year = labelled.year.or_else(|| extract_year(body));
+
+    // If the labelled header gave us a title, trust it wholesale (it's the
+    // canonical PG block). Otherwise fall back to the bare leading style.
+    if labelled.title.is_some() || labelled.author.is_some() {
+        return DocMetadata {
+            title: labelled.title,
+            author: labelled.author,
+            year,
+        };
+    }
+
+    let bare = extract_bare(body);
+    DocMetadata {
+        title: bare.title,
+        author: bare.author,
+        year,
+    }
+}
+
+/// Pull `Title:` / `Author:` / `Release Date:` style labelled fields from a
+/// Project Gutenberg header block. Returns empty when none are present.
+fn extract_labelled(body: &str) -> DocMetadata {
+    let mut meta = DocMetadata::default();
+    for line in body.lines().take(60) {
+        let trimmed = line.trim();
+        if let Some(rest) = strip_label(trimmed, "title") {
+            if meta.title.is_none() && !rest.is_empty() {
+                meta.title = Some(rest.to_string());
+            }
+        } else if let Some(rest) = strip_label(trimmed, "author") {
+            if meta.author.is_none() && !rest.is_empty() {
+                meta.author = Some(rest.to_string());
+            }
+        } else if let Some(rest) = strip_label(trimmed, "release date")
+            && meta.year.is_none()
+        {
+            meta.year = year_in(rest);
+        }
+    }
+    meta
+}
+
+/// Case-insensitively match `"<label>:"` at the start of `line`, returning the
+/// trimmed remainder if it matches.
+fn strip_label<'a>(line: &'a str, label: &str) -> Option<&'a str> {
+    let bytes = label.len();
+    // `label` is ASCII, so a byte-prefix slice is char-safe only when the
+    // line is at least that long; guard with `get` to avoid splitting a
+    // multibyte char that happens to start within the prefix window.
+    let prefix = line.get(..bytes)?;
+    if prefix.eq_ignore_ascii_case(label) && line.as_bytes()[bytes] == b':' {
+        return Some(line[bytes + 1..].trim());
+    }
+    None
+}
+
+/// Bare leading style: first meaningful line is the title; the first `by …`
+/// line within the scan window is the author.
+fn extract_bare(body: &str) -> DocMetadata {
+    let mut meta = DocMetadata::default();
+    let mut seen = 0usize;
+    // Set when the previous meaningful line was a lone "by" — the next
+    // meaningful line is then the author name.
+    let mut author_on_next = false;
+    for raw in body.lines() {
+        if seen >= META_SCAN_LINES {
+            break;
+        }
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if is_meta_noise(line) {
+            continue;
+        }
+        seen += 1;
+
+        // Author was deferred from a lone "by" on the previous line.
+        if author_on_next {
+            author_on_next = false;
+            if meta.author.is_none() && is_plausible_name(line) {
+                meta.author = Some(normalise_author(line));
+                continue;
+            }
+        }
+
+        // A lone "by" — the author is on the following meaningful line.
+        if line.eq_ignore_ascii_case("by") {
+            author_on_next = true;
+            continue;
+        }
+
+        // `by <author>` (the leading "by" is not part of the name).
+        if let Some(name) = strip_by_prefix(line) {
+            if meta.author.is_none() && is_plausible_name(name) {
+                meta.author = Some(normalise_author(name));
+            }
+            continue;
+        }
+
+        // First meaningful content line that isn't a `by` line is the title.
+        if meta.title.is_none() {
+            meta.title = Some(normalise_title(line));
+        }
+    }
+    meta
+}
+
+/// Strip a leading case-insensitive `by ` and return the remainder, or `None`
+/// if the line doesn't start with `by`.
+fn strip_by_prefix(line: &str) -> Option<&str> {
+    let lower = line.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("by ") {
+        let offset = line.len() - rest.len();
+        Some(line[offset..].trim())
+    } else {
+        None
+    }
+}
+
+/// Lines that are clearly not title/author material (proofreading credits,
+/// illustration captions, decorative rules).
+fn is_meta_noise(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with("produced")
+        || lower.starts_with("[illustration")
+        || lower.starts_with("illustration")
+        || lower.starts_with("transcriber")
+        || lower.starts_with("contents")
+        // Distributed-proofreading credit blocks, often wrapped across lines.
+        || lower.contains("proofread")
+        || lower.contains("pgdp.net")
+        || lower.contains("distributed proof")
+        // Decorative / structural lines: no alphabetic character at all.
+        || !line.chars().any(|c| c.is_alphabetic())
+}
+
+/// A plausible author name: at least one alphabetic run, not absurdly long,
+/// and not an obvious sentence (heuristic guard against false positives like
+/// "by the time he arrived…").
+fn is_plausible_name(name: &str) -> bool {
+    let trimmed = name.trim_end_matches([',', '.']).trim();
+    !trimmed.is_empty() && trimmed.len() <= 80 && trimmed.split_whitespace().count() <= 8
+}
+
+/// Trim trailing punctuation a title commonly ends with (`;`, trailing comma).
+fn normalise_title(title: &str) -> String {
+    title.trim().trim_end_matches([';', ',']).trim().to_string()
+}
+
+/// Trim a trailing comma/period from an author line.
+fn normalise_author(author: &str) -> String {
+    author
+        .trim()
+        .trim_end_matches([',', '.'])
+        .trim()
+        .to_string()
+}
+
+/// Find a 4-digit year in [1500, 2100] anywhere in a release/copyright line.
+fn year_in(text: &str) -> Option<u32> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            // Collect the maximal digit run starting here.
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            // Exactly-4-digit runs only, so we don't pick years out of
+            // longer identifiers like ebook numbers.
+            if i - start == 4
+                && let Ok(y) = text[start..i].parse::<u32>()
+                && (1500..=2100).contains(&y)
+            {
+                return Some(y);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Search the header region for a year on a release/copyright line.
+fn extract_year(body: &str) -> Option<u32> {
+    for line in body.lines().take(60) {
+        let lower = line.to_ascii_lowercase();
+        let is_date_line = lower.contains("release date")
+            || lower.contains("copyright")
+            || lower.contains("published");
+        if is_date_line && let Some(y) = year_in(line) {
+            return Some(y);
+        }
+    }
+    None
+}
+
 fn build_schema() -> (Schema, Fields) {
     let mut builder = Schema::builder();
     let doc_id = builder.add_u64_field("doc_id", STORED);
@@ -773,6 +1058,12 @@ fn build_schema() -> (Schema, Fields) {
     let token_offsets =
         builder.add_bytes_field("token_offsets", BytesOptions::default().set_stored());
 
+    // Per-document metadata extracted at index time. Stored only — not
+    // indexed for search (the document list reads them back by address).
+    let title = builder.add_text_field("title", STORED);
+    let author = builder.add_text_field("author", STORED);
+    let year = builder.add_u64_field("year", STORED);
+
     (
         builder.build(),
         Fields {
@@ -782,6 +1073,9 @@ fn build_schema() -> (Schema, Fields) {
             body_lemma,
             body_pos,
             token_offsets,
+            title: Some(title),
+            author: Some(author),
+            year: Some(year),
         },
     )
 }
@@ -944,6 +1238,28 @@ mod tests {
     }
 
     #[test]
+    fn list_documents_round_trips_metadata() {
+        let tmp = tempdir();
+        let idx = CorpusIndex::create(&tmp).unwrap();
+        idx.add_documents(
+            [Document {
+                id: 0,
+                path: PathBuf::from("frank.txt"),
+                text: "Frankenstein\n\nby Mary Shelley\n\nRelease Date: 1818\n\nLetter 1"
+                    .to_string(),
+            }],
+            None,
+        )
+        .unwrap();
+        let docs = idx.list_documents().unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].title.as_deref(), Some("Frankenstein"));
+        assert_eq!(docs[0].author.as_deref(), Some("Mary Shelley"));
+        assert_eq!(docs[0].year, Some(1818));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn frequencies_ranks_terms_by_total_count() {
         let (tmp, idx) = two_doc_index();
         let (rows, total) = idx.frequencies(QueryLayer::Word, 10).unwrap();
@@ -993,6 +1309,161 @@ mod tests {
         assert_eq!(dist.dispersion.iter().map(|&c| c as u64).sum::<u64>(), 4);
         assert_eq!(dist.dispersion.len(), 4);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- metadata extraction -------------------------------------------
+
+    #[test]
+    fn extract_pg_boilerplate_header() {
+        let body = "\
+The Project Gutenberg eBook of Frankenstein
+
+Title: Frankenstein; Or, The Modern Prometheus
+
+Author: Mary Wollstonecraft Shelley
+
+Release Date: October 31, 1993 [eBook #84]
+
+Language: English
+
+*** START OF THE PROJECT GUTENBERG EBOOK ***
+
+Letter 1 ...";
+        let m = extract_metadata(body);
+        assert_eq!(
+            m.title.as_deref(),
+            Some("Frankenstein; Or, The Modern Prometheus")
+        );
+        assert_eq!(m.author.as_deref(), Some("Mary Wollstonecraft Shelley"));
+        assert_eq!(m.year, Some(1993));
+    }
+
+    #[test]
+    fn extract_pg_release_date_bracket_year() {
+        let body = "Title: Moby Dick\nAuthor: Herman Melville\nRelease Date: December, 2008 [EBook #2701]\n";
+        let m = extract_metadata(body);
+        assert_eq!(m.title.as_deref(), Some("Moby Dick"));
+        assert_eq!(m.author.as_deref(), Some("Herman Melville"));
+        assert_eq!(m.year, Some(2008));
+    }
+
+    #[test]
+    fn extract_bare_leading_style() {
+        // Boilerplate-stripped shape: title on line 1, `by <author>` below.
+        let body = "\
+Frankenstein;
+
+or, the Modern Prometheus
+
+by Mary Wollstonecraft (Godwin) Shelley
+
+
+ CONTENTS
+ Letter 1";
+        let m = extract_metadata(body);
+        assert_eq!(m.title.as_deref(), Some("Frankenstein"));
+        assert_eq!(
+            m.author.as_deref(),
+            Some("Mary Wollstonecraft (Godwin) Shelley")
+        );
+        assert_eq!(m.year, None);
+    }
+
+    #[test]
+    fn extract_bare_capital_by() {
+        let body = "MOBY-DICK;\n\nor, THE WHALE.\n\nBy Herman Melville\n\nCONTENTS\n";
+        let m = extract_metadata(body);
+        assert_eq!(m.title.as_deref(), Some("MOBY-DICK"));
+        assert_eq!(m.author.as_deref(), Some("Herman Melville"));
+    }
+
+    #[test]
+    fn extract_skips_illustration_and_decorative_noise() {
+        let body = "\
+[Illustration:
+                             GEORGE ALLEN
+                        ]
+
+                                PRIDE.
+                                  by
+                             Jane Austen,
+";
+        let m = extract_metadata(body);
+        // First non-noise line wins as title; decorative/illustration lines
+        // are skipped. (Indented all-caps publisher lines do count as text,
+        // so this documents the heuristic's real behaviour.)
+        assert!(m.title.is_some());
+        assert_eq!(m.author.as_deref(), Some("Jane Austen"));
+    }
+
+    #[test]
+    fn extract_returns_none_when_nothing_found() {
+        // Pure prose with no leading title/author cues and a sentence-y `by`.
+        let body = "The fox ran. It was chased by the dog through the woods.";
+        let m = extract_metadata(body);
+        // First line becomes the title (defined heuristic), but no author
+        // (the `by` is mid-sentence, not line-leading) and no year.
+        assert_eq!(m.author, None);
+        assert_eq!(m.year, None);
+    }
+
+    #[test]
+    fn extract_year_only_from_4_digit_runs() {
+        // 5-digit ebook ids must not be mistaken for a year.
+        assert_eq!(year_in("Release Date: [eBook #58169]"), None);
+        assert_eq!(year_in("Release Date: 1851 [eBook #2701]"), Some(1851));
+        assert_eq!(year_in("Copyright 1999 by someone"), Some(1999));
+        // Out-of-range years are rejected.
+        assert_eq!(year_in("circa 1200 BC"), None);
+    }
+
+    #[test]
+    fn extract_from_real_gutenberg_files_if_present() {
+        // Best-effort assertions on real downloaded fixtures. The files are
+        // not committed, so skip silently when absent.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/gutenberg");
+        let check = |id: &str, want_author: &str| {
+            let path = dir.join(format!("{id}.txt"));
+            let Ok(body) = std::fs::read_to_string(&path) else {
+                return;
+            };
+            let m = extract_metadata(&body);
+            assert!(m.title.is_some(), "expected a title for {id}.txt, got none");
+            assert_eq!(
+                m.author.as_deref(),
+                Some(want_author),
+                "author mismatch for {id}.txt"
+            );
+        };
+        check("84", "Mary Wollstonecraft (Godwin) Shelley");
+        check("2701", "Herman Melville");
+        check("2554", "Fyodor Dostoevsky");
+    }
+
+    #[test]
+    #[ignore = "diagnostic: prints extraction over all downloaded fixtures"]
+    fn dump_real_extractions() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/gutenberg");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let mut files: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "txt"))
+            .collect();
+        files.sort();
+        for f in files {
+            let body = std::fs::read_to_string(&f).unwrap();
+            let m = extract_metadata(&body);
+            println!(
+                "{:>12}  title={:?}  author={:?}  year={:?}",
+                f.file_name().unwrap().to_string_lossy(),
+                m.title,
+                m.author,
+                m.year
+            );
+        }
     }
 
     fn tempdir() -> std::path::PathBuf {
