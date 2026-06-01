@@ -51,6 +51,10 @@ pub fn run() {
             commands::run_kwic,
             commands::run_collocates,
             commands::build_index,
+            commands::list_documents,
+            commands::run_frequencies,
+            commands::run_term_distribution,
+            commands::expand_context,
         ])
         .run(tauri::generate_context!())
         .expect("error while running corpust");
@@ -97,6 +101,9 @@ pub struct KwicRequest {
 pub struct KwicHit {
     pub doc_id: u64,
     pub path: String,
+    /// Token position of the hit in its document; the frontend feeds it
+    /// back to `expand_context` to widen the concordance window.
+    pub hit_position: usize,
     pub left: String,
     pub hit: String,
     pub right: String,
@@ -178,4 +185,91 @@ pub enum TaggerKind {
     /// Bundled `tree-tagger` binary; one subprocess per document.
     /// Accurate (LancsBox parity) but slow.
     Subprocess,
+}
+
+// ---- Document list (CorpusDetail) ----
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentInfo {
+    pub doc_id: u64,
+    pub path: String,
+    pub token_count: usize,
+}
+
+// ---- Frequency table (FrequencyView word/POS tables) ----
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrequenciesRequest {
+    pub corpus_id: String,
+    pub layer: QueryLayer,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreqRow {
+    pub term: String,
+    pub count: u64,
+    pub pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrequenciesResult {
+    pub rows: Vec<FreqRow>,
+    pub total_tokens: u64,
+    pub elapsed_ms: f64,
+}
+
+// ---- Term distribution (FrequencyView per-doc table + dispersion) ----
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TermDistRequest {
+    pub corpus_id: String,
+    pub term: String,
+    pub layer: QueryLayer,
+    pub buckets: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocTermCount {
+    pub doc_id: u64,
+    pub path: String,
+    pub hits: u64,
+    pub token_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TermDistResult {
+    pub doc_counts: Vec<DocTermCount>,
+    pub dispersion: Vec<u32>,
+    pub total_hits: u64,
+    pub elapsed_ms: f64,
+}
+
+// ---- Context expansion (ContextDrawer) ----
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpandRequest {
+    pub corpus_id: String,
+    pub doc_id: u64,
+    pub position: usize,
+    pub context: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpandedContext {
+    pub doc_id: u64,
+    pub path: String,
+    pub before: String,
+    pub hit: String,
+    pub after: String,
+    pub token_count: usize,
 }

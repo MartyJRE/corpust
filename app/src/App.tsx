@@ -132,6 +132,7 @@ export function App() {
           const hits: KwicHit[] = r.hits.map((h, i) => ({
             docId: String(h.docId),
             pos: i,
+            hitPos: h.hitPosition,
             left: h.left,
             hit: h.hit,
             right: h.right,

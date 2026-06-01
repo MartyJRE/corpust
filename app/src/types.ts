@@ -35,6 +35,10 @@ export interface KwicRequest {
 export interface KwicHit {
   docId: string;
   pos: number;
+  /** Token position of the hit within its document. Carried from the
+   *  backend so the ContextDrawer can re-expand a wider window. Absent
+   *  for fixture hits. */
+  hitPos?: number;
   left: string;
   hit: string;
   right: string;

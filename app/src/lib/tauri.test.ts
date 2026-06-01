@@ -68,6 +68,55 @@ describe("tauri wrappers", () => {
     expect(invokeMock).toHaveBeenCalledWith("build_index", { req });
   });
 
+  it("listDocuments forwards corpusId", async () => {
+    invokeMock.mockResolvedValue([]);
+    const { listDocuments } = await import("./tauri");
+    await listDocuments("c1");
+    expect(invokeMock).toHaveBeenCalledWith("list_documents", { corpusId: "c1" });
+  });
+
+  it("runFrequencies forwards the request under `req`", async () => {
+    invokeMock.mockResolvedValue({ rows: [], totalTokens: 0, elapsedMs: 0 });
+    const { runFrequencies } = await import("./tauri");
+    const req = { corpusId: "c1", layer: "word" as const, limit: 12 };
+    await runFrequencies(req);
+    expect(invokeMock).toHaveBeenCalledWith("run_frequencies", { req });
+  });
+
+  it("runTermDistribution forwards the request under `req`", async () => {
+    invokeMock.mockResolvedValue({
+      docCounts: [],
+      dispersion: [],
+      totalHits: 0,
+      elapsedMs: 0,
+    });
+    const { runTermDistribution } = await import("./tauri");
+    const req = { corpusId: "c1", term: "the", layer: "word" as const, buckets: 100 };
+    await runTermDistribution(req);
+    expect(invokeMock).toHaveBeenCalledWith("run_term_distribution", { req });
+  });
+
+  it("expandContext forwards the request under `req`", async () => {
+    invokeMock.mockResolvedValue({
+      docId: 0,
+      path: "a.txt",
+      before: "",
+      hit: "the",
+      after: "",
+      tokenCount: 10,
+    });
+    const { expandContext } = await import("./tauri");
+    const req = { corpusId: "c1", docId: 0, position: 5, context: 45 };
+    await expandContext(req);
+    expect(invokeMock).toHaveBeenCalledWith("expand_context", { req });
+  });
+
+  it("isFixtureCorpus recognises baked-in demo corpora", async () => {
+    const { isFixtureCorpus } = await import("./tauri");
+    expect(isFixtureCorpus("does-not-exist")).toBe(false);
+    expect(isFixtureCorpus("gut-en")).toBe(true);
+  });
+
   it("inTauri detects the runtime marker", async () => {
     const { inTauri } = await import("./tauri");
     expect(inTauri()).toBe(false);

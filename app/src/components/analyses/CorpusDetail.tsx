@@ -1,7 +1,9 @@
 import { Download, Eye, Search } from "lucide-react";
+import { useEffect, useState } from "react";
 import { DOCUMENTS } from "@/data";
+import { type DocumentInfo, hasLiveData, listDocuments } from "@/lib/tauri";
 import type { CorpusMeta } from "@/types";
-import { formatBuildTime, formatBytes, formatDate } from "@/lib/utils";
+import { basename, formatBuildTime, formatBytes, formatDate } from "@/lib/utils";
 
 export interface CorpusDetailProps {
   corpus: CorpusMeta;
@@ -10,6 +12,27 @@ export interface CorpusDetailProps {
 
 export function CorpusDetail({ corpus, onDismiss }: CorpusDetailProps) {
   const wps = Math.round(corpus.tokenCount / (corpus.buildMs / 1000));
+
+  const [docs, setDocs] = useState<DocumentInfo[] | null>(null);
+  useEffect(() => {
+    setDocs(null);
+    if (!hasLiveData(corpus.id)) return;
+    let cancelled = false;
+    listDocuments(corpus.id)
+      .then((d) => {
+        if (!cancelled) setDocs(d);
+      })
+      .catch((e) => console.error("listDocuments failed:", e));
+    return () => {
+      cancelled = true;
+    };
+  }, [corpus.id]);
+
+  // Real corpora show filename + token count (the only per-document data
+  // the index stores). Fixtures keep their richer demo metadata.
+  const docRows = docs
+    ? docs.map((d) => ({ file: basename(d.path), tokens: d.tokenCount }))
+    : DOCUMENTS.map((d) => ({ file: d.id, tokens: d.tokens }));
   return (
     <div className="cx-detail">
       <div className="cx-detail-head">
@@ -88,25 +111,19 @@ export function CorpusDetail({ corpus, onDismiss }: CorpusDetailProps) {
 
       <div className="cx-section-h">
         <span>documents</span>
-        <span className="sub">{corpus.docCount.toLocaleString()} files · showing first 13</span>
+        <span className="sub">{docRows.length.toLocaleString()} files</span>
       </div>
       <table className="cx-doc-table">
         <thead>
           <tr>
-            <th>id</th>
-            <th>title</th>
-            <th>author</th>
-            <th className="num">year</th>
+            <th>file</th>
             <th className="num">tokens</th>
           </tr>
         </thead>
         <tbody>
-          {DOCUMENTS.map((d) => (
-            <tr key={d.id}>
-              <td style={{ color: "var(--fg-muted)" }}>{d.id}</td>
-              <td>{d.title}</td>
-              <td style={{ color: "var(--fg-muted)" }}>{d.author}</td>
-              <td className="num">{d.year}</td>
+          {docRows.map((d) => (
+            <tr key={d.file}>
+              <td style={{ color: "var(--fg-muted)" }}>{d.file}</td>
               <td className="num">{d.tokens.toLocaleString()}</td>
             </tr>
           ))}

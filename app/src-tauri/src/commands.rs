@@ -7,8 +7,10 @@
 
 use crate::{
     AppState, BuildRequest, Collocate as CollocateDto, CollocatesRequest, CollocatesResult,
-    CorpusMeta, CorpusMetaEnvelope, KwicHit as KwicHitDto, KwicRequest, KwicResult, OpenedCorpus,
-    TaggerKind,
+    CorpusMeta, CorpusMetaEnvelope, DocTermCount as DocTermCountDto,
+    DocumentInfo as DocumentInfoDto, ExpandRequest, ExpandedContext, FreqRow, FrequenciesRequest,
+    FrequenciesResult, KwicHit as KwicHitDto, KwicRequest, KwicResult, OpenedCorpus, TaggerKind,
+    TermDistRequest, TermDistResult,
 };
 use corpust_annotate::{Annotator, treetagger::TreeTagger};
 use corpust_index::{CorpusIndex, DEFAULT_CONTEXT};
@@ -261,6 +263,7 @@ pub fn run_kwic(state: State<'_, AppState>, req: KwicRequest) -> Result<KwicResu
             .map(|h| KwicHitDto {
                 doc_id: h.doc_id,
                 path: h.path.to_string_lossy().into_owned(),
+                hit_position: h.hit_position,
                 left: h.left,
                 hit: h.hit,
                 right: h.right,
@@ -269,6 +272,129 @@ pub fn run_kwic(state: State<'_, AppState>, req: KwicRequest) -> Result<KwicResu
         elapsed_ms,
         truncated,
     })
+}
+
+/// List every document in a corpus with its path + token count. Backs
+/// the CorpusDetail document table.
+#[tauri::command]
+pub fn list_documents(
+    state: State<'_, AppState>,
+    corpus_id: String,
+) -> Result<Vec<DocumentInfoDto>, String> {
+    with_corpus(&state, &corpus_id, |index| {
+        let docs = index
+            .list_documents()
+            .map_err(|e| format!("listing documents: {e:#}"))?;
+        Ok(docs
+            .into_iter()
+            .map(|d| DocumentInfoDto {
+                doc_id: d.doc_id,
+                path: d.path.to_string_lossy().into_owned(),
+                token_count: d.token_count,
+            })
+            .collect())
+    })
+}
+
+/// Corpus-wide top-N term frequencies on a layer. Backs the FrequencyView
+/// word / POS tables.
+#[tauri::command]
+pub fn run_frequencies(
+    state: State<'_, AppState>,
+    req: FrequenciesRequest,
+) -> Result<FrequenciesResult, String> {
+    let limit = req.limit.clamp(1, 1000);
+    let t0 = Instant::now();
+    let (rows, total_tokens) = with_corpus(&state, &req.corpus_id, |index| {
+        index
+            .frequencies(req.layer.into(), limit)
+            .map_err(|e| format!("frequencies failed: {e:#}"))
+    })?;
+    let denom = total_tokens.max(1) as f64;
+    let rows = rows
+        .into_iter()
+        .map(|(term, count)| FreqRow {
+            term,
+            count,
+            pct: count as f64 / denom * 100.0,
+        })
+        .collect();
+    Ok(FrequenciesResult {
+        rows,
+        total_tokens,
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+/// Per-document hit counts + a corpus-wide dispersion histogram for a
+/// term. Backs the FrequencyView document table and dispersion strip.
+#[tauri::command]
+pub fn run_term_distribution(
+    state: State<'_, AppState>,
+    req: TermDistRequest,
+) -> Result<TermDistResult, String> {
+    let buckets = req.buckets.clamp(1, 1000);
+    let t0 = Instant::now();
+    let dist = with_corpus(&state, &req.corpus_id, |index| {
+        index
+            .term_distribution(&req.term, req.layer.into(), buckets)
+            .map_err(|e| format!("term distribution failed: {e:#}"))
+    })?;
+    Ok(TermDistResult {
+        doc_counts: dist
+            .doc_counts
+            .into_iter()
+            .map(|d| DocTermCountDto {
+                doc_id: d.doc_id,
+                path: d.path.to_string_lossy().into_owned(),
+                hits: d.hits,
+                token_count: d.token_count,
+            })
+            .collect(),
+        dispersion: dist.dispersion,
+        total_hits: dist.total_hits,
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+/// Re-expand the context around a single KWIC hit to a wider window.
+/// Backs the ContextDrawer.
+#[tauri::command]
+pub fn expand_context(
+    state: State<'_, AppState>,
+    req: ExpandRequest,
+) -> Result<ExpandedContext, String> {
+    let context = req.context.clamp(1, 500);
+    let found = with_corpus(&state, &req.corpus_id, |index| {
+        index
+            .context_at(req.doc_id, req.position, context)
+            .map_err(|e| format!("context lookup failed: {e:#}"))
+    })?;
+    // Resolve the path separately so the drawer can show a title even if
+    // the position fell out of range.
+    let path = with_corpus(&state, &req.corpus_id, |index| {
+        Ok(index
+            .list_documents()
+            .map_err(|e| format!("listing documents: {e:#}"))?
+            .into_iter()
+            .find(|d| d.doc_id == req.doc_id)
+            .map(|d| d.path.to_string_lossy().into_owned())
+            .unwrap_or_default())
+    })?;
+    match found {
+        Some((before, hit, after, token_count)) => Ok(ExpandedContext {
+            doc_id: req.doc_id,
+            path,
+            before,
+            hit,
+            after,
+            token_count,
+        }),
+        None => Err(format!(
+            "no token at position {} in doc {}",
+            req.position, req.doc_id
+        )),
+    }
 }
 
 /// Runs the build on a worker thread so the UI event loop stays
