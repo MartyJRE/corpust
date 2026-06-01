@@ -22,6 +22,7 @@ use corpust_core::{DocId, Document};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use tantivy::{
     DocAddress, DocSet, Index, IndexReader, ReloadPolicy, TERMINATED, TantivyDocument, Term, doc,
     postings::Postings,
@@ -45,7 +46,19 @@ pub struct CorpusIndex {
     index: Index,
     reader: IndexReader,
     fields: Fields,
+    /// Query-result caches. The index is immutable once opened (the app
+    /// re-opens a fresh `CorpusIndex` after a rebuild), so memoizing these
+    /// O(corpus) reads is sound and turns repeat layer-toggles / revisits
+    /// from seconds into nothing. Keyed by their full input so different
+    /// layers / terms / limits don't collide.
+    doc_cache: OnceLock<Vec<DocumentInfo>>,
+    freq_cache: Mutex<HashMap<(QueryLayer, usize), FreqTable>>,
+    dist_cache: Mutex<HashMap<(String, QueryLayer, usize), TermDistribution>>,
 }
+
+/// Top-N `(term, count)` rows plus the field's grand-total token count —
+/// the return shape of [`CorpusIndex::frequencies`].
+pub type FreqTable = (Vec<(String, u64)>, u64);
 
 #[derive(Clone, Copy)]
 struct Fields {
@@ -69,7 +82,7 @@ struct Fields {
 /// for documents indexed with an [`Annotator`] that emits lemmas.
 /// `Pos` queries the POS-tag layer (case-sensitive — conventionally
 /// uppercase tagsets like Penn Treebank).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QueryLayer {
     Word,
     Lemma,
@@ -179,6 +192,9 @@ impl CorpusIndex {
             index,
             reader,
             fields,
+            doc_cache: OnceLock::new(),
+            freq_cache: Mutex::new(HashMap::new()),
+            dist_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -506,6 +522,9 @@ impl CorpusIndex {
     /// Enumerate every (alive) document with its path and token count.
     /// Sorted by `doc_id`.
     pub fn list_documents(&self) -> Result<Vec<DocumentInfo>> {
+        if let Some(cached) = self.doc_cache.get() {
+            return Ok(cached.clone());
+        }
         let searcher = self.reader.searcher();
         let mut out = Vec::new();
         for (seg_ord, seg_reader) in searcher.segment_readers().iter().enumerate() {
@@ -553,6 +572,9 @@ impl CorpusIndex {
             }
         }
         out.sort_by_key(|d| d.doc_id);
+        // Cache the document list — it never changes for an open index and
+        // is hit on every `term_distribution` call (global position axis).
+        let _ = self.doc_cache.set(out.clone());
         Ok(out)
     }
 
@@ -564,11 +586,15 @@ impl CorpusIndex {
     /// NOTE: this is a full term-dictionary scan with one postings read
     /// per term. Fine at the current scale; for billion-word corpora the
     /// table should be precomputed at build time instead.
-    pub fn frequencies(
-        &self,
-        layer: QueryLayer,
-        limit: usize,
-    ) -> Result<(Vec<(String, u64)>, u64)> {
+    pub fn frequencies(&self, layer: QueryLayer, limit: usize) -> Result<FreqTable> {
+        if let Some(cached) = self
+            .freq_cache
+            .lock()
+            .expect("freq_cache poisoned")
+            .get(&(layer, limit))
+        {
+            return Ok(cached.clone());
+        }
         let searcher = self.reader.searcher();
         let field = self.layer_field(layer);
         let mut totals: HashMap<String, u64> = HashMap::new();
@@ -601,7 +627,12 @@ impl CorpusIndex {
         let mut rows: Vec<(String, u64)> = totals.into_iter().collect();
         rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         rows.truncate(limit);
-        Ok((rows, grand_total))
+        let result = (rows, grand_total);
+        self.freq_cache
+            .lock()
+            .expect("freq_cache poisoned")
+            .insert((layer, limit), result.clone());
+        Ok(result)
     }
 
     /// Per-document hit counts and a corpus-wide dispersion histogram for
@@ -617,6 +648,15 @@ impl CorpusIndex {
         buckets: usize,
     ) -> Result<TermDistribution> {
         let buckets = buckets.max(1);
+        let cache_key = (term.to_string(), layer, buckets);
+        if let Some(cached) = self
+            .dist_cache
+            .lock()
+            .expect("dist_cache poisoned")
+            .get(&cache_key)
+        {
+            return Ok(cached.clone());
+        }
         let searcher = self.reader.searcher();
         let field = self.layer_field(layer);
         let lookup = match layer {
@@ -689,11 +729,16 @@ impl CorpusIndex {
             .collect();
         doc_counts.sort_by(|a, b| b.hits.cmp(&a.hits).then_with(|| a.doc_id.cmp(&b.doc_id)));
 
-        Ok(TermDistribution {
+        let result = TermDistribution {
             doc_counts,
             dispersion,
             total_hits,
-        })
+        };
+        self.dist_cache
+            .lock()
+            .expect("dist_cache poisoned")
+            .insert(cache_key, result.clone());
+        Ok(result)
     }
 
     fn layer_field(&self, layer: QueryLayer) -> Field {
