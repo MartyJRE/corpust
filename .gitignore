@@ -14,3 +14,9 @@ node_modules
 /app/dist
 /app/coverage
 /app/src-tauri/gen
+
+# `tauri icon` byproducts for non-desktop targets (config references only 32/128/128@2x)
+/app/src-tauri/icons/Square*.png
+/app/src-tauri/icons/StoreLogo.png
+/app/src-tauri/icons/android/
+/app/src-tauri/icons/ios/
