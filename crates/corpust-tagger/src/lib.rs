@@ -72,6 +72,18 @@ pub struct Tagger {
     /// noise candidates that Viterbi's Bayes correction can pick
     /// over NP, so we keep most of the mass on NP.
     np_boost: f64,
+    /// Whether to apply the case-insensitive lexicon merge. A
+    /// sentence-initial capitalized word's lexicon entry is often
+    /// dominated by the proper-noun reading it gets at sentence start
+    /// ("Requests" → NP=1.0), hiding the verb/common-noun readings its
+    /// lowercase form carries ("requests" → NNS/VVZ). When enabled, a
+    /// sentence-initial, proper-noun-exclusive cased entry is merged with
+    /// its lowercase counterpart, frequency-weighted (see [`merge_cased`]
+    /// and [`is_proper_noun_exclusive`]). This mirrors tree-tagger's
+    /// count-weighted cased merge and is a clean win on both formal
+    /// (UNSC `Requests` fixed) and literary (Gutenberg, +5 / −0) text, so
+    /// it defaults on. Set `false` to disable.
+    case_merge: bool,
     /// Override for the per-tag marginal `P(t)` used in Viterbi's
     /// Bayes-correction step. `None` falls back to
     /// `normalize_prior(tries.tag_prelude)`. Mostly for diagnostic
@@ -102,6 +114,7 @@ impl Tagger {
             id: format!("treetagger-rs-{language}"),
             pruning_threshold: 0.001,
             np_boost: 0.95,
+            case_merge: true,
             tag_prior_override: None,
         })
     }
@@ -133,25 +146,124 @@ impl Tagger {
         self.np_boost = boost;
     }
 
+    /// Enable or disable the case-insensitive lexicon merge. See the
+    /// `case_merge` field docs. Defaults on.
+    pub fn set_case_merge(&mut self, enabled: bool) {
+        self.case_merge = enabled;
+    }
+
     /// Build the candidate list for one token: lexicon entries when
     /// known, otherwise the unknown-word distribution from the
     /// suffix trie (with prefix trie / dtree default as fallbacks
     /// and a capitalized → NP boost). Lemma is pre-resolved.
-    fn candidates_for(&self, word: &str) -> Vec<viterbi::Cand> {
+    fn candidates_for(&self, word: &str, sentence_initial: bool) -> Vec<viterbi::Cand> {
         if let Some(entry) = self.model.lexicon.lookup(word)
             && !entry.candidates.is_empty()
         {
-            return entry
-                .candidates
-                .iter()
-                .map(|c| viterbi::Cand {
-                    tag_id: c.tag_id,
-                    lex_prob: c.prob as f64,
-                    lemma: self.model.lexicon.lemma(c.lemma_index).map(str::to_owned),
-                })
-                .collect();
+            // Case-insensitive merge, restricted to sentence-initial
+            // first-uppercase words. That's the only position where the
+            // capitalization is forced (and therefore uninformative), so
+            // a cased entry dominated by sentence-initial proper-noun
+            // appearances ("Requests" → NP) is hiding the verb/common
+            // readings its lowercase form carries. Mid-sentence
+            // capitals are genuine proper nouns ("Round Table",
+            // "Knights") and must be left alone — merging them there is
+            // what regresses literary text. See `case_merge_beta` docs.
+            if self.case_merge
+                && sentence_initial
+                && word.chars().next().is_some_and(char::is_uppercase)
+                && self.is_proper_noun_exclusive(entry)
+            {
+                let lc: String = word.chars().flat_map(char::to_lowercase).collect();
+                if lc != word
+                    && let Some(low) = self.model.lexicon.lookup(&lc)
+                    && !low.candidates.is_empty()
+                {
+                    return self.merge_cased(entry, low);
+                }
+            }
+            return self.cands_from_entry(entry);
         }
         self.unknown_word_candidates(word)
+    }
+
+    /// Map a lexicon entry straight to Viterbi candidates (lemma
+    /// pre-resolved). The common case behind [`candidates_for`].
+    fn cands_from_entry(&self, entry: &par::lexicon::Entry) -> Vec<viterbi::Cand> {
+        entry
+            .candidates
+            .iter()
+            .map(|c| viterbi::Cand {
+                tag_id: c.tag_id,
+                lex_prob: c.prob as f64,
+                lemma: self.model.lexicon.lemma(c.lemma_index).map(str::to_owned),
+            })
+            .collect()
+    }
+
+    /// Whether every candidate in a cased entry is a proper-noun tag
+    /// (`NP`/`NPS`). That's the signature of a sentence-initial artifact
+    /// — a common word ("Requests") whose only cased reading is the
+    /// proper noun it gets mistaken for at sentence start. Genuine
+    /// proper nouns keep a common-noun tail ("Council" → NP+NN), so they
+    /// fail this test and are left untouched by the case merge.
+    fn is_proper_noun_exclusive(&self, entry: &par::lexicon::Entry) -> bool {
+        entry
+            .candidates
+            .iter()
+            .all(|c| matches!(self.model.header.tag(c.tag_id), Some("NP" | "NPS")))
+    }
+
+    /// Merge a cased entry with its lowercase counterpart **weighted by
+    /// each form's training frequency** (`leading_field`), reproducing
+    /// tree-tagger's count-weighted cased merge:
+    /// `count(t) = N_cap·P_cap(t) + N_low·P_low(t)`, then renormalize.
+    ///
+    /// This is what makes the merge safe. A word seen far more often as
+    /// a proper noun ("Sir" N_cap=74 / N_low=0, "Brown" 76/2) stays NP
+    /// because its cased count dominates; a common word that only
+    /// surfaces capitalized at sentence start ("Requests" N_cap=0 /
+    /// N_low=29) collapses to its lowercase reading (NNS). A uniform
+    /// blend can't tell these apart — the counts can. The cased entry's
+    /// lemma wins for shared tags; lowercase-only tags take the
+    /// lowercase lemma.
+    ///
+    /// When neither form carries a count (`N_cap = N_low = 0`, e.g.
+    /// "Merlin"), the weighting is undefined, so we leave the cased
+    /// reading untouched rather than invent a split.
+    fn merge_cased(
+        &self,
+        cap: &par::lexicon::Entry,
+        low: &par::lexicon::Entry,
+    ) -> Vec<viterbi::Cand> {
+        let cap_w = f64::from(cap.leading_field);
+        let low_w = f64::from(low.leading_field);
+        if cap_w + low_w == 0.0 {
+            return self.cands_from_entry(cap);
+        }
+        // tag_id → (summed count, lemma index). BTreeMap keeps the
+        // output order deterministic (by tag_id) for stable tests.
+        let mut acc: std::collections::BTreeMap<u32, (f64, Option<u32>)> =
+            std::collections::BTreeMap::new();
+        for c in &cap.candidates {
+            let slot = acc.entry(c.tag_id).or_insert((0.0, Some(c.lemma_index)));
+            slot.0 += cap_w * c.prob as f64;
+        }
+        for c in &low.candidates {
+            let slot = acc.entry(c.tag_id).or_insert((0.0, None));
+            slot.0 += low_w * c.prob as f64;
+            if slot.1.is_none() {
+                slot.1 = Some(c.lemma_index);
+            }
+        }
+        let total: f64 = acc.values().map(|(count, _)| *count).sum();
+        acc.into_iter()
+            .map(|(tag_id, (count, lemma_idx))| viterbi::Cand {
+                tag_id,
+                lex_prob: if total > 0.0 { count / total } else { count },
+                lemma: lemma_idx.and_then(|i| self.model.lexicon.lemma(i).map(str::to_owned)),
+            })
+            .collect()
     }
 
     /// Distribution of plausible tags for a word missing from the
@@ -359,11 +471,28 @@ fn normalize_prior(prelude: &[f64]) -> Vec<f64> {
     prelude.iter().map(|v| v / total).collect()
 }
 
+/// Whether a token ends a sentence — used to mark the *next* token as
+/// sentence-initial for the case merge. Matches the sentence-final
+/// punctuation tree-tagger tags `SENT` (`.`, `!`, `?`, and the ellipsis
+/// `...`).
+fn is_sentence_final(tok: &str) -> bool {
+    matches!(tok, "." | "!" | "?" | "..." | "?!" | "!?")
+}
+
 impl Annotator for Tagger {
     fn annotate<'a>(&self, text: &'a str) -> Result<Vec<AnnotatedToken<'a>>> {
         let tokens = self.tokenizer.tokenize(text);
-        let cands: Vec<Vec<viterbi::Cand>> =
-            tokens.iter().map(|t| self.candidates_for(t)).collect();
+        // A token is sentence-initial if it's the first token or follows
+        // sentence-final punctuation. Detected from the token stream
+        // (no tags yet) so the case merge can fire only here.
+        let cands: Vec<Vec<viterbi::Cand>> = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let sentence_initial = i == 0 || is_sentence_final(tokens[i - 1].as_str());
+                self.candidates_for(t, sentence_initial)
+            })
+            .collect();
         let tagged: Vec<viterbi::Tagged> = match self.dtree.as_ref() {
             Some(traversal) => {
                 // Default prior: the dtree's averaged-leaf marginal,
@@ -1386,7 +1515,7 @@ mod tests {
         let words = ["Balan", "Uriens", "Guenever", "Accolon", "May-day"];
         for w in words {
             eprintln!("\n=== {w:?} ===");
-            let cands = tagger.candidates_for(w);
+            let cands = tagger.candidates_for(w, false);
             let mut cands_sorted: Vec<_> = cands.iter().collect();
             cands_sorted.sort_by(|a, b| b.lex_prob.partial_cmp(&a.lex_prob).unwrap());
             for c in cands_sorted.iter().take(8) {
@@ -2011,8 +2140,118 @@ mod tests {
             }
         }
         let probe = probe.expect("at least one invented word should miss the lexicon");
-        let cands = tagger.candidates_for(probe);
+        let cands = tagger.candidates_for(probe, true);
         assert!(!cands.is_empty(), "candidates_for must always return ≥1");
+    }
+
+    #[test]
+    fn sentence_final_detection() {
+        assert!(is_sentence_final("."));
+        assert!(is_sentence_final("!"));
+        assert!(is_sentence_final("?"));
+        assert!(!is_sentence_final("the"));
+        assert!(!is_sentence_final(","));
+        assert!(!is_sentence_final(";"));
+    }
+
+    fn top_tag(cands: &[viterbi::Cand]) -> u32 {
+        cands
+            .iter()
+            .max_by(|a, b| a.lex_prob.partial_cmp(&b.lex_prob).unwrap())
+            .unwrap()
+            .tag_id
+    }
+
+    #[test]
+    fn case_merge_demotes_sentence_initial_resolution_verb() {
+        let Some(tagger) = english_tagger() else {
+            return;
+        };
+        let np = tagger.tag_id_by_name("NP").map(u32::from).unwrap();
+        let nns = tagger.tag_id_by_name("NNS").map(u32::from).unwrap();
+        // Mid-sentence (and merge-off): "Requests" is an NP-only cased
+        // entry — the sentence-initial artifact we want to correct.
+        let plain = tagger.candidates_for("Requests", false);
+        assert!(
+            plain.iter().all(|c| c.tag_id == np),
+            "cased 'Requests' should be NP-only before the merge"
+        );
+        // Sentence-initial with the merge: the lowercase NNS/VVZ readings
+        // enter, and count-weighting (cap freq 0 vs low freq ~29) makes
+        // NNS dominant.
+        let merged = tagger.candidates_for("Requests", true);
+        assert_eq!(
+            top_tag(&merged),
+            nns,
+            "sentence-initial 'Requests' should merge to NNS-dominant"
+        );
+    }
+
+    #[test]
+    fn case_merge_skips_genuine_proper_noun() {
+        let Some(tagger) = english_tagger() else {
+            return;
+        };
+        let np = tagger.tag_id_by_name("NP").map(u32::from).unwrap();
+        // "Council" keeps a common-noun tail (NP+NN), so it fails the
+        // proper-noun-exclusive gate and is never merged — its candidate
+        // set is identical whether or not it's sentence-initial, and NP
+        // stays on top.
+        let plain = tagger.candidates_for("Council", false);
+        let initial = tagger.candidates_for("Council", true);
+        assert_eq!(plain.len(), initial.len());
+        assert_eq!(top_tag(&initial), np, "'Council' should stay NP-dominant");
+    }
+
+    #[test]
+    fn case_merge_only_fires_sentence_initial() {
+        let Some(tagger) = english_tagger() else {
+            return;
+        };
+        let np = tagger.tag_id_by_name("NP").map(u32::from).unwrap();
+        // Same word, two positions: merged only at sentence start.
+        let mid = tagger.candidates_for("Requests", false);
+        let start = tagger.candidates_for("Requests", true);
+        assert!(mid.iter().all(|c| c.tag_id == np));
+        assert_ne!(top_tag(&start), np);
+    }
+
+    #[test]
+    fn case_merge_end_to_end_tags_requests_non_np() {
+        let Some(tagger) = english_tagger() else {
+            return;
+        };
+        // Full pipeline: sentence-initial detection from the token stream
+        // drives the merge. "Requests" after a sentence boundary is no
+        // longer mistagged NP; the mid-sentence proper noun "Council" is.
+        let out = tagger
+            .annotate("The Security Council met. Requests the report be filed.")
+            .unwrap();
+        let req = out.iter().find(|t| t.word == "Requests").unwrap();
+        assert_ne!(
+            req.pos.as_deref(),
+            Some("NP"),
+            "sentence-initial 'Requests' should not be tagged NP"
+        );
+        let council = out.iter().find(|t| t.word == "Council").unwrap();
+        assert_eq!(
+            council.pos.as_deref(),
+            Some("NP"),
+            "mid-sentence 'Council' should stay NP"
+        );
+    }
+
+    #[test]
+    fn case_merge_can_be_disabled() {
+        let Some(mut tagger) = english_tagger() else {
+            return;
+        };
+        tagger.set_case_merge(false);
+        let np = tagger.tag_id_by_name("NP").map(u32::from).unwrap();
+        // With the merge off, even sentence-initial "Requests" keeps the
+        // raw NP-only cased entry.
+        let cands = tagger.candidates_for("Requests", true);
+        assert!(cands.iter().all(|c| c.tag_id == np));
     }
 
     #[test]
