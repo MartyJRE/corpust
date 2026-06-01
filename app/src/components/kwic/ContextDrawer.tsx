@@ -3,8 +3,10 @@
 // Serif 4. 420px wide, slides in 180ms.
 
 import { ArrowLeft, ArrowRight, FileText, X } from "lucide-react";
-import { Fragment } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { EXPANDED } from "@/data";
+import { type ExpandedContext, expandContext, hasLiveData } from "@/lib/tauri";
+import { basename } from "@/lib/utils";
 import type { CorpusMeta, KwicHit } from "@/types";
 
 export interface ContextDrawerProps {
@@ -15,7 +17,52 @@ export interface ContextDrawerProps {
   onNext: () => void;
 }
 
+/** Tokens of context to fetch on each side when expanding a hit. */
+const EXPAND_CONTEXT = 45;
+
 export function ContextDrawer({ hit, corpus, onClose, onPrev, onNext }: ContextDrawerProps) {
+  const [live, setLive] = useState<ExpandedContext | null>(null);
+
+  // Pull a wider context window from the backend for real corpora. Fixture
+  // corpora fall through to the `EXPANDED` demo map below.
+  useEffect(() => {
+    setLive(null);
+    if (!hasLiveData(corpus.id) || hit.hitPos == null) return;
+    let cancelled = false;
+    expandContext({
+      corpusId: corpus.id,
+      docId: Number(hit.docId),
+      position: hit.hitPos,
+      context: EXPAND_CONTEXT,
+    })
+      .then((r) => {
+        if (!cancelled) setLive(r);
+      })
+      .catch((e) => {
+        console.error("expandContext failed:", e);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [corpus.id, hit.docId, hit.hitPos]);
+
+  if (live) {
+    return (
+      <DrawerShell
+        docTitle={basename(live.path).replace(/\.txt$/, "")}
+        docMeta={`position ${hit.hitPos?.toLocaleString() ?? "?"} of ${live.tokenCount.toLocaleString()} tokens`}
+        pos={hit.hitPos ?? hit.pos}
+        onClose={onClose}
+        onPrev={onPrev}
+        onNext={onNext}
+      >
+        <span style={{ color: "var(--fg-muted)" }}>{live.before} </span>
+        <span className="cx-drawer-hit">{live.hit}</span>
+        <span style={{ color: "var(--fg-muted)" }}> {live.after}</span>
+      </DrawerShell>
+    );
+  }
+
   const expanded = EXPANDED[`${corpus.id}|${hit.docId}|${hit.pos}`] ?? {
     before:
       "Context before the hit would appear here in three sentences, loaded lazily from the underlying document on the Rust side. The drawer renders in Source Serif 4 because at this point the user is reading rather than scanning; monospace lives in the table, serif lives here. ",
@@ -29,13 +76,47 @@ export function ContextDrawer({ hit, corpus, onClose, onPrev, onNext }: ContextD
   const parts = expanded.match.split(hit.hit);
 
   return (
+    <DrawerShell
+      docTitle={expanded.docTitle}
+      docMeta={expanded.docMeta}
+      pos={hit.pos}
+      onClose={onClose}
+      onPrev={onPrev}
+      onNext={onNext}
+    >
+      <span style={{ color: "var(--fg-muted)" }}>{expanded.before}</span>
+      <span>
+        {parts.map((part, i) => (
+          <Fragment key={i}>
+            {part}
+            {i < parts.length - 1 && <span className="cx-drawer-hit">{hit.hit}</span>}
+          </Fragment>
+        ))}
+      </span>
+      <span style={{ color: "var(--fg-muted)" }}>{expanded.after}</span>
+    </DrawerShell>
+  );
+}
+
+interface DrawerShellProps {
+  docTitle: string;
+  docMeta: string;
+  pos: number;
+  onClose: () => void;
+  onPrev: () => void;
+  onNext: () => void;
+  children: React.ReactNode;
+}
+
+function DrawerShell({ docTitle, docMeta, pos, onClose, onPrev, onNext, children }: DrawerShellProps) {
+  return (
     <aside className="cx-drawer">
       <div className="cx-drawer-head">
         <div className="cx-drawer-title">
           <FileText size={12} />
-          <span style={{ color: "var(--fg)" }}>{expanded.docTitle}</span>
+          <span style={{ color: "var(--fg)" }}>{docTitle}</span>
           <span className="pos">·</span>
-          <span className="pos">pos {hit.pos.toLocaleString()}</span>
+          <span className="pos">pos {pos.toLocaleString()}</span>
         </div>
         <div style={{ display: "flex", gap: 4 }}>
           <button type="button" className="cx-btn cx-btn-ghost cx-btn-icon" onClick={onPrev} title="Previous hit (k)">
@@ -49,20 +130,9 @@ export function ContextDrawer({ hit, corpus, onClose, onPrev, onNext }: ContextD
           </button>
         </div>
       </div>
-      <div className="cx-drawer-body">
-        <span style={{ color: "var(--fg-muted)" }}>{expanded.before}</span>
-        <span>
-          {parts.map((part, i) => (
-            <Fragment key={i}>
-              {part}
-              {i < parts.length - 1 && <span className="cx-drawer-hit">{hit.hit}</span>}
-            </Fragment>
-          ))}
-        </span>
-        <span style={{ color: "var(--fg-muted)" }}>{expanded.after}</span>
-      </div>
+      <div className="cx-drawer-body">{children}</div>
       <div className="cx-drawer-foot">
-        <span>{expanded.docMeta}</span>
+        <span>{docMeta}</span>
         <div className="cx-drawer-nav">
           <span className="cx-kbd">j</span>
           <span>/</span>

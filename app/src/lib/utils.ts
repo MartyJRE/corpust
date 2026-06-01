@@ -39,6 +39,12 @@ export function formatNumber(n: number): string {
   return n.toLocaleString("en-US");
 }
 
+/** Last path segment of a file path (handles both `/` and `\`). */
+export function basename(path: string): string {
+  const parts = path.split(/[/\\]/);
+  return parts[parts.length - 1] || path;
+}
+
 /** Bucket KWIC hits by their doc position into `buckets` density cells. */
 export function makeDensity(hits: { pos: number }[], buckets = 60): number[] {
   const d = new Array(buckets).fill(0) as number[];

@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use corpust_annotate::{AnnotatedToken, Annotator};
 use corpust_core::{DocId, Document};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tantivy::{
     DocAddress, DocSet, Index, IndexReader, ReloadPolicy, TERMINATED, TantivyDocument, Term, doc,
@@ -75,9 +76,42 @@ pub enum QueryLayer {
 pub struct KwicHit {
     pub doc_id: DocId,
     pub path: PathBuf,
+    /// Token position of the hit within its document. Lets callers
+    /// re-expand a wider context later via [`CorpusIndex::context_at`].
+    pub hit_position: usize,
     pub left: String,
     pub hit: String,
     pub right: String,
+}
+
+/// One document's summary, for the corpus document list.
+#[derive(Debug, Clone)]
+pub struct DocumentInfo {
+    pub doc_id: DocId,
+    pub path: PathBuf,
+    pub token_count: usize,
+}
+
+/// Per-document occurrence count of a term.
+#[derive(Debug, Clone)]
+pub struct DocTermCount {
+    pub doc_id: DocId,
+    pub path: PathBuf,
+    pub hits: u64,
+    pub token_count: u64,
+}
+
+/// Corpus-wide distribution of a term: per-document hit counts plus a
+/// dispersion histogram over the whole corpus.
+#[derive(Debug, Clone)]
+pub struct TermDistribution {
+    /// Documents that contain the term, sorted by descending hit count.
+    pub doc_counts: Vec<DocTermCount>,
+    /// Per-bucket occurrence counts over a global position axis
+    /// (documents concatenated in `doc_id` order). Length == requested
+    /// bucket count.
+    pub dispersion: Vec<u32>,
+    pub total_hits: u64,
 }
 
 impl CorpusIndex {
@@ -361,32 +395,17 @@ impl CorpusIndex {
                         break;
                     }
                     let p = pos as usize;
-                    if p >= offsets.len() {
+                    let Some((left, hit, right)) = window(body, &offsets, p, context) else {
                         continue;
-                    }
-
-                    let window_start = p.saturating_sub(context);
-                    let window_end = (p + context + 1).min(offsets.len());
-                    let byte_start = offsets[window_start] as usize;
-                    let byte_end = if window_end < offsets.len() {
-                        offsets[window_end] as usize
-                    } else {
-                        body.len()
                     };
-
-                    let window_text = &body[byte_start..byte_end];
-                    let window_tokens: Vec<&str> = window_text.unicode_words().collect();
-                    let hit_idx = p - window_start;
-                    if hit_idx >= window_tokens.len() {
-                        continue;
-                    }
 
                     hits.push(KwicHit {
                         doc_id,
                         path: PathBuf::from(path),
-                        left: window_tokens[..hit_idx].join(" "),
-                        hit: window_tokens[hit_idx].to_string(),
-                        right: window_tokens[hit_idx + 1..].join(" "),
+                        hit_position: p,
+                        left,
+                        hit,
+                        right,
                     });
                 }
 
@@ -395,6 +414,230 @@ impl CorpusIndex {
         }
 
         Ok(hits)
+    }
+
+    /// Re-extract the concordance window around a known hit position in a
+    /// specific document — used to expand the context shown for a single
+    /// KWIC line after the fact, without re-running the whole query.
+    ///
+    /// Returns `(left, hit, right, token_count)` or `None` if the document
+    /// or position can't be located. Locating the document is a linear
+    /// scan over stored doc ids; document counts are modest so this is
+    /// cheap enough for an on-click expansion.
+    pub fn context_at(
+        &self,
+        doc_id: DocId,
+        position: usize,
+        context: usize,
+    ) -> Result<Option<(String, String, String, usize)>> {
+        let searcher = self.reader.searcher();
+        for (seg_ord, seg_reader) in searcher.segment_readers().iter().enumerate() {
+            for local in seg_reader.doc_ids_alive() {
+                let doc_addr = DocAddress::new(seg_ord as u32, local);
+                let retrieved: TantivyDocument = searcher.doc(doc_addr)?;
+                let stored_id = retrieved
+                    .get_first(self.fields.doc_id)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(u64::MAX);
+                if stored_id != doc_id {
+                    continue;
+                }
+                let body = retrieved
+                    .get_first(self.fields.body)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let offsets = retrieved
+                    .get_first(self.fields.token_offsets)
+                    .and_then(|v| v.as_bytes())
+                    .map(bytes_to_offsets)
+                    .unwrap_or_default();
+                let token_count = offsets.len();
+                return Ok(window(body, &offsets, position, context)
+                    .map(|(l, h, r)| (l, h, r, token_count)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Enumerate every (alive) document with its path and token count.
+    /// Sorted by `doc_id`.
+    pub fn list_documents(&self) -> Result<Vec<DocumentInfo>> {
+        let searcher = self.reader.searcher();
+        let mut out = Vec::new();
+        for (seg_ord, seg_reader) in searcher.segment_readers().iter().enumerate() {
+            for local in seg_reader.doc_ids_alive() {
+                let doc_addr = DocAddress::new(seg_ord as u32, local);
+                let retrieved: TantivyDocument = searcher.doc(doc_addr)?;
+                let doc_id = retrieved
+                    .get_first(self.fields.doc_id)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let path = retrieved
+                    .get_first(self.fields.path)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let token_count = retrieved
+                    .get_first(self.fields.token_offsets)
+                    .and_then(|v| v.as_bytes())
+                    .map(|b| bytes_to_offsets(b).len())
+                    .unwrap_or(0);
+                out.push(DocumentInfo {
+                    doc_id,
+                    path: PathBuf::from(path),
+                    token_count,
+                });
+            }
+        }
+        out.sort_by_key(|d| d.doc_id);
+        Ok(out)
+    }
+
+    /// Corpus-wide top-`limit` term frequencies on `layer`. Returns the
+    /// `(term, count)` rows sorted by descending count, plus the grand
+    /// total of (non-empty) token occurrences in the field — the
+    /// denominator callers use to turn counts into percentages.
+    ///
+    /// NOTE: this is a full term-dictionary scan with one postings read
+    /// per term. Fine at the current scale; for billion-word corpora the
+    /// table should be precomputed at build time instead.
+    pub fn frequencies(
+        &self,
+        layer: QueryLayer,
+        limit: usize,
+    ) -> Result<(Vec<(String, u64)>, u64)> {
+        let searcher = self.reader.searcher();
+        let field = self.layer_field(layer);
+        let mut totals: HashMap<String, u64> = HashMap::new();
+        let mut grand_total: u64 = 0;
+        for seg_reader in searcher.segment_readers() {
+            let inv = seg_reader.inverted_index(field)?;
+            let term_dict = inv.terms();
+            let mut stream = term_dict.stream()?;
+            while stream.advance() {
+                let key = match std::str::from_utf8(stream.key()) {
+                    Ok(k) if !k.is_empty() => k.to_string(),
+                    _ => continue,
+                };
+                let term_info = stream.value().clone();
+                let mut postings =
+                    inv.read_postings_from_terminfo(&term_info, IndexRecordOption::WithFreqs)?;
+                let mut sum: u64 = 0;
+                loop {
+                    let doc = postings.doc();
+                    if doc == TERMINATED {
+                        break;
+                    }
+                    sum += postings.term_freq() as u64;
+                    postings.advance();
+                }
+                grand_total += sum;
+                *totals.entry(key).or_default() += sum;
+            }
+        }
+        let mut rows: Vec<(String, u64)> = totals.into_iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        rows.truncate(limit);
+        Ok((rows, grand_total))
+    }
+
+    /// Per-document hit counts and a corpus-wide dispersion histogram for
+    /// a single term on `layer`, in one pass over the term's postings.
+    ///
+    /// The dispersion axis treats the corpus as one long stream of tokens
+    /// (documents concatenated in `doc_id` order); each occurrence falls
+    /// into one of `buckets` equal-width buckets along that axis.
+    pub fn term_distribution(
+        &self,
+        term: &str,
+        layer: QueryLayer,
+        buckets: usize,
+    ) -> Result<TermDistribution> {
+        let buckets = buckets.max(1);
+        let searcher = self.reader.searcher();
+        let field = self.layer_field(layer);
+        let lookup = match layer {
+            QueryLayer::Word | QueryLayer::Lemma => term.to_lowercase(),
+            QueryLayer::Pos => term.to_string(),
+        };
+        let term_obj = Term::from_field_text(field, &lookup);
+
+        // Global position axis: documents in doc_id order, with cumulative
+        // token offsets. Reuse list_documents for ordering + token counts.
+        let docs = self.list_documents()?;
+        let mut global_start: HashMap<DocId, u64> = HashMap::new();
+        let mut cursor: u64 = 0;
+        for d in &docs {
+            global_start.insert(d.doc_id, cursor);
+            cursor += d.token_count as u64;
+        }
+        let total_tokens = cursor.max(1);
+
+        let mut dispersion = vec![0u32; buckets];
+        let mut doc_hits: HashMap<DocId, u64> = HashMap::new();
+        let mut total_hits: u64 = 0;
+        let mut positions_buf: Vec<u32> = Vec::new();
+
+        for (seg_ord, seg_reader) in searcher.segment_readers().iter().enumerate() {
+            let inv = seg_reader.inverted_index(field)?;
+            let Some(mut postings) =
+                inv.read_postings(&term_obj, IndexRecordOption::WithFreqsAndPositions)?
+            else {
+                continue;
+            };
+            loop {
+                let doc = postings.doc();
+                if doc == TERMINATED {
+                    break;
+                }
+                let doc_addr = DocAddress::new(seg_ord as u32, doc);
+                let retrieved: TantivyDocument = searcher.doc(doc_addr)?;
+                let stored_id = retrieved
+                    .get_first(self.fields.doc_id)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let freq = postings.term_freq() as u64;
+                *doc_hits.entry(stored_id).or_default() += freq;
+                total_hits += freq;
+
+                let base = *global_start.get(&stored_id).unwrap_or(&0);
+                positions_buf.clear();
+                postings.positions(&mut positions_buf);
+                for &p in &positions_buf {
+                    let global_pos = base + p as u64;
+                    let b = ((global_pos * buckets as u64) / total_tokens) as usize;
+                    dispersion[b.min(buckets - 1)] += 1;
+                }
+                postings.advance();
+            }
+        }
+
+        let mut doc_counts: Vec<DocTermCount> = docs
+            .iter()
+            .filter_map(|d| {
+                let hits = *doc_hits.get(&d.doc_id).unwrap_or(&0);
+                (hits > 0).then(|| DocTermCount {
+                    doc_id: d.doc_id,
+                    path: d.path.clone(),
+                    hits,
+                    token_count: d.token_count as u64,
+                })
+            })
+            .collect();
+        doc_counts.sort_by(|a, b| b.hits.cmp(&a.hits).then_with(|| a.doc_id.cmp(&b.doc_id)));
+
+        Ok(TermDistribution {
+            doc_counts,
+            dispersion,
+            total_hits,
+        })
+    }
+
+    fn layer_field(&self, layer: QueryLayer) -> Field {
+        match layer {
+            QueryLayer::Word => self.fields.body,
+            QueryLayer::Lemma => self.fields.body_lemma,
+            QueryLayer::Pos => self.fields.body_pos,
+        }
     }
 }
 
@@ -454,6 +697,42 @@ fn register_tokenizer(index: &Index) {
         .filter(LowerCaser)
         .build();
     index.tokenizers().register(TOKENIZER_NAME, analyzer);
+}
+
+/// Extract the concordance window around token position `p`: `context`
+/// tokens of either side, clamped at document edges. Context text is read
+/// from the stored original `body` so the surface form is source-faithful
+/// regardless of which layer the hit was located on. Returns
+/// `(left, hit, right)`, or `None` if `p` is out of range.
+fn window(
+    body: &str,
+    offsets: &[u32],
+    p: usize,
+    context: usize,
+) -> Option<(String, String, String)> {
+    if p >= offsets.len() {
+        return None;
+    }
+    let window_start = p.saturating_sub(context);
+    let window_end = (p + context + 1).min(offsets.len());
+    let byte_start = offsets[window_start] as usize;
+    let byte_end = if window_end < offsets.len() {
+        offsets[window_end] as usize
+    } else {
+        body.len()
+    };
+
+    let window_text = &body[byte_start..byte_end];
+    let window_tokens: Vec<&str> = window_text.unicode_words().collect();
+    let hit_idx = p - window_start;
+    if hit_idx >= window_tokens.len() {
+        return None;
+    }
+    Some((
+        window_tokens[..hit_idx].join(" "),
+        window_tokens[hit_idx].to_string(),
+        window_tokens[hit_idx + 1..].join(" "),
+    ))
 }
 
 fn offsets_to_bytes(offsets: &[u32]) -> Vec<u8> {
@@ -626,6 +905,93 @@ mod tests {
         let no_pos = idx.kwic("NN", QueryLayer::Pos, 1, 10).unwrap();
         assert!(no_pos.is_empty());
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn two_doc_index() -> (std::path::PathBuf, CorpusIndex) {
+        let tmp = tempdir();
+        let idx = CorpusIndex::create(&tmp).unwrap();
+        idx.add_documents(
+            [
+                Document {
+                    id: 0,
+                    path: PathBuf::from("a.txt"),
+                    text: "the cat sat on the mat".to_string(),
+                },
+                Document {
+                    id: 1,
+                    path: PathBuf::from("b.txt"),
+                    text: "the dog and the cat".to_string(),
+                },
+            ],
+            None,
+        )
+        .unwrap();
+        (tmp, idx)
+    }
+
+    #[test]
+    fn list_documents_reports_paths_and_token_counts() {
+        let (tmp, idx) = two_doc_index();
+        let docs = idx.list_documents().unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].doc_id, 0);
+        assert_eq!(docs[0].path, PathBuf::from("a.txt"));
+        assert_eq!(docs[0].token_count, 6); // the cat sat on the mat
+        assert_eq!(docs[1].doc_id, 1);
+        assert_eq!(docs[1].token_count, 5); // the dog and the cat
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn frequencies_ranks_terms_by_total_count() {
+        let (tmp, idx) = two_doc_index();
+        let (rows, total) = idx.frequencies(QueryLayer::Word, 10).unwrap();
+        // 11 tokens across both docs; "the" appears 4 times.
+        assert_eq!(total, 11);
+        assert_eq!(rows[0], ("the".to_string(), 4));
+        // "cat" appears twice; everything else once.
+        let cat = rows.iter().find(|(t, _)| t == "cat").unwrap();
+        assert_eq!(cat.1, 2);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn context_at_reexpands_window() {
+        let (tmp, idx) = two_doc_index();
+        // Locate a hit first, then re-expand it wider.
+        let hits = idx.kwic("sat", QueryLayer::Word, 1, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        let h = &hits[0];
+        assert_eq!(h.left, "cat");
+        assert_eq!(h.right, "on");
+
+        let (left, hit, right, tokens) = idx
+            .context_at(h.doc_id, h.hit_position, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit, "sat");
+        assert_eq!(left, "the cat");
+        assert_eq!(right, "on the mat");
+        assert_eq!(tokens, 6);
+
+        // Unknown doc id yields None.
+        assert!(idx.context_at(999, 0, 3).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn term_distribution_counts_per_doc_and_buckets() {
+        let (tmp, idx) = two_doc_index();
+        let dist = idx.term_distribution("the", QueryLayer::Word, 4).unwrap();
+        assert_eq!(dist.total_hits, 4);
+        // Both docs contain "the".
+        assert_eq!(dist.doc_counts.len(), 2);
+        let total_in_docs: u64 = dist.doc_counts.iter().map(|d| d.hits).sum();
+        assert_eq!(total_in_docs, 4);
+        // Bucket counts sum to the total number of occurrences.
+        assert_eq!(dist.dispersion.iter().map(|&c| c as u64).sum::<u64>(), 4);
+        assert_eq!(dist.dispersion.len(), 4);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
