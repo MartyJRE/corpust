@@ -88,9 +88,9 @@ export interface DocFreqRow {
 
 export interface DocumentMeta {
   id: string;
-  title: string;
-  author: string;
-  year: number;
+  title?: string;
+  author?: string;
+  year?: number;
   tokens: number;
 }
 
