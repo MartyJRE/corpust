@@ -13,7 +13,7 @@ use crate::{
     TermDistRequest, TermDistResult,
 };
 use corpust_annotate::{Annotator, treetagger::TreeTagger};
-use corpust_index::{CorpusIndex, DEFAULT_CONTEXT};
+use corpust_index::{CorpusIndex, DEFAULT_CONTEXT, QueryLayer};
 use corpust_io::paths;
 use corpust_query::{KwicRequest as CoreKwicRequest, kwic as run_core_kwic};
 use corpust_tagger::Tagger as RustTagger;
@@ -307,12 +307,19 @@ pub fn run_frequencies(
     req: FrequenciesRequest,
 ) -> Result<FrequenciesResult, String> {
     let limit = req.limit.clamp(1, 1000);
+    let layer: QueryLayer = req.layer.into();
     let t0 = Instant::now();
-    let (rows, total_tokens) = with_corpus(&state, &req.corpus_id, |index| {
-        index
-            .frequencies(req.layer.into(), limit)
-            .map_err(|e| format!("frequencies failed: {e:#}"))
-    })?;
+    // Prefer the precomputed sidecar written at build time; fall back to
+    // a live term-dictionary scan for corpora built before it existed
+    // (or if the request asks for more rows than were precomputed).
+    let (rows, total_tokens) = match load_precomputed_frequencies(&req.corpus_id, layer, limit) {
+        Some(table) => table,
+        None => with_corpus(&state, &req.corpus_id, |index| {
+            index
+                .frequencies(layer, limit)
+                .map_err(|e| format!("frequencies failed: {e:#}"))
+        })?,
+    };
     let denom = total_tokens.max(1) as f64;
     let rows = rows
         .into_iter()
@@ -592,6 +599,11 @@ fn build_index_inner(
     write_metadata_file(&corpus_dir.join("metadata.json"), &meta)
         .map_err(|e| format!("writing metadata: {e:#}"))?;
 
+    // Precompute per-layer frequency tables so FrequencyView serves from
+    // a sidecar instead of re-scanning the term dictionary on every open.
+    // Best-effort — the query path falls back to a live scan if absent.
+    write_frequency_sidecar(&index, &corpus_dir);
+
     emit_progress(
         app,
         started,
@@ -638,6 +650,67 @@ where
         .expect("corpus registry poisoned")
         .insert(id.to_owned(), OpenedCorpus { index, meta });
     result
+}
+
+/// Precompute and persist the per-layer frequency tables next to the
+/// index. Best-effort: any failure only forfeits the speedup (queries
+/// fall back to a live scan), so it never aborts a build — it logs.
+fn write_frequency_sidecar(index: &CorpusIndex, corpus_dir: &Path) {
+    use corpust_io::freq::{FreqTables, LayerFreq, PRECOMPUTE_LIMIT, write_freq_file};
+    let af = match index.all_frequencies(PRECOMPUTE_LIMIT) {
+        Ok(af) => af,
+        Err(e) => {
+            eprintln!("warning: couldn't precompute frequencies: {e:#}");
+            return;
+        }
+    };
+    let tables = FreqTables {
+        limit: PRECOMPUTE_LIMIT,
+        word: LayerFreq::from_table(af.word),
+        lemma: LayerFreq::from_table(af.lemma),
+        pos: LayerFreq::from_table(af.pos),
+    };
+    let path = corpus_dir.join("frequencies.json");
+    if let Err(e) = write_freq_file(&path, &tables) {
+        eprintln!("warning: couldn't write {}: {e:#}", path.display());
+    }
+}
+
+/// Serve a frequency request from the precomputed sidecar, or `None` to
+/// signal the caller should fall back to a live scan. Returns `None`
+/// when the sidecar is absent/unreadable or was computed with fewer rows
+/// than `limit` asks for.
+fn load_precomputed_frequencies(
+    slug: &str,
+    layer: QueryLayer,
+    limit: usize,
+) -> Option<(Vec<(String, u64)>, u64)> {
+    let path = paths::freq_path(slug).ok()?;
+    load_precomputed_from(&path, layer, limit)
+}
+
+/// Path-based core of [`load_precomputed_frequencies`], split out so it
+/// can be tested without touching the global `CORPUST_DATA_ROOT`.
+fn load_precomputed_from(
+    path: &Path,
+    layer: QueryLayer,
+    limit: usize,
+) -> Option<(Vec<(String, u64)>, u64)> {
+    if !path.exists() {
+        return None;
+    }
+    let tables = corpust_io::freq::read_freq_file(path).ok()?;
+    if tables.limit < limit {
+        return None;
+    }
+    let layer_freq = match layer {
+        QueryLayer::Word => tables.word,
+        QueryLayer::Lemma => tables.lemma,
+        QueryLayer::Pos => tables.pos,
+    };
+    let mut rows = layer_freq.rows;
+    rows.truncate(limit);
+    Some((rows, layer_freq.total))
 }
 
 /// Open an existing corpus from disk by slug. Returns the tantivy
@@ -853,5 +926,66 @@ mod tests {
                 .contains("unsupported metadata schema version"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn precomputed_frequencies_serve_truncate_and_fallback() {
+        use corpust_io::freq::{FreqTables, LayerFreq, PRECOMPUTE_LIMIT, write_freq_file};
+
+        let path = tmp_file("freq-serve");
+        let tables = FreqTables {
+            limit: PRECOMPUTE_LIMIT,
+            word: LayerFreq {
+                rows: vec![("the".into(), 10), ("cat".into(), 5), ("dog".into(), 3)],
+                total: 18,
+            },
+            lemma: LayerFreq::default(),
+            pos: LayerFreq {
+                rows: vec![("NN".into(), 8)],
+                total: 18,
+            },
+        };
+        write_freq_file(&path, &tables).unwrap();
+
+        // Serves the word layer, truncated to the requested limit.
+        let (rows, total) = load_precomputed_from(&path, QueryLayer::Word, 2).unwrap();
+        assert_eq!(rows, vec![("the".into(), 10), ("cat".into(), 5)]);
+        assert_eq!(total, 18);
+
+        // POS layer comes through; total is the field grand total.
+        let (pos_rows, _) = load_precomputed_from(&path, QueryLayer::Pos, 10).unwrap();
+        assert_eq!(pos_rows, vec![("NN".into(), 8)]);
+
+        // Lemma layer is empty for an unannotated corpus — served, not a fallback.
+        let (lemma_rows, _) = load_precomputed_from(&path, QueryLayer::Lemma, 10).unwrap();
+        assert!(lemma_rows.is_empty());
+
+        std::fs::remove_file(&path).ok();
+
+        // Missing sidecar → None, signalling a live-scan fallback.
+        assert!(load_precomputed_from(&path, QueryLayer::Word, 2).is_none());
+    }
+
+    #[test]
+    fn precomputed_frequencies_falls_back_when_limit_exceeds_precompute() {
+        use corpust_io::freq::{FreqTables, LayerFreq, write_freq_file};
+
+        let path = tmp_file("freq-toosmall");
+        let tables = FreqTables {
+            limit: 2, // precomputed only top-2
+            word: LayerFreq {
+                rows: vec![("the".into(), 10), ("cat".into(), 5)],
+                total: 18,
+            },
+            ..Default::default()
+        };
+        write_freq_file(&path, &tables).unwrap();
+
+        // Asking for more than was precomputed forces a fallback.
+        assert!(load_precomputed_from(&path, QueryLayer::Word, 5).is_none());
+        // Within the precomputed depth it still serves.
+        assert!(load_precomputed_from(&path, QueryLayer::Word, 2).is_some());
+
+        std::fs::remove_file(&path).ok();
     }
 }

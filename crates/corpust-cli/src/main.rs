@@ -321,6 +321,12 @@ fn run_index(
         eprintln!("warning: couldn't write {}: {e:#}", metadata_path.display());
     }
 
+    // Precompute the per-layer frequency tables once so the UI's
+    // FrequencyView doesn't re-scan the term dictionary on every open.
+    // Best-effort: a failure here only forfeits the speedup (the query
+    // path falls back to a live scan), so it must not fail the build.
+    write_frequency_sidecar(&index, &corpus_dir);
+
     println!(
         "indexed {doc_count} doc(s) ({byte_count} bytes) in {:.2?} (read {:.2?} + index {:.2?})",
         t0.elapsed(),
@@ -330,6 +336,30 @@ fn run_index(
     println!("index written to {}", out.display());
     println!("metadata written to {}", metadata_path.display());
     Ok(())
+}
+
+/// Precompute and persist the per-layer frequency tables next to the
+/// index. Best-effort — logs a warning and returns on any failure so a
+/// flaky sidecar never fails an otherwise-good build.
+fn write_frequency_sidecar(index: &CorpusIndex, corpus_dir: &std::path::Path) {
+    use corpust_io::freq::{FreqTables, LayerFreq, PRECOMPUTE_LIMIT, write_freq_file};
+    let af = match index.all_frequencies(PRECOMPUTE_LIMIT) {
+        Ok(af) => af,
+        Err(e) => {
+            eprintln!("warning: couldn't precompute frequencies: {e:#}");
+            return;
+        }
+    };
+    let tables = FreqTables {
+        limit: PRECOMPUTE_LIMIT,
+        word: LayerFreq::from_table(af.word),
+        lemma: LayerFreq::from_table(af.lemma),
+        pos: LayerFreq::from_table(af.pos),
+    };
+    let path = corpus_dir.join("frequencies.json");
+    if let Err(e) = write_freq_file(&path, &tables) {
+        eprintln!("warning: couldn't write {}: {e:#}", path.display());
+    }
 }
 
 fn build_tagger(

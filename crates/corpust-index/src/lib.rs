@@ -60,6 +60,16 @@ pub struct CorpusIndex {
 /// the return shape of [`CorpusIndex::frequencies`].
 pub type FreqTable = (Vec<(String, u64)>, u64);
 
+/// The [`FreqTable`] for each [`QueryLayer`], produced in one shot by
+/// [`CorpusIndex::all_frequencies`]. Build paths persist this so the
+/// FrequencyView doesn't re-scan the term dictionary on every open.
+#[derive(Debug, Clone)]
+pub struct AllFrequencies {
+    pub word: FreqTable,
+    pub lemma: FreqTable,
+    pub pos: FreqTable,
+}
+
 #[derive(Clone, Copy)]
 struct Fields {
     doc_id: Field,
@@ -642,6 +652,18 @@ impl CorpusIndex {
             .expect("freq_cache poisoned")
             .insert((layer, limit), result.clone());
         Ok(result)
+    }
+
+    /// Compute the top-`limit` [`FreqTable`] for all three layers in one
+    /// call. Build paths use this to precompute and persist the tables
+    /// (see the NOTE on [`Self::frequencies`]); `Lemma` / `Pos` come back
+    /// empty for corpora indexed without annotation.
+    pub fn all_frequencies(&self, limit: usize) -> Result<AllFrequencies> {
+        Ok(AllFrequencies {
+            word: self.frequencies(QueryLayer::Word, limit)?,
+            lemma: self.frequencies(QueryLayer::Lemma, limit)?,
+            pos: self.frequencies(QueryLayer::Pos, limit)?,
+        })
     }
 
     /// Per-document hit counts and a corpus-wide dispersion histogram for
