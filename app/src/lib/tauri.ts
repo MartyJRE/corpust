@@ -29,6 +29,9 @@ export interface CollocatesResult {
   elapsedMs: number;
   nodeHits: number;
   windowTokens: number;
+  /** True when the full-corpus scan hit its safety ceiling, so scores
+   *  reflect a large sample rather than every node occurrence. */
+  truncated: boolean;
 }
 
 /** Raw KWIC hit as returned by the backend — distinct from the UI's

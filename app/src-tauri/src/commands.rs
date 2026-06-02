@@ -122,119 +122,116 @@ pub fn open_corpus(state: State<'_, AppState>, id: String) -> Result<CorpusMeta,
     Ok(meta)
 }
 
+/// Async so the full-corpus collocation scan runs on a worker thread —
+/// Tauri routes sync `fn` commands onto the main thread, where a scan
+/// over a frequent node ("the" in a 100M-token corpus) would freeze the
+/// window. `spawn_blocking` keeps the index/I-O code synchronous while
+/// the UI stays responsive (the frontend shows a loading state).
 #[tauri::command]
-pub fn run_collocates(
-    state: State<'_, AppState>,
+pub async fn run_collocates(
+    app: AppHandle,
     req: CollocatesRequest,
 ) -> Result<CollocatesResult, String> {
-    // Pull a large KWIC result with enough context to cover both
-    // window sides, then aggregate collocates. Cap hits at 5000 —
-    // enough for meaningful collocations on common terms without
-    // blowing up on "the".
-    const HIT_CAP: usize = 5000;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        run_collocates_inner(&state, &req)
+    })
+    .await
+    .map_err(|e| format!("collocates task failed to join: {e}"))?
+}
+
+fn run_collocates_inner(
+    state: &State<'_, AppState>,
+    req: &CollocatesRequest,
+) -> Result<CollocatesResult, String> {
+    // Safety ceiling on the positional scan. Set high enough that a full
+    // pass is the norm; only pathologically frequent nodes hit it, and
+    // when they do `truncated` surfaces it rather than silently capping.
+    const MAX_NODE_OCCURRENCES: usize = 1_000_000;
+
     let lw = req.left_window.min(30);
     let rw = req.right_window.min(30);
     if lw == 0 && rw == 0 {
         return Err("collocation window must include at least one side".to_owned());
     }
-    let context = lw.max(rw).max(1);
-    let kreq = CoreKwicRequest::new(&req.term)
-        .layer(req.layer.into())
-        .context(context)
-        .limit(HIT_CAP);
+    let layer: QueryLayer = req.layer.into();
+    let limit = req.limit.clamp(1, 200);
+    let span = (lw + rw) as u64;
     let t0 = Instant::now();
-    let hits = with_corpus(&state, &req.corpus_id, |index| {
-        run_core_kwic(index, kreq).map_err(|e| format!("kwic failed: {e:#}"))
-    })?;
 
-    // Count word occurrences per side, honoring asymmetric L/R
-    // windows. The KWIC call fetched `context` tokens of each side,
-    // so we now trim each side's stream to the requested L or R
-    // window (left: last N tokens; right: first N tokens).
-    use std::collections::HashMap;
-    let mut left_counts: HashMap<String, u32> = HashMap::new();
-    let mut right_counts: HashMap<String, u32> = HashMap::new();
-    let mut window_tokens: u32 = 0;
+    let (collocates, node_freq, window_tokens, truncated) =
+        with_corpus(state, &req.corpus_id, |index| {
+            let scan = index
+                .collocate_counts(&req.term, layer, lw, rw, MAX_NODE_OCCURRENCES)
+                .map_err(|e| format!("collocate scan failed: {e:#}"))?;
 
-    for h in &hits {
-        if lw > 0 {
-            let left_toks: Vec<String> = tokenize_for_collocates(&h.left).collect();
-            let start = left_toks.len().saturating_sub(lw);
-            for w in &left_toks[start..] {
-                *left_counts.entry(w.clone()).or_default() += 1;
-                window_tokens += 1;
-            }
-        }
-        if rw > 0 {
-            for w in tokenize_for_collocates(&h.right).take(rw) {
-                *right_counts.entry(w).or_default() += 1;
-                window_tokens += 1;
-            }
-        }
-    }
+            // Corpus size and collocate marginals are taken on the
+            // surface (word) layer — collocates are surface forms read
+            // from `body`, regardless of which layer the node matched on.
+            let n = index
+                .layer_total_tokens(corpust_index::QueryLayer::Word)
+                .map_err(|e| format!("corpus size lookup failed: {e:#}"))?;
 
-    // Merge sides + rank by total.
-    let mut merged: HashMap<String, (u32, u32)> = HashMap::new();
-    for (w, l) in left_counts {
-        merged.entry(w).or_default().0 = l;
-    }
-    for (w, r) in right_counts {
-        merged.entry(w).or_default().1 = r;
-    }
-    let mut vec: Vec<(String, u32, u32)> =
-        merged.into_iter().map(|(w, (l, r))| (w, l, r)).collect();
-    vec.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
-    vec.truncate(req.limit.clamp(1, 200));
+            // Bound the marginal lookups: score a generous top-by-raw-count
+            // candidate pool rather than every distinct collocate type
+            // (which can be tens of thousands for a frequent node).
+            let pool = (limit * 8).max(200);
+            let mut cand: Vec<(String, u32, u32)> = scan
+                .counts
+                .iter()
+                .map(|(w, &(l, r))| (w.clone(), l, r))
+                .collect();
+            cand.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)).then_with(|| a.0.cmp(&b.0)));
+            cand.truncate(pool);
 
-    let collocates: Vec<CollocateDto> = vec
-        .into_iter()
-        .map(|(w, l, r)| {
-            let total = l + r;
-            // Placeholder stats until we wire corpus-wide term
-            // frequencies. log2(total+1) gives a monotonic proxy that
-            // spreads the scatter's y-axis readably.
-            let score = ((total + 1) as f64).log2();
-            CollocateDto {
-                word: w,
-                pos: String::new(),
-                left_count: l,
-                right_count: r,
-                total,
-                log_dice: score,
-                mi: score,
-                z: score,
-                dist: 0,
-            }
-        })
-        .collect();
+            let words: Vec<String> = cand.iter().map(|(w, _, _)| w.clone()).collect();
+            let f_coll = index
+                .term_totals(&words, corpust_index::QueryLayer::Word)
+                .map_err(|e| format!("collocate frequency lookup failed: {e:#}"))?;
 
-    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let mut collocates: Vec<CollocateDto> = cand
+                .into_iter()
+                .map(|(w, l, r)| {
+                    let total = l + r;
+                    let fc = f_coll.get(&w).copied().unwrap_or(0);
+                    let s = corpust_index::assoc::scores(total as u64, scan.node_freq, fc, n, span);
+                    CollocateDto {
+                        word: w,
+                        pos: String::new(),
+                        left_count: l,
+                        right_count: r,
+                        total,
+                        log_dice: s.log_dice,
+                        mi: s.mi,
+                        z: s.z,
+                        dist: 0,
+                    }
+                })
+                .collect();
+            // Rank by log Dice (the UI default); the client re-sorts on
+            // demand for the other measures.
+            collocates.sort_by(|a, b| {
+                b.log_dice
+                    .partial_cmp(&a.log_dice)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.word.cmp(&b.word))
+            });
+            collocates.truncate(limit);
+
+            Ok((
+                collocates,
+                scan.node_freq,
+                scan.window_tokens,
+                scan.truncated,
+            ))
+        })?;
+
     Ok(CollocatesResult {
         collocates,
-        elapsed_ms,
-        node_hits: hits.len() as u32,
-        window_tokens,
-    })
-}
-
-/// Split a KWIC context string into collocate candidates.
-/// - whitespace-separated,
-/// - lowercased,
-/// - punctuation-trimmed at ends,
-/// - filter empty/single-char tokens,
-/// - filter pure-digit tokens.
-fn tokenize_for_collocates(s: &str) -> impl Iterator<Item = String> + '_ {
-    s.split_whitespace().filter_map(|tok| {
-        let trimmed: String = tok
-            .trim_matches(|c: char| !c.is_alphanumeric())
-            .to_lowercase();
-        if trimmed.len() < 2 {
-            return None;
-        }
-        if trimmed.chars().all(|c| c.is_ascii_digit()) {
-            return None;
-        }
-        Some(trimmed)
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        node_hits: node_freq.min(u32::MAX as u64) as u32,
+        window_tokens: window_tokens.min(u32::MAX as u64) as u32,
+        truncated,
     })
 }
 

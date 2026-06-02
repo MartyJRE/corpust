@@ -16,6 +16,8 @@
 //! A stored `token_offsets` sidecar carries per-token byte offsets so KWIC
 //! context extraction is O(context) regardless of document length.
 
+pub mod assoc;
+
 use anyhow::{Context, Result};
 use corpust_annotate::{AnnotatedToken, Annotator};
 use corpust_core::{DocId, Document};
@@ -54,6 +56,11 @@ pub struct CorpusIndex {
     doc_cache: OnceLock<Vec<DocumentInfo>>,
     freq_cache: Mutex<HashMap<(QueryLayer, usize), FreqTable>>,
     dist_cache: Mutex<HashMap<(String, QueryLayer, usize), TermDistribution>>,
+    /// Cache of full-corpus collocate scans, keyed by
+    /// `(term, layer, left, right)`. The scan is the expensive part of a
+    /// collocation query (a positional pass over every node occurrence);
+    /// marginals + scores are recomputed cheaply on top.
+    colloc_cache: Mutex<HashMap<(String, QueryLayer, usize, usize), CollocateScan>>,
 }
 
 /// Top-N `(term, count)` rows plus the field's grand-total token count —
@@ -147,6 +154,27 @@ pub struct DocTermCount {
     pub token_count: u64,
 }
 
+/// Raw windowed co-occurrence counts for a collocation query, produced
+/// by a single positional pass over every occurrence of the node term.
+/// Association scores ([`assoc`]) are computed on top of this plus the
+/// corpus marginals — kept separate so the expensive scan can be cached
+/// independently of the (cheap) scoring.
+#[derive(Debug, Clone)]
+pub struct CollocateScan {
+    /// Number of node occurrences scanned. Equals the node's true corpus
+    /// frequency unless `truncated` is set.
+    pub node_freq: u64,
+    /// Per-collocate `(left_count, right_count)` within the window.
+    pub counts: HashMap<String, (u32, u32)>,
+    /// Total collocate slots actually counted (sum of left+right hits) —
+    /// the UI's "window tokens" figure.
+    pub window_tokens: u64,
+    /// True when the safety ceiling cut the scan short; scores then
+    /// reflect a (large) sample of the node's occurrences, not all of
+    /// them.
+    pub truncated: bool,
+}
+
 /// Corpus-wide distribution of a term: per-document hit counts plus a
 /// dispersion histogram over the whole corpus.
 #[derive(Debug, Clone)]
@@ -208,6 +236,7 @@ impl CorpusIndex {
             doc_cache: OnceLock::new(),
             freq_cache: Mutex::new(HashMap::new()),
             dist_cache: Mutex::new(HashMap::new()),
+            colloc_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -666,6 +695,159 @@ impl CorpusIndex {
         })
     }
 
+    /// Total token count on `layer` across the whole corpus — the `N`
+    /// denominator for association measures. O(segments): Tantivy tracks
+    /// this per inverted index, so no scan is needed.
+    pub fn layer_total_tokens(&self, layer: QueryLayer) -> Result<u64> {
+        let searcher = self.reader.searcher();
+        let field = self.layer_field(layer);
+        let mut total = 0u64;
+        for seg_reader in searcher.segment_readers() {
+            total += seg_reader.inverted_index(field)?.total_num_tokens();
+        }
+        Ok(total)
+    }
+
+    /// Corpus-wide frequency of each given term on `layer`. Used to fetch
+    /// the `f(node)` / `f(collocate)` marginals for scoring. Terms absent
+    /// from the index map to `0`.
+    pub fn term_totals(&self, terms: &[String], layer: QueryLayer) -> Result<HashMap<String, u64>> {
+        let searcher = self.reader.searcher();
+        let field = self.layer_field(layer);
+        let mut out: HashMap<String, u64> = HashMap::with_capacity(terms.len());
+        for term in terms {
+            let term_obj = Term::from_field_text(field, term);
+            let mut sum = 0u64;
+            for seg_reader in searcher.segment_readers() {
+                let inv = seg_reader.inverted_index(field)?;
+                if let Some(mut postings) =
+                    inv.read_postings(&term_obj, IndexRecordOption::WithFreqs)?
+                {
+                    loop {
+                        let doc = postings.doc();
+                        if doc == TERMINATED {
+                            break;
+                        }
+                        sum += postings.term_freq() as u64;
+                        postings.advance();
+                    }
+                }
+            }
+            out.insert(term.clone(), sum);
+        }
+        Ok(out)
+    }
+
+    /// Count surface-form collocates in a `[left, right]` token window
+    /// around **every** occurrence of `term` on `layer`, in a single
+    /// positional pass (one stored-document fetch per document, not per
+    /// hit). Collocate candidates are normalised the same way as
+    /// [`tokenize_for_collocates`]: lowercased, edge-punctuation trimmed,
+    /// single-character and pure-digit tokens dropped.
+    ///
+    /// `max_nodes` is a safety ceiling: if more than that many node
+    /// occurrences are seen the scan stops early and the result is marked
+    /// `truncated`. Pass a large value (or `usize::MAX`) for a full scan.
+    ///
+    /// Results are cached on `(term, layer, left, right)` since the scan
+    /// is the costly part of a collocation query.
+    pub fn collocate_counts(
+        &self,
+        term: &str,
+        layer: QueryLayer,
+        left: usize,
+        right: usize,
+        max_nodes: usize,
+    ) -> Result<CollocateScan> {
+        let (query_field, lookup_term) = match layer {
+            QueryLayer::Word => (self.fields.body, term.to_lowercase()),
+            QueryLayer::Lemma => (self.fields.body_lemma, term.to_lowercase()),
+            QueryLayer::Pos => (self.fields.body_pos, term.to_string()),
+        };
+        let cache_key = (lookup_term.clone(), layer, left, right);
+        if let Some(cached) = self
+            .colloc_cache
+            .lock()
+            .expect("colloc_cache poisoned")
+            .get(&cache_key)
+        {
+            return Ok(cached.clone());
+        }
+
+        let searcher = self.reader.searcher();
+        let term_obj = Term::from_field_text(query_field, &lookup_term);
+
+        let mut counts: HashMap<String, (u32, u32)> = HashMap::new();
+        let mut node_freq: u64 = 0;
+        let mut window_tokens: u64 = 0;
+        let mut truncated = false;
+        let mut positions_buf: Vec<u32> = Vec::new();
+
+        'segments: for (seg_ord, seg_reader) in searcher.segment_readers().iter().enumerate() {
+            let inv_idx = seg_reader.inverted_index(query_field)?;
+            let Some(mut postings) =
+                inv_idx.read_postings(&term_obj, IndexRecordOption::WithFreqsAndPositions)?
+            else {
+                continue;
+            };
+
+            loop {
+                let doc = postings.doc();
+                if doc == TERMINATED {
+                    continue 'segments;
+                }
+
+                let doc_addr = DocAddress::new(seg_ord as u32, doc);
+                let retrieved: TantivyDocument = searcher.doc(doc_addr)?;
+                let body = retrieved
+                    .get_first(self.fields.body)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let offsets_bytes = retrieved
+                    .get_first(self.fields.token_offsets)
+                    .and_then(|v| v.as_bytes())
+                    .unwrap_or_default();
+                let offsets = bytes_to_offsets(offsets_bytes);
+
+                positions_buf.clear();
+                postings.positions(&mut positions_buf);
+
+                for &pos in &positions_buf {
+                    if node_freq as usize >= max_nodes {
+                        truncated = true;
+                        break 'segments;
+                    }
+                    node_freq += 1;
+                    let p = pos as usize;
+                    for w in window_side(body, &offsets, p, left, Side::Left) {
+                        let e = counts.entry(w).or_default();
+                        e.0 += 1;
+                        window_tokens += 1;
+                    }
+                    for w in window_side(body, &offsets, p, right, Side::Right) {
+                        let e = counts.entry(w).or_default();
+                        e.1 += 1;
+                        window_tokens += 1;
+                    }
+                }
+
+                postings.advance();
+            }
+        }
+
+        let scan = CollocateScan {
+            node_freq,
+            counts,
+            window_tokens,
+            truncated,
+        };
+        self.colloc_cache
+            .lock()
+            .expect("colloc_cache poisoned")
+            .insert(cache_key, scan.clone());
+        Ok(scan)
+    }
+
     /// Per-document hit counts and a corpus-wide dispersion histogram for
     /// a single term on `layer`, in one pass over the term's postings.
     ///
@@ -883,6 +1065,60 @@ fn window(
         window_tokens[hit_idx].to_string(),
         window_tokens[hit_idx + 1..].join(" "),
     ))
+}
+
+/// Which side of the node a window extends to.
+enum Side {
+    Left,
+    Right,
+}
+
+/// Extract and normalise the collocate candidates within `count` token
+/// positions on one `side` of node position `p`. Reads surface text from
+/// `body` via `offsets`, then applies [`tokenize_for_collocates`].
+///
+/// Returns an empty vec when `p` is out of range or the side is empty
+/// (node at a document edge, or `count == 0`).
+fn window_side(body: &str, offsets: &[u32], p: usize, count: usize, side: Side) -> Vec<String> {
+    if count == 0 || p >= offsets.len() {
+        return Vec::new();
+    }
+    let (start, end) = match side {
+        // positions [p-count, p)
+        Side::Left => (p.saturating_sub(count), p),
+        // positions (p, p+count]
+        Side::Right => (p + 1, (p + 1 + count).min(offsets.len())),
+    };
+    if start >= end {
+        return Vec::new();
+    }
+    let byte_start = offsets[start] as usize;
+    let byte_end = if end < offsets.len() {
+        offsets[end] as usize
+    } else {
+        body.len()
+    };
+    tokenize_for_collocates(&body[byte_start..byte_end]).collect()
+}
+
+/// Split a window substring into collocate candidates:
+/// whitespace/punctuation-delimited, lowercased, edge-punctuation
+/// trimmed, dropping empty/single-character and pure-digit tokens. Kept
+/// in sync with the equivalent normalisation the Tauri command applied
+/// before collocation moved into the index.
+fn tokenize_for_collocates(s: &str) -> impl Iterator<Item = String> + '_ {
+    s.unicode_words().filter_map(|tok| {
+        let trimmed: String = tok
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
+        if trimmed.chars().count() < 2 {
+            return None;
+        }
+        if trimmed.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        Some(trimmed)
+    })
 }
 
 fn offsets_to_bytes(offsets: &[u32]) -> Vec<u8> {
@@ -1327,6 +1563,54 @@ mod tests {
         assert_eq!(docs[0].token_count, 6); // the cat sat on the mat
         assert_eq!(docs[1].doc_id, 1);
         assert_eq!(docs[1].token_count, 5); // the dog and the cat
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn collocate_counts_tallies_window_sides() {
+        // doc0: the(0) cat(1) sat(2) on(3) the(4) mat(5)
+        // doc1: the(0) dog(1) and(2) the(3) cat(4)
+        let (tmp, idx) = two_doc_index();
+
+        let scan = idx
+            .collocate_counts("the", QueryLayer::Word, 1, 1, usize::MAX)
+            .unwrap();
+
+        assert_eq!(scan.node_freq, 4, "the occurs 4×");
+        assert!(!scan.truncated);
+        // cat sits immediately right of "the" twice (doc0 p0, doc1 p3).
+        assert_eq!(scan.counts.get("cat"), Some(&(0, 2)));
+        // on/and precede a "the"; mat/dog follow one.
+        assert_eq!(scan.counts.get("on"), Some(&(1, 0)));
+        assert_eq!(scan.counts.get("and"), Some(&(1, 0)));
+        assert_eq!(scan.counts.get("mat"), Some(&(0, 1)));
+        assert_eq!(scan.counts.get("dog"), Some(&(0, 1)));
+        // 2(cat) + 1(on) + 1(and) + 1(mat) + 1(dog) collocate slots filled.
+        assert_eq!(scan.window_tokens, 6);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn collocate_marginals_and_truncation() {
+        let (tmp, idx) = two_doc_index();
+
+        // N = every surface token across both docs (6 + 5).
+        assert_eq!(idx.layer_total_tokens(QueryLayer::Word).unwrap(), 11);
+
+        let totals = idx
+            .term_totals(&["the".to_string(), "cat".to_string()], QueryLayer::Word)
+            .unwrap();
+        assert_eq!(totals.get("the"), Some(&4));
+        assert_eq!(totals.get("cat"), Some(&2));
+
+        // Safety ceiling stops the scan early and flags it.
+        let scan = idx
+            .collocate_counts("the", QueryLayer::Word, 1, 1, 2)
+            .unwrap();
+        assert_eq!(scan.node_freq, 2);
+        assert!(scan.truncated);
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

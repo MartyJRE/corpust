@@ -151,8 +151,13 @@ pub struct Collocate {
 pub struct CollocatesResult {
     pub collocates: Vec<Collocate>,
     pub elapsed_ms: f64,
+    /// Node-term occurrences the scan covered. Equals the node's true
+    /// corpus frequency unless `truncated` is set.
     pub node_hits: u32,
     pub window_tokens: u32,
+    /// True when the safety ceiling cut the full-corpus scan short, so
+    /// the scores reflect a (large) sample rather than every occurrence.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
