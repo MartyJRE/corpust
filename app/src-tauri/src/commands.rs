@@ -73,8 +73,16 @@ fn emit_failure(app: &AppHandle, started: Instant, message: &str) {
 /// build step writes `<slug>/metadata.json` next to the index. The
 /// in-memory `AppState.corpora` registry is only a cache of opened
 /// handles; we fall back to disk for everything else.
+/// Async so scanning the data directory + parsing each metadata sidecar
+/// doesn't stall the UI thread at startup with many corpora present.
 #[tauri::command]
-pub fn list_corpora() -> Result<Vec<CorpusMeta>, String> {
+pub async fn list_corpora() -> Result<Vec<CorpusMeta>, String> {
+    tauri::async_runtime::spawn_blocking(list_corpora_inner)
+        .await
+        .map_err(|e| format!("list corpora task failed to join: {e}"))?
+}
+
+fn list_corpora_inner() -> Result<Vec<CorpusMeta>, String> {
     let root = match paths::corpora_root() {
         Ok(p) => p,
         Err(e) => return Err(format!("resolving data dir: {e:#}")),
@@ -105,21 +113,28 @@ pub fn list_corpora() -> Result<Vec<CorpusMeta>, String> {
 /// Open a corpus by slug (the `id` field returned from `list_corpora`
 /// or `build_index`). Registers the handle in `AppState` so subsequent
 /// KWIC / collocate calls hit the same instance.
+/// Async so opening a large index from disk (Tantivy reader setup) runs
+/// off the UI thread when the user switches corpora.
 #[tauri::command]
-pub fn open_corpus(state: State<'_, AppState>, id: String) -> Result<CorpusMeta, String> {
-    let (index, meta) = load_from_disk(&id)?;
-    state
-        .corpora
-        .lock()
-        .expect("corpus registry poisoned")
-        .insert(
-            id,
-            OpenedCorpus {
-                index,
-                meta: meta.clone(),
-            },
-        );
-    Ok(meta)
+pub async fn open_corpus(app: AppHandle, id: String) -> Result<CorpusMeta, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let (index, meta) = load_from_disk(&id)?;
+        state
+            .corpora
+            .lock()
+            .expect("corpus registry poisoned")
+            .insert(
+                id,
+                OpenedCorpus {
+                    index,
+                    meta: meta.clone(),
+                },
+            );
+        Ok(meta)
+    })
+    .await
+    .map_err(|e| format!("open corpus task failed to join: {e}"))?
 }
 
 /// Async so the full-corpus collocation scan runs on a worker thread —
@@ -235,8 +250,20 @@ fn run_collocates_inner(
     })
 }
 
+/// Async so the KWIC scan runs off the UI thread; a frequent term in a
+/// large corpus would otherwise freeze the window while the loading
+/// state is supposed to be showing.
 #[tauri::command]
-pub fn run_kwic(state: State<'_, AppState>, req: KwicRequest) -> Result<KwicResult, String> {
+pub async fn run_kwic(app: AppHandle, req: KwicRequest) -> Result<KwicResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        run_kwic_inner(&state, &req)
+    })
+    .await
+    .map_err(|e| format!("kwic task failed to join: {e}"))?
+}
+
+fn run_kwic_inner(state: &State<'_, AppState>, req: &KwicRequest) -> Result<KwicResult, String> {
     let context = if req.context == 0 {
         DEFAULT_CONTEXT
     } else {
@@ -249,7 +276,7 @@ pub fn run_kwic(state: State<'_, AppState>, req: KwicRequest) -> Result<KwicResu
         .limit(limit);
 
     let t0 = Instant::now();
-    let hits = with_corpus(&state, &req.corpus_id, |index| {
+    let hits = with_corpus(state, &req.corpus_id, |index| {
         run_core_kwic(index, kreq).map_err(|e| format!("kwic failed: {e:#}"))
     })?;
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -273,12 +300,26 @@ pub fn run_kwic(state: State<'_, AppState>, req: KwicRequest) -> Result<KwicResu
 
 /// List every document in a corpus with its path + token count. Backs
 /// the CorpusDetail document table.
+/// Async so the document-listing scan (reads every doc's stored fields)
+/// stays off the UI thread on large corpora.
 #[tauri::command]
-pub fn list_documents(
-    state: State<'_, AppState>,
+pub async fn list_documents(
+    app: AppHandle,
     corpus_id: String,
 ) -> Result<Vec<DocumentInfoDto>, String> {
-    with_corpus(&state, &corpus_id, |index| {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        list_documents_inner(&state, &corpus_id)
+    })
+    .await
+    .map_err(|e| format!("list documents task failed to join: {e}"))?
+}
+
+fn list_documents_inner(
+    state: &State<'_, AppState>,
+    corpus_id: &str,
+) -> Result<Vec<DocumentInfoDto>, String> {
+    with_corpus(state, corpus_id, |index| {
         let docs = index
             .list_documents()
             .map_err(|e| format!("listing documents: {e:#}"))?;
@@ -298,10 +339,26 @@ pub fn list_documents(
 
 /// Corpus-wide top-N term frequencies on a layer. Backs the FrequencyView
 /// word / POS tables.
+/// Async so the term-dictionary scan (the fallback when no precomputed
+/// sidecar exists) runs off the UI thread — Tauri puts sync commands on
+/// the main thread, where switching the word/lemma/POS layer would
+/// otherwise freeze the window. The frontend shows a loading state.
 #[tauri::command]
-pub fn run_frequencies(
-    state: State<'_, AppState>,
+pub async fn run_frequencies(
+    app: AppHandle,
     req: FrequenciesRequest,
+) -> Result<FrequenciesResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        run_frequencies_inner(&state, &req)
+    })
+    .await
+    .map_err(|e| format!("frequencies task failed to join: {e}"))?
+}
+
+fn run_frequencies_inner(
+    state: &State<'_, AppState>,
+    req: &FrequenciesRequest,
 ) -> Result<FrequenciesResult, String> {
     let limit = req.limit.clamp(1, 1000);
     let layer: QueryLayer = req.layer.into();
@@ -311,7 +368,7 @@ pub fn run_frequencies(
     // (or if the request asks for more rows than were precomputed).
     let (rows, total_tokens) = match load_precomputed_frequencies(&req.corpus_id, layer, limit) {
         Some(table) => table,
-        None => with_corpus(&state, &req.corpus_id, |index| {
+        None => with_corpus(state, &req.corpus_id, |index| {
             index
                 .frequencies(layer, limit)
                 .map_err(|e| format!("frequencies failed: {e:#}"))
@@ -335,14 +392,29 @@ pub fn run_frequencies(
 
 /// Per-document hit counts + a corpus-wide dispersion histogram for a
 /// term. Backs the FrequencyView document table and dispersion strip.
+/// Async for the same reason as [`run_frequencies`]: the per-term
+/// postings walk that builds the dispersion histogram + per-doc counts
+/// must stay off the UI thread.
 #[tauri::command]
-pub fn run_term_distribution(
-    state: State<'_, AppState>,
+pub async fn run_term_distribution(
+    app: AppHandle,
     req: TermDistRequest,
+) -> Result<TermDistResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        run_term_distribution_inner(&state, &req)
+    })
+    .await
+    .map_err(|e| format!("term distribution task failed to join: {e}"))?
+}
+
+fn run_term_distribution_inner(
+    state: &State<'_, AppState>,
+    req: &TermDistRequest,
 ) -> Result<TermDistResult, String> {
     let buckets = req.buckets.clamp(1, 1000);
     let t0 = Instant::now();
-    let dist = with_corpus(&state, &req.corpus_id, |index| {
+    let dist = with_corpus(state, &req.corpus_id, |index| {
         index
             .term_distribution(&req.term, req.layer.into(), buckets)
             .map_err(|e| format!("term distribution failed: {e:#}"))
@@ -366,20 +438,32 @@ pub fn run_term_distribution(
 
 /// Re-expand the context around a single KWIC hit to a wider window.
 /// Backs the ContextDrawer.
+/// Async because locating the document is a linear scan over stored doc
+/// ids; on a large corpus that's enough to stutter the UI if it ran on
+/// the main thread when the drawer opens.
 #[tauri::command]
-pub fn expand_context(
-    state: State<'_, AppState>,
-    req: ExpandRequest,
+pub async fn expand_context(app: AppHandle, req: ExpandRequest) -> Result<ExpandedContext, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        expand_context_inner(&state, &req)
+    })
+    .await
+    .map_err(|e| format!("expand context task failed to join: {e}"))?
+}
+
+fn expand_context_inner(
+    state: &State<'_, AppState>,
+    req: &ExpandRequest,
 ) -> Result<ExpandedContext, String> {
     let context = req.context.clamp(1, 500);
-    let found = with_corpus(&state, &req.corpus_id, |index| {
+    let found = with_corpus(state, &req.corpus_id, |index| {
         index
             .context_at(req.doc_id, req.position, context)
             .map_err(|e| format!("context lookup failed: {e:#}"))
     })?;
     // Resolve the path separately so the drawer can show a title even if
     // the position fell out of range.
-    let path = with_corpus(&state, &req.corpus_id, |index| {
+    let path = with_corpus(state, &req.corpus_id, |index| {
         Ok(index
             .list_documents()
             .map_err(|e| format!("listing documents: {e:#}"))?

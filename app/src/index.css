@@ -381,6 +381,22 @@
 .cx-results-empty-sub { font-size: 11px; color: var(--fg-subtle); font-family: var(--font-mono); }
 .cx-results-empty-hint { margin-top: 14px; font-size: 11px; color: var(--fg-subtle); display: flex; gap: 6px; align-items: center; }
 
+/* Small inline loading wheel — used wherever an async backend query is
+   in flight (frequency tables, dispersion). */
+.cx-spinner {
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  animation: cx-spin var(--dur-3, 280ms) linear infinite;
+}
+.cx-loading-row {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--fg-muted); font-size: 12px; font-family: var(--font-mono);
+  padding: 18px 2px;
+}
+@keyframes cx-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .cx-spinner { animation-duration: 1.2s; } }
+
 .cx-kwic-col { flex: 1; overflow: auto; min-width: 0; position: relative; }
 
 .cx-kwic-sort-bar {
