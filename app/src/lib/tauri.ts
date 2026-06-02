@@ -103,6 +103,31 @@ export interface TermDistResult {
   elapsedMs: number;
 }
 
+export interface CollocateDistanceRequest {
+  corpusId: string;
+  term: string;
+  layer: QueryLayer;
+  leftWindow: number;
+  rightWindow: number;
+  limit: number;
+}
+
+export interface DistanceRow {
+  word: string;
+  total: number;
+  /** One count per offset in `offsets` (same order). */
+  counts: number[];
+}
+
+export interface CollocateDistanceResult {
+  /** Signed slot offsets, e.g. [-3,-2,-1,1,2,3]. */
+  offsets: number[];
+  rows: DistanceRow[];
+  nodeHits: number;
+  truncated: boolean;
+  elapsedMs: number;
+}
+
 export interface ExpandRequest {
   corpusId: string;
   docId: number;
@@ -147,6 +172,12 @@ export async function listDocuments(corpusId: string): Promise<DocumentInfo[]> {
 
 export async function runFrequencies(req: FrequenciesRequest): Promise<FrequenciesResult> {
   return invokeSafe<FrequenciesResult>("run_frequencies", { req });
+}
+
+export async function runCollocateDistance(
+  req: CollocateDistanceRequest,
+): Promise<CollocateDistanceResult> {
+  return invokeSafe<CollocateDistanceResult>("run_collocate_distance", { req });
 }
 
 export async function runTermDistribution(req: TermDistRequest): Promise<TermDistResult> {

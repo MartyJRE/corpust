@@ -50,7 +50,12 @@ export function StatusBar({ corpus, result, layer, memory = 0.42 }: StatusBarPro
             {result.truncated && (
               <>
                 <span className="cx-sep">·</span>
-                <span className="cx-warn">truncated</span>
+                <span
+                  className="cx-status-dim"
+                  title={`More matches exist than the ${result.hits.length.toLocaleString()}-line display cap; showing the first ${result.hits.length.toLocaleString()}. Frequency and collocation stats still use the whole corpus.`}
+                >
+                  first {result.hits.length.toLocaleString()} shown
+                </span>
               </>
             )}
           </>

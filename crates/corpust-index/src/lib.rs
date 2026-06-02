@@ -175,6 +175,19 @@ pub struct CollocateScan {
     pub truncated: bool,
 }
 
+/// Per-collocate counts bucketed by signed distance from the node, for
+/// the collocation-by-distance view. `slots` runs `[-left … -1, +1 … +right]`
+/// (the node position itself is excluded).
+#[derive(Debug, Clone)]
+pub struct DistanceProfile {
+    pub node_freq: u64,
+    /// The signed offsets the columns correspond to, e.g. `[-3,-2,-1,1,2,3]`.
+    pub offsets: Vec<i32>,
+    /// Per collocate word: a count for each offset in `offsets` (same length).
+    pub rows: HashMap<String, Vec<u32>>,
+    pub truncated: bool,
+}
+
 /// Corpus-wide distribution of a term: per-document hit counts plus a
 /// dispersion histogram over the whole corpus.
 #[derive(Debug, Clone)]
@@ -848,6 +861,114 @@ impl CorpusIndex {
         Ok(scan)
     }
 
+    /// Like [`Self::collocate_counts`] but keeps each collocate's count
+    /// bucketed by **signed distance** from the node (`-left … -1, +1 …
+    /// +right`), powering the collocation-by-distance view. One positional
+    /// pass; tokens are sliced by their stored offsets so a distance maps
+    /// to exactly one token.
+    pub fn collocate_by_distance(
+        &self,
+        term: &str,
+        layer: QueryLayer,
+        left: usize,
+        right: usize,
+        max_nodes: usize,
+    ) -> Result<DistanceProfile> {
+        let (query_field, lookup_term) = match layer {
+            QueryLayer::Word => (self.fields.body, term.to_lowercase()),
+            QueryLayer::Lemma => (self.fields.body_lemma, term.to_lowercase()),
+            QueryLayer::Pos => (self.fields.body_pos, term.to_string()),
+        };
+        let offsets_axis: Vec<i32> = (1..=left as i32)
+            .rev()
+            .map(|d| -d)
+            .chain(1..=right as i32)
+            .collect();
+        let slot_of = |d: i32| -> usize {
+            if d < 0 {
+                (d + left as i32) as usize
+            } else {
+                left + (d as usize - 1)
+            }
+        };
+
+        let searcher = self.reader.searcher();
+        let term_obj = Term::from_field_text(query_field, &lookup_term);
+        let mut rows: HashMap<String, Vec<u32>> = HashMap::new();
+        let slots = left + right;
+        let mut node_freq: u64 = 0;
+        let mut truncated = false;
+        let mut positions_buf: Vec<u32> = Vec::new();
+
+        'segments: for (seg_ord, seg_reader) in searcher.segment_readers().iter().enumerate() {
+            let inv_idx = seg_reader.inverted_index(query_field)?;
+            let Some(mut postings) =
+                inv_idx.read_postings(&term_obj, IndexRecordOption::WithFreqsAndPositions)?
+            else {
+                continue;
+            };
+            loop {
+                let doc = postings.doc();
+                if doc == TERMINATED {
+                    continue 'segments;
+                }
+                let doc_addr = DocAddress::new(seg_ord as u32, doc);
+                let retrieved: TantivyDocument = searcher.doc(doc_addr)?;
+                let body = retrieved
+                    .get_first(self.fields.body)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let offsets = bytes_to_offsets(
+                    retrieved
+                        .get_first(self.fields.token_offsets)
+                        .and_then(|v| v.as_bytes())
+                        .unwrap_or_default(),
+                );
+                let n = offsets.len();
+                let start_of = |i: usize| -> usize {
+                    if i < n {
+                        offsets[i] as usize
+                    } else {
+                        body.len()
+                    }
+                };
+
+                positions_buf.clear();
+                postings.positions(&mut positions_buf);
+                for &pos in &positions_buf {
+                    if node_freq as usize >= max_nodes {
+                        truncated = true;
+                        break 'segments;
+                    }
+                    node_freq += 1;
+                    let p = pos as usize;
+                    if p >= n {
+                        continue;
+                    }
+                    let lo = p.saturating_sub(left);
+                    let hi = (p + right + 1).min(n);
+                    for i in lo..hi {
+                        if i == p {
+                            continue;
+                        }
+                        if let Some(w) = normalize_token(&body[start_of(i)..start_of(i + 1)]) {
+                            let slot = slot_of(i as i32 - p as i32);
+                            rows.entry(w).or_insert_with(|| vec![0u32; slots])[slot] += 1;
+                        }
+                    }
+                }
+                postings.advance();
+            }
+        }
+
+        Ok(DistanceProfile {
+            node_freq,
+            offsets: offsets_axis,
+            rows,
+            truncated,
+        })
+    }
+
     /// Per-document hit counts and a corpus-wide dispersion histogram for
     /// a single term on `layer`, in one pass over the term's postings.
     ///
@@ -1042,29 +1163,32 @@ fn window(
     p: usize,
     context: usize,
 ) -> Option<(String, String, String)> {
-    if p >= offsets.len() {
+    let n = offsets.len();
+    if p >= n {
         return None;
     }
     let window_start = p.saturating_sub(context);
-    let window_end = (p + context + 1).min(offsets.len());
-    let byte_start = offsets[window_start] as usize;
-    let byte_end = if window_end < offsets.len() {
-        offsets[window_end] as usize
-    } else {
-        body.len()
-    };
+    let window_end = (p + context + 1).min(n); // exclusive token index
 
-    let window_text = &body[byte_start..byte_end];
-    let window_tokens: Vec<&str> = window_text.unicode_words().collect();
-    let hit_idx = p - window_start;
-    if hit_idx >= window_tokens.len() {
-        return None;
-    }
-    Some((
-        window_tokens[..hit_idx].join(" "),
-        window_tokens[hit_idx].to_string(),
-        window_tokens[hit_idx + 1..].join(" "),
-    ))
+    // Slice each token directly by its stored byte offset. `offsets[i]` is
+    // the start of token `i`; the start of token `i+1` (or end of body) is
+    // its end. This keeps the displayed hit aligned with the indexed
+    // position `p` even when the indexing tokenizer (an annotator's
+    // tokenisation) splits the text differently from a naive
+    // re-tokenisation — re-tokenising here silently mis-aligned the hit on
+    // annotated corpora.
+    let start_of = |i: usize| -> usize {
+        if i < n {
+            offsets[i] as usize
+        } else {
+            body.len()
+        }
+    };
+    let left = body[start_of(window_start)..start_of(p)].trim();
+    let hit = body[start_of(p)..start_of(p + 1)].trim();
+    let right = body[start_of(p + 1)..start_of(window_end)].trim();
+
+    Some((left.to_owned(), hit.to_owned(), right.to_owned()))
 }
 
 /// Which side of the node a window extends to.
@@ -1099,6 +1223,22 @@ fn window_side(body: &str, offsets: &[u32], p: usize, count: usize, side: Side) 
         body.len()
     };
     tokenize_for_collocates(&body[byte_start..byte_end]).collect()
+}
+
+/// Normalise a single token slice for collocate counting: lowercase,
+/// strip edge punctuation, drop empty/single-character and pure-digit
+/// tokens. Returns `None` for tokens that aren't collocate candidates.
+fn normalize_token(raw: &str) -> Option<String> {
+    let trimmed: String = raw
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    if trimmed.chars().count() < 2 {
+        return None;
+    }
+    if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(trimmed)
 }
 
 /// Split a window substring into collocate candidates:
@@ -1588,6 +1728,25 @@ mod tests {
         // 2(cat) + 1(on) + 1(and) + 1(mat) + 1(dog) collocate slots filled.
         assert_eq!(scan.window_tokens, 6);
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn collocate_by_distance_buckets_offsets() {
+        // doc0: the(0) cat(1) sat(2) on(3) the(4) mat(5)
+        // doc1: the(0) dog(1) and(2) the(3) cat(4)
+        let (tmp, idx) = two_doc_index();
+        let prof = idx
+            .collocate_by_distance("the", QueryLayer::Word, 1, 1, usize::MAX)
+            .unwrap();
+        assert_eq!(prof.node_freq, 4);
+        assert_eq!(prof.offsets, vec![-1, 1]);
+        // cat: never immediately left of "the", twice immediately right.
+        assert_eq!(prof.rows.get("cat"), Some(&vec![0, 2]));
+        // on / and precede a "the"; mat / dog follow one.
+        assert_eq!(prof.rows.get("on"), Some(&vec![1, 0]));
+        assert_eq!(prof.rows.get("and"), Some(&vec![1, 0]));
+        assert_eq!(prof.rows.get("mat"), Some(&vec![0, 1]));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
