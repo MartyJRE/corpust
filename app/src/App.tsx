@@ -14,6 +14,8 @@ import { KwicTable } from "@/components/kwic/KwicTable";
 import { HitDensityGutter } from "@/components/kwic/HitDensityGutter";
 import { ContextDrawer } from "@/components/kwic/ContextDrawer";
 import { CollocationsView } from "@/components/analyses/CollocationsView";
+import { CollocationDistance } from "@/components/analyses/CollocationDistance";
+import { WordTree } from "@/components/analyses/WordTree";
 import { FrequencyView } from "@/components/analyses/FrequencyView";
 import { CorpusDetail } from "@/components/analyses/CorpusDetail";
 import { SettingsView } from "@/components/analyses/SettingsView";
@@ -22,7 +24,7 @@ import { CommandPalette, type CommandDef } from "@/components/overlays/CommandPa
 import { BuildDialog } from "@/components/overlays/BuildDialog";
 import { CORPORA, RECENT_QUERIES, pickHits } from "@/data";
 import { makeDensity } from "@/lib/utils";
-import { inTauri, listCorpora, runCollocates, runKwic as runKwicTauri } from "@/lib/tauri";
+import { inTauri, isFixtureCorpus, listCorpora, runCollocates, runKwic as runKwicTauri } from "@/lib/tauri";
 import type { Collocate } from "@/types";
 import type {
   CorpusMeta,
@@ -111,73 +113,62 @@ export function App() {
   // counter drops stale responses so the freshest one wins. We don't
   // wipe `result` on refetch — the stale table stays visible so the
   // UI doesn't strobe on every keystroke.
+  // One fetch path for the concordance, keyed on (corpus, term, layer).
+  // A request-id guard drops superseded responses, so a real corpus can
+  // never end up showing a previous (fixture) corpus's stale hits.
   const kwicReqRef = useRef(0);
-  const runKwic = () => {
-    if (!activeCorpus || !term.trim()) return;
-    const myId = ++kwicReqRef.current;
-    setLoading(true);
-    const isRealCorpus = inTauri() && !CORPORA.some((c) => c.id === activeCorpus.id);
-    if (isRealCorpus) {
-      runKwicTauri({
-        corpusId: activeCorpus.id,
-        term: term.trim(),
-        layer,
-        context: 8,
-        limit: 200,
-      })
-        .then((r) => {
-          if (myId !== kwicReqRef.current) return;
-          // The Tauri backend returns hits with a numeric doc_id +
-          // file path; the frontend's KwicHit shape carries docId
-          // (string) and no path. Adapt the shape inline until the
-          // types converge.
-          const hits: KwicHit[] = r.hits.map((h, i) => ({
-            docId: String(h.docId),
-            pos: i,
-            hitPos: h.hitPosition,
-            left: h.left,
-            hit: h.hit,
-            right: h.right,
-          }));
-          setResult({ hits, elapsedMs: r.elapsedMs, truncated: r.truncated });
-          setSelected(null);
-        })
-        .catch((e) => {
-          console.error("runKwic failed:", e);
-          if (myId === kwicReqRef.current) {
-            setResult({ hits: [], elapsedMs: 0, truncated: false });
-            setSelected(null);
-          }
-        })
-        .finally(() => {
-          if (myId === kwicReqRef.current) setLoading(false);
-        });
+  const fetchKwic = useCallback((corpus: CorpusMeta | null, q: string, lyr: QueryLayer) => {
+    if (!corpus || !q.trim()) {
+      setResult(null);
+      setLoading(false);
       return;
     }
-    // Fallback: fixture data for the non-Tauri / pre-built-corpus case.
-    window.setTimeout(() => {
-      if (myId !== kwicReqRef.current) return;
-      const hits = pickHits(activeCorpus.id, term.trim(), layer);
-      const elapsedMs = 0.2 + Math.random() * 1.6;
-      setResult({ hits, elapsedMs, truncated: hits.length >= 1000 });
-      setSelected(null);
-      setLoading(false);
-    }, 40);
-  };
-  // Explicit Enter-key / "Run" button handler. Same path as the
-  // effects — the request-id guard handles any overlap.
-  const run = runKwic;
+    const myId = ++kwicReqRef.current;
+    setLoading(true);
+    // Fixture corpora (or non-Tauri preview) use the baked-in demo hits.
+    if (!inTauri() || isFixtureCorpus(corpus.id)) {
+      const hits = pickHits(corpus.id, q.trim(), lyr);
+      if (myId === kwicReqRef.current) {
+        setResult({ hits, elapsedMs: 0.2 + Math.random() * 1.6, truncated: hits.length >= 1000 });
+        setSelected(null);
+        setLoading(false);
+      }
+      return;
+    }
+    runKwicTauri({ corpusId: corpus.id, term: q.trim(), layer: lyr, context: 8, limit: 200 })
+      .then((r) => {
+        if (myId !== kwicReqRef.current) return;
+        const hits: KwicHit[] = r.hits.map((h, i) => ({
+          docId: String(h.docId),
+          pos: i,
+          hitPos: h.hitPosition,
+          left: h.left,
+          hit: h.hit,
+          right: h.right,
+        }));
+        setResult({ hits, elapsedMs: r.elapsedMs, truncated: r.truncated });
+        setSelected(null);
+      })
+      .catch((e) => {
+        if (myId !== kwicReqRef.current) return;
+        console.error("runKwic failed:", e);
+        setResult({ hits: [], elapsedMs: 0, truncated: false });
+        setSelected(null);
+      })
+      .finally(() => {
+        if (myId === kwicReqRef.current) setLoading(false);
+      });
+  }, []);
 
+  // Auto-fetch on corpus / term / layer change (debounced so typing
+  // coalesces). The guard inside drops stale responses.
   useEffect(() => {
-    runKwic();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [layer, activeCorpus]);
-
-  useEffect(() => {
-    const t = window.setTimeout(runKwic, 100);
+    const t = window.setTimeout(() => fetchKwic(activeCorpus, term, layer), 100);
     return () => window.clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [term]);
+  }, [activeCorpus, term, layer, fetchKwic]);
+
+  // Explicit Enter / "Run" — fetch immediately, no debounce.
+  const run = () => fetchKwic(activeCorpus, term, layer);
 
   // Fetch real collocates when the Collocations view is active on a
   // real (backend-registered) corpus. Fixture corpora keep whatever
@@ -396,6 +387,7 @@ export function App() {
             <CollocationsView
               corpus={activeCorpus}
               term={term}
+              layer={layer}
               data={collocates}
               loading={collLoading}
               truncated={collTruncated}
@@ -409,6 +401,12 @@ export function App() {
           )}
           {subview === "freq" && activeCorpus && (
             <FrequencyView corpus={activeCorpus} term={term} />
+          )}
+          {subview === "tree" && activeCorpus && (
+            <WordTree corpusName={activeCorpus.name} term={term} result={result} loading={loading} />
+          )}
+          {subview === "dist" && activeCorpus && (
+            <CollocationDistance corpus={activeCorpus} term={term} layer={layer} />
           )}
         </div>
       </>

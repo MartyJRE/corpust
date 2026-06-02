@@ -90,6 +90,17 @@
     -moz-osx-font-smoothing: grayscale;
     font-feature-settings: "rlig" 1, "calt" 1, "ss01" 1;
     overflow: hidden;
+    /* UI chrome isn't selectable — it's an app, not a document. Specific
+       content surfaces opt back in below. */
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  /* Selectable content: form fields, the concordance lines, and the
+     context-drawer reading pane — the actual corpus text a user copies.
+     Stats tables and chrome stay non-selectable. */
+  input, textarea, .cx-kwic, .cx-drawer-body {
+    user-select: text;
+    -webkit-user-select: text;
   }
   ::selection { background: color-mix(in oklch, var(--accent) 35%, transparent); color: var(--fg); }
   @media (prefers-reduced-motion: reduce) {
@@ -647,12 +658,23 @@
 .cx-coll-segbtn button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .cx-coll-graph {
-  position: relative; height: 380px;
+  position: relative; height: clamp(460px, 60vh, 780px);
   background: var(--bg-raised); border: 1px solid var(--border);
   border-radius: var(--radius-md);
   margin-bottom: 8px; overflow: hidden;
 }
 .cx-coll-svg-wrap { padding: 0; }
+
+/* collocation-by-distance heatmap */
+.cx-dist-msg { display: flex; align-items: center; justify-content: center; height: 100%; font-family: var(--font-mono); font-size: 12px; color: var(--fg-subtle); text-align: center; }
+.cx-dist-table { border-collapse: collapse; font-family: var(--font-mono); font-size: 11px; }
+.cx-dist-table th { color: var(--fg-subtle); font-weight: 400; padding: 4px 0; text-align: center; }
+.cx-dist-word { text-align: left !important; color: var(--fg); padding-right: 12px !important; white-space: nowrap; position: sticky; left: 0; background: var(--bg-raised); }
+.cx-dist-total { color: var(--fg-subtle); font-size: 10px; }
+.cx-dist-col { width: 40px; }
+.cx-dist-node { color: var(--accent); font-style: italic; padding: 0 8px; }
+.cx-dist-cell { width: 40px; height: 22px; text-align: center; color: var(--fg); border: 1px solid var(--border); }
+.cx-dist-nodecell { width: 14px; border-left: 1px dashed var(--accent); border-right: 1px dashed var(--accent); opacity: 0.5; }
 
 .cx-coll-legend {
   display: flex; gap: 14px;
@@ -735,7 +757,9 @@
 .cx-freq-bar-row .word.is-pos { color: var(--layer-pos); }
 .cx-freq-bar-row .count { text-align: right; color: var(--fg-muted); }
 .cx-freq-bar-row .pct { text-align: right; color: var(--fg-subtle); font-size: 10px; }
-.cx-freq-bar { height: 6px; border-radius: 2px; background: color-mix(in oklch, var(--accent) 70%, transparent); transition: width var(--dur-2) var(--ease); }
+.cx-freq-bar { height: 6px; border-radius: 2px; background: color-mix(in oklch, var(--accent) 70%, transparent); transform-origin: left center; animation: cx-bar-grow var(--dur-2) var(--ease) both; }
+@keyframes cx-bar-grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@media (prefers-reduced-motion: reduce) { .cx-freq-bar { animation: none; } }
 
 .cx-disp { position: relative; height: 96px; background: var(--bg-inset); border-radius: var(--radius-sm); border: 1px solid var(--border); overflow: hidden; }
 .cx-disp-mark { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--accent); opacity: 0.6; }

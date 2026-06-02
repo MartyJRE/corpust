@@ -54,6 +54,7 @@ pub fn run() {
             commands::list_documents,
             commands::run_frequencies,
             commands::run_term_distribution,
+            commands::run_collocate_distance,
             commands::expand_context,
         ])
         .run(tauri::generate_context!())
@@ -260,6 +261,40 @@ pub struct TermDistResult {
     pub doc_counts: Vec<DocTermCount>,
     pub dispersion: Vec<u32>,
     pub total_hits: u64,
+    pub elapsed_ms: f64,
+}
+
+// ---- Collocation by distance (positional profile) ----
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollocateDistanceRequest {
+    pub corpus_id: String,
+    pub term: String,
+    pub layer: QueryLayer,
+    pub left_window: usize,
+    pub right_window: usize,
+    /// How many of the busiest collocates to return rows for.
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DistanceRow {
+    pub word: String,
+    pub total: u32,
+    /// One count per offset in `offsets` (same length/order).
+    pub counts: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollocateDistanceResult {
+    /// Signed offsets the columns represent, e.g. `[-3,-2,-1,1,2,3]`.
+    pub offsets: Vec<i32>,
+    pub rows: Vec<DistanceRow>,
+    pub node_hits: u32,
+    pub truncated: bool,
     pub elapsed_ms: f64,
 }
 

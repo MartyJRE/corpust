@@ -20,6 +20,22 @@ export interface FrequencyViewProps {
 const TOP_N = 12;
 const BUCKETS = 100;
 
+/** True only once `active` has stayed true for `delay` ms — so a spinner
+ *  doesn't flash on fast (cached/sidecar) queries. Fast loads resolve
+ *  before the timer fires and never show it; slow ones still do. */
+function useDelayedFlag(active: boolean, delay = 160): boolean {
+  const [on, setOn] = useState(false);
+  useEffect(() => {
+    if (!active) {
+      setOn(false);
+      return;
+    }
+    const id = window.setTimeout(() => setOn(true), delay);
+    return () => window.clearTimeout(id);
+  }, [active, delay]);
+  return on;
+}
+
 interface FreqBarRow {
   primary: string;
   secondary?: string;
@@ -37,8 +53,6 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
   const [by, setBy] = useState<FreqBy>("word");
   const [liveFreq, setLiveFreq] = useState<FreqResultRow[] | null>(null);
   const [liveDist, setLiveDist] = useState<TermDistResult | null>(null);
-  const [freqLoading, setFreqLoading] = useState(false);
-  const [distLoading, setDistLoading] = useState(false);
 
   // Corpus-wide term frequencies on the active layer; refetch when the
   // corpus or the word/POS toggle changes. The backend command is async
@@ -49,14 +63,13 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
     setLiveFreq(null);
     if (!hasLiveData(corpus.id)) return;
     let cancelled = false;
-    setFreqLoading(true);
     runFrequencies({ corpusId: corpus.id, layer: by, limit: TOP_N })
       .then((r) => {
         if (!cancelled) setLiveFreq(r.rows);
       })
-      .catch((e) => console.error("runFrequencies failed:", e))
-      .finally(() => {
-        if (!cancelled) setFreqLoading(false);
+      .catch((e) => {
+        console.error("runFrequencies failed:", e);
+        if (!cancelled) setLiveFreq([]); // clear the spinner on error
       });
     return () => {
       cancelled = true;
@@ -68,14 +81,13 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
     setLiveDist(null);
     if (!hasLiveData(corpus.id) || !term.trim()) return;
     let cancelled = false;
-    setDistLoading(true);
     runTermDistribution({ corpusId: corpus.id, term: term.trim(), layer: by, buckets: BUCKETS })
       .then((r) => {
         if (!cancelled) setLiveDist(r);
       })
-      .catch((e) => console.error("runTermDistribution failed:", e))
-      .finally(() => {
-        if (!cancelled) setDistLoading(false);
+      .catch((e) => {
+        console.error("runTermDistribution failed:", e);
+        if (!cancelled) setLiveDist({ docCounts: [], dispersion: [], totalHits: 0, elapsedMs: 0 });
       });
     return () => {
       cancelled = true;
@@ -83,6 +95,15 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
   }, [corpus.id, term, by]);
 
   const isLive = hasLiveData(corpus.id);
+  // For a live corpus, show the spinner until the *real* data arrives —
+  // never flash the fixture rows (which would look like the bars
+  // reshuffling from demo terms into the real ones).
+  const freqPending = isLive && !liveFreq;
+  const distPending = isLive && !liveDist;
+  // Only surface the spinner if the query is actually slow; a fast load
+  // resolves first and the bars just grow in — no spinner flash.
+  const showFreqSpinner = useDelayedFlag(freqPending);
+  const showDistSpinner = useDelayedFlag(distPending);
   const fixtureDispersion = useMemo(() => makeDispersion(42), []);
 
   // --- Normalise live or fixture data into uniform render rows. ---
@@ -144,15 +165,19 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
             <div className="cx-card-meta">n = {corpus.tokenCount.toLocaleString()} tokens</div>
           </div>
           <div className="cx-card-body">
-            {isLive && freqLoading ? (
-              <div className="cx-loading-row">
-                <span className="cx-spinner" /> computing frequencies…
-              </div>
+            {freqPending ? (
+              showFreqSpinner ? (
+                <div className="cx-loading-row">
+                  <span className="cx-spinner" /> computing frequencies…
+                </div>
+              ) : null
             ) : (
-            freqRows.map((row) => {
+            freqRows.map((row, i) => {
               const w = (row.count / maxCount) * 100;
               return (
-                <div key={row.primary} className="cx-freq-bar-row">
+                // keyed by rank, not term: the slot stays put while its
+                // contents swap, so bars don't reorder mid grow-animation.
+                <div key={i} className="cx-freq-bar-row">
                   <span className={`word ${by === "pos" ? "is-pos" : ""}`}>
                     {row.secondary ? `${row.primary} · ${row.secondary}` : row.primary}
                   </span>
@@ -176,10 +201,12 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
             </div>
           </div>
           <div className="cx-card-body">
-            {isLive && distLoading ? (
-              <div className="cx-loading-row">
-                <span className="cx-spinner" /> computing dispersion…
-              </div>
+            {distPending ? (
+              showDistSpinner ? (
+                <div className="cx-loading-row">
+                  <span className="cx-spinner" /> computing dispersion…
+                </div>
+              ) : null
             ) : (
             <>
             <div className="cx-disp">
@@ -199,9 +226,9 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
               <span>top documents</span>
               <span className="sub">hits · per 1M tokens</span>
             </div>
-            {docFreq.slice(0, 8).map((d) => (
+            {docFreq.slice(0, 8).map((d, i) => (
               <div
-                key={d.doc}
+                key={i}
                 className="cx-freq-bar-row"
                 style={{ gridTemplateColumns: "140px 1fr 50px 60px" }}
               >

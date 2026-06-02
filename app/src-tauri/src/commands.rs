@@ -6,11 +6,11 @@
 //! returned `corpusId` / `taskId` handles.
 
 use crate::{
-    AppState, BuildRequest, Collocate as CollocateDto, CollocatesRequest, CollocatesResult,
-    CorpusMeta, CorpusMetaEnvelope, DocTermCount as DocTermCountDto,
-    DocumentInfo as DocumentInfoDto, ExpandRequest, ExpandedContext, FreqRow, FrequenciesRequest,
-    FrequenciesResult, KwicHit as KwicHitDto, KwicRequest, KwicResult, OpenedCorpus, TaggerKind,
-    TermDistRequest, TermDistResult,
+    AppState, BuildRequest, Collocate as CollocateDto, CollocateDistanceRequest,
+    CollocateDistanceResult, CollocatesRequest, CollocatesResult, CorpusMeta, CorpusMetaEnvelope,
+    DistanceRow, DocTermCount as DocTermCountDto, DocumentInfo as DocumentInfoDto, ExpandRequest,
+    ExpandedContext, FreqRow, FrequenciesRequest, FrequenciesResult, KwicHit as KwicHitDto,
+    KwicRequest, KwicResult, OpenedCorpus, TaggerKind, TermDistRequest, TermDistResult,
 };
 use corpust_annotate::{Annotator, treetagger::TreeTagger};
 use corpust_index::{CorpusIndex, DEFAULT_CONTEXT, QueryLayer};
@@ -432,6 +432,67 @@ fn run_term_distribution_inner(
             .collect(),
         dispersion: dist.dispersion,
         total_hits: dist.total_hits,
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+/// Per-collocate counts bucketed by signed distance from the node, for
+/// the collocation-by-distance heatmap. Async — full positional scan.
+#[tauri::command]
+pub async fn run_collocate_distance(
+    app: AppHandle,
+    req: CollocateDistanceRequest,
+) -> Result<CollocateDistanceResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        run_collocate_distance_inner(&state, &req)
+    })
+    .await
+    .map_err(|e| format!("collocate distance task failed to join: {e}"))?
+}
+
+fn run_collocate_distance_inner(
+    state: &State<'_, AppState>,
+    req: &CollocateDistanceRequest,
+) -> Result<CollocateDistanceResult, String> {
+    const MAX_NODE_OCCURRENCES: usize = 1_000_000;
+    let lw = req.left_window.min(15);
+    let rw = req.right_window.min(15);
+    if lw == 0 && rw == 0 {
+        return Err("distance window must include at least one side".to_owned());
+    }
+    let layer: QueryLayer = req.layer.into();
+    let limit = req.limit.clamp(1, 60);
+    let t0 = Instant::now();
+
+    let (offsets, mut rows, node_freq, truncated) = with_corpus(state, &req.corpus_id, |index| {
+        let prof = index
+            .collocate_by_distance(&req.term, layer, lw, rw, MAX_NODE_OCCURRENCES)
+            .map_err(|e| format!("distance scan failed: {e:#}"))?;
+        let rows: Vec<DistanceRow> = prof
+            .rows
+            .into_iter()
+            .map(|(word, counts)| {
+                let total = counts.iter().sum();
+                DistanceRow {
+                    word,
+                    total,
+                    counts,
+                }
+            })
+            .collect();
+        Ok((prof.offsets, rows, prof.node_freq, prof.truncated))
+    })?;
+
+    // Keep the busiest collocates; the heatmap can't show thousands.
+    rows.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.word.cmp(&b.word)));
+    rows.truncate(limit);
+
+    Ok(CollocateDistanceResult {
+        offsets,
+        rows,
+        node_hits: node_freq.min(u32::MAX as u64) as u32,
+        truncated,
         elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
     })
 }
