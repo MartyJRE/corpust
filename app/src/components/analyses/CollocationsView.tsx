@@ -41,13 +41,19 @@ function prefRatio(c: Collocate): number {
   return (c.rightCount - c.leftCount) / c.total;
 }
 
-function niceTicks(max: number, count = 5): number[] {
-  if (max <= 0) return [0];
-  const rawStep = max / (count - 1);
+// Evenly spaced "nice" ticks across a signed domain, always landing a
+// tick on zero (start is floored to a step multiple, and zero is a
+// multiple of any step).
+function signedTicks(min: number, max: number, count = 5): number[] {
+  const span = max - min || 1;
+  const rawStep = span / (count - 1);
   const pow = Math.pow(10, Math.floor(Math.log10(rawStep)));
-  const step = Math.ceil(rawStep / pow) * pow;
+  const step = Math.ceil(rawStep / pow) * pow || 1;
+  const start = Math.floor(min / step) * step;
   const ticks: number[] = [];
-  for (let v = 0; v <= max * 1.05; v += step) ticks.push(v);
+  for (let v = start; v <= max + step * 0.5; v += step) {
+    ticks.push(Number(v.toFixed(6)));
+  }
   return ticks;
 }
 
@@ -64,6 +70,12 @@ export interface CollocationsViewProps {
    *  fixture `COLLOCATIONS` so the view still looks populated in
    *  demos / non-Tauri preview. */
   data?: Collocate[] | null;
+  /** Backend scan in flight — show a loading overlay. The full-corpus
+   *  scan can take a moment on a frequent node. */
+  loading?: boolean;
+  /** The scan hit its safety ceiling; scores are from a large sample,
+   *  not every occurrence. Surface it rather than silently capping. */
+  truncated?: boolean;
   /** Tokens on the left of the node to consider (0 = skip). Lifted
    *  to App so the backend refetch uses the same values the UI shows. */
   leftWindow?: number;
@@ -78,6 +90,8 @@ type CollSortKey = "word" | "pos" | "leftCount" | "rightCount" | "total" | "logD
 export function CollocationsView({
   term,
   data: dataProp,
+  loading = false,
+  truncated = false,
   leftWindow = 5,
   rightWindow = 5,
   onWindowChange,
@@ -111,15 +125,28 @@ export function CollocationsView({
     if (sortDir === "desc") copy.reverse();
     return copy;
   }, [rawData, sortKey, sortDir]);
-  const maxScore = useMemo(() => Math.max(1e-6, ...data.map((d) => d[metric])), [data, metric]);
+  // y-axis domain always straddles zero: MI and z-score go negative for
+  // dispreferred collocates, so the axis can't assume a 0-based range.
+  const [domMin, domMax] = useMemo(() => {
+    const scores = data.map((d) => d[metric]);
+    const lo = Math.min(0, ...scores);
+    const hi = Math.max(0, ...scores);
+    const pad = (hi - lo) * 0.05 || 1;
+    return [lo - (lo < 0 ? pad : 0), hi + pad];
+  }, [data, metric]);
   const maxTotal = useMemo(() => Math.max(1, ...data.map((d) => d.total)), [data]);
 
   const xFor = (pref: number) => M.left + ((pref + 1) / 2) * PW;
-  const yFor = (score: number) => M.top + PH - (score / (maxScore * 1.05)) * PH;
+  const yFor = (score: number) =>
+    M.top + PH - ((score - domMin) / (domMax - domMin || 1)) * PH;
   const rFor = (total: number) => 4 + (Math.sqrt(total) / Math.sqrt(maxTotal)) * 12;
   const colorOf = (pos: string) => POS_FAMILY_COLOR[posFamily(pos)];
+  // Strength meter: collocate's position within the signed domain (so a
+  // strongly negative score reads as a short bar, not a clamped stub).
+  const meterWidth = (score: number) =>
+    Math.max(4, ((score - domMin) / (domMax - domMin || 1)) * 120);
 
-  const yTicks = niceTicks(maxScore, 5);
+  const yTicks = signedTicks(domMin, domMax, 5);
   const xTicks = [-1, -0.5, 0, 0.5, 1];
   const metricLabel = metric === "logDice" ? "log-Dice" : metric === "mi" ? "MI" : "z-score";
 
@@ -129,6 +156,22 @@ export function CollocationsView({
         <div className="cx-coll-head">
           <h2 className="cx-coll-title">
             collocates of <span className="kw">{term}</span>
+            {truncated && (
+              <span
+                title="The node occurs more often than the scan ceiling; scores are from a large sample, not every occurrence."
+                style={{
+                  marginLeft: 8,
+                  fontFamily: "var(--font-mono)",
+                  fontSize: 10,
+                  fontWeight: 400,
+                  color: "var(--warn)",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.06em",
+                }}
+              >
+                · sampled
+              </span>
+            )}
           </h2>
           <div className="cx-coll-controls">
             <span>L</span>
@@ -183,7 +226,28 @@ export function CollocationsView({
           </div>
         </div>
 
-        <div className="cx-coll-graph cx-coll-svg-wrap">
+        <div className="cx-coll-graph cx-coll-svg-wrap" style={{ position: "relative" }}>
+          {loading && (
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                background: "color-mix(in oklch, var(--bg) 55%, transparent)",
+                backdropFilter: "blur(1px)",
+                zIndex: 2,
+                fontFamily: "var(--font-mono)",
+                fontSize: 12,
+                color: "var(--fg-muted)",
+                letterSpacing: "0.04em",
+                transition: "opacity var(--dur-2) var(--ease)",
+              }}
+            >
+              computing collocations…
+            </div>
+          )}
           <svg
             viewBox={`0 0 ${W} ${H}`}
             preserveAspectRatio="xMidYMid meet"
@@ -434,10 +498,7 @@ export function CollocationsView({
                 <td className="num">{c.mi.toFixed(2)}</td>
                 <td className="num">{c.z.toFixed(1)}</td>
                 <td className="num">
-                  <span
-                    className="cx-meter"
-                    style={{ width: Math.max(4, (c[metric] / maxScore) * 120) }}
-                  />
+                  <span className="cx-meter" style={{ width: meterWidth(c[metric]) }} />
                 </td>
               </tr>
             ))}

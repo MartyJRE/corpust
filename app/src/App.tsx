@@ -44,6 +44,8 @@ export function App() {
   const [term, setTerm] = useState("linguistic");
   const [result, setResult] = useState<KwicResult | null>(null);
   const [collocates, setCollocates] = useState<Collocate[] | null>(null);
+  const [collLoading, setCollLoading] = useState(false);
+  const [collTruncated, setCollTruncated] = useState(false);
   const [collLeft, setCollLeft] = useState(5);
   const [collRight, setCollRight] = useState(5);
   const [loading, setLoading] = useState(false);
@@ -191,9 +193,12 @@ export function App() {
     if (subview !== "coll" || !activeCorpus || !term.trim()) return;
     if (!inTauri() || CORPORA.some((c) => c.id === activeCorpus.id)) {
       setCollocates(null);
+      setCollLoading(false);
+      setCollTruncated(false);
       return;
     }
     const myId = ++collReqRef.current;
+    setCollLoading(true);
     runCollocates({
       corpusId: activeCorpus.id,
       term: term.trim(),
@@ -203,11 +208,17 @@ export function App() {
       limit: 60,
     })
       .then((r) => {
-        if (myId === collReqRef.current) setCollocates(r.collocates);
+        if (myId !== collReqRef.current) return;
+        setCollocates(r.collocates);
+        setCollTruncated(r.truncated);
+        setCollLoading(false);
       })
       .catch((e) => {
         console.error("runCollocates failed:", e);
-        if (myId === collReqRef.current) setCollocates([]);
+        if (myId !== collReqRef.current) return;
+        setCollocates([]);
+        setCollTruncated(false);
+        setCollLoading(false);
       });
   };
 
@@ -386,6 +397,8 @@ export function App() {
               corpus={activeCorpus}
               term={term}
               data={collocates}
+              loading={collLoading}
+              truncated={collTruncated}
               leftWindow={collLeft}
               rightWindow={collRight}
               onWindowChange={(l, r) => {
