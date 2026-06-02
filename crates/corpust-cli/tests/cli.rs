@@ -67,6 +67,17 @@ fn index_then_kwic_word_layer() {
     assert!(meta_raw.contains("\"schemaVersion\""));
     assert!(meta_raw.contains("\"docCount\": 2"));
 
+    // Precomputed frequency sidecar should land next to the index too,
+    // with "the" as the top word-layer term across both docs.
+    let freq_path = out.parent().unwrap().join("frequencies.json");
+    assert!(
+        freq_path.exists(),
+        "expected frequencies.json at {freq_path:?}"
+    );
+    let freq_raw = fs::read_to_string(&freq_path).unwrap();
+    assert!(freq_raw.contains("\"schemaVersion\""));
+    assert!(freq_raw.contains("\"the\""));
+
     corpust()
         .args(["kwic"])
         .args(["--index"])

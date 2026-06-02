@@ -6,8 +6,9 @@
 //! <data_root>/
 //! └── corpora/
 //!     └── <slug>/
-//!         ├── index/        ← tantivy files
-//!         └── metadata.json ← versioned CorpusMeta sidecar
+//!         ├── index/           ← tantivy files
+//!         ├── metadata.json    ← versioned CorpusMeta sidecar
+//!         └── frequencies.json ← versioned precomputed freq tables
 //! ```
 //!
 //! On macOS that's `~/Library/Application Support/corpust/`; on Linux
@@ -61,6 +62,11 @@ pub fn index_path(slug: &str) -> Result<PathBuf> {
 /// Path to the metadata sidecar inside a corpus dir.
 pub fn metadata_path(slug: &str) -> Result<PathBuf> {
     Ok(corpus_dir(slug)?.join("metadata.json"))
+}
+
+/// Path to the precomputed frequency-table sidecar inside a corpus dir.
+pub fn freq_path(slug: &str) -> Result<PathBuf> {
+    Ok(corpus_dir(slug)?.join("frequencies.json"))
 }
 
 /// Turn a human-chosen corpus name into a filesystem-safe slug.
@@ -175,6 +181,10 @@ mod tests {
         assert_eq!(
             metadata_path("foo").unwrap(),
             tmp_root.join("corpora/foo/metadata.json")
+        );
+        assert_eq!(
+            freq_path("foo").unwrap(),
+            tmp_root.join("corpora/foo/frequencies.json")
         );
 
         // Empty CORPUST_DATA_ROOT falls back to the default lookup.
