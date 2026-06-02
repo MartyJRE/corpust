@@ -37,18 +37,27 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
   const [by, setBy] = useState<FreqBy>("word");
   const [liveFreq, setLiveFreq] = useState<FreqResultRow[] | null>(null);
   const [liveDist, setLiveDist] = useState<TermDistResult | null>(null);
+  const [freqLoading, setFreqLoading] = useState(false);
+  const [distLoading, setDistLoading] = useState(false);
 
   // Corpus-wide term frequencies on the active layer; refetch when the
-  // corpus or the word/POS toggle changes. Fixtures fall through below.
+  // corpus or the word/POS toggle changes. The backend command is async
+  // (off the UI thread), so the only thing freezing here is React state —
+  // the loading flag drives a spinner instead of a frozen table. Fixtures
+  // fall through below.
   useEffect(() => {
     setLiveFreq(null);
     if (!hasLiveData(corpus.id)) return;
     let cancelled = false;
+    setFreqLoading(true);
     runFrequencies({ corpusId: corpus.id, layer: by, limit: TOP_N })
       .then((r) => {
         if (!cancelled) setLiveFreq(r.rows);
       })
-      .catch((e) => console.error("runFrequencies failed:", e));
+      .catch((e) => console.error("runFrequencies failed:", e))
+      .finally(() => {
+        if (!cancelled) setFreqLoading(false);
+      });
     return () => {
       cancelled = true;
     };
@@ -59,16 +68,21 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
     setLiveDist(null);
     if (!hasLiveData(corpus.id) || !term.trim()) return;
     let cancelled = false;
+    setDistLoading(true);
     runTermDistribution({ corpusId: corpus.id, term: term.trim(), layer: by, buckets: BUCKETS })
       .then((r) => {
         if (!cancelled) setLiveDist(r);
       })
-      .catch((e) => console.error("runTermDistribution failed:", e));
+      .catch((e) => console.error("runTermDistribution failed:", e))
+      .finally(() => {
+        if (!cancelled) setDistLoading(false);
+      });
     return () => {
       cancelled = true;
     };
   }, [corpus.id, term, by]);
 
+  const isLive = hasLiveData(corpus.id);
   const fixtureDispersion = useMemo(() => makeDispersion(42), []);
 
   // --- Normalise live or fixture data into uniform render rows. ---
@@ -130,7 +144,12 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
             <div className="cx-card-meta">n = {corpus.tokenCount.toLocaleString()} tokens</div>
           </div>
           <div className="cx-card-body">
-            {freqRows.map((row) => {
+            {isLive && freqLoading ? (
+              <div className="cx-loading-row">
+                <span className="cx-spinner" /> computing frequencies…
+              </div>
+            ) : (
+            freqRows.map((row) => {
               const w = (row.count / maxCount) * 100;
               return (
                 <div key={row.primary} className="cx-freq-bar-row">
@@ -142,7 +161,8 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
                   <span className="pct">{row.pct.toFixed(2)}%</span>
                 </div>
               );
-            })}
+            })
+            )}
           </div>
         </div>
 
@@ -156,6 +176,12 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
             </div>
           </div>
           <div className="cx-card-body">
+            {isLive && distLoading ? (
+              <div className="cx-loading-row">
+                <span className="cx-spinner" /> computing dispersion…
+              </div>
+            ) : (
+            <>
             <div className="cx-disp">
               {dispMarks.map((pct, i) => (
                 <div key={i} className="cx-disp-mark" style={{ left: `${pct}%` }} />
@@ -187,6 +213,8 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
                 <span className="pct">{d.per1m.toFixed(1)}/M</span>
               </div>
             ))}
+            </>
+            )}
           </div>
         </div>
       </div>

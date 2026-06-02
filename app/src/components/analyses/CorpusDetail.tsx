@@ -29,16 +29,22 @@ function orDash(value: string | number | null) {
 export function CorpusDetail({ corpus, onDismiss }: CorpusDetailProps) {
   const wps = Math.round(corpus.tokenCount / (corpus.buildMs / 1000));
 
+  const isLive = hasLiveData(corpus.id);
   const [docs, setDocs] = useState<DocumentInfo[] | null>(null);
+  const [docsLoading, setDocsLoading] = useState(false);
   useEffect(() => {
     setDocs(null);
     if (!hasLiveData(corpus.id)) return;
     let cancelled = false;
+    setDocsLoading(true);
     listDocuments(corpus.id)
       .then((d) => {
         if (!cancelled) setDocs(d);
       })
-      .catch((e) => console.error("listDocuments failed:", e));
+      .catch((e) => console.error("listDocuments failed:", e))
+      .finally(() => {
+        if (!cancelled) setDocsLoading(false);
+      });
     return () => {
       cancelled = true;
     };
@@ -140,8 +146,15 @@ export function CorpusDetail({ corpus, onDismiss }: CorpusDetailProps) {
 
       <div className="cx-section-h">
         <span>documents</span>
-        <span className="sub">{docRows.length.toLocaleString()} files</span>
+        <span className="sub">
+          {isLive && docsLoading ? "loading…" : `${docRows.length.toLocaleString()} files`}
+        </span>
       </div>
+      {isLive && docsLoading ? (
+        <div className="cx-loading-row">
+          <span className="cx-spinner" /> loading documents…
+        </div>
+      ) : (
       <table className="cx-doc-table">
         <thead>
           <tr>
@@ -164,6 +177,7 @@ export function CorpusDetail({ corpus, onDismiss }: CorpusDetailProps) {
           ))}
         </tbody>
       </table>
+      )}
     </div>
   );
 }

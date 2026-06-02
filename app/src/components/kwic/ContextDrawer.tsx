@@ -21,7 +21,9 @@ export interface ContextDrawerProps {
 const EXPAND_CONTEXT = 45;
 
 export function ContextDrawer({ hit, corpus, onClose, onPrev, onNext }: ContextDrawerProps) {
+  const isLive = hasLiveData(corpus.id);
   const [live, setLive] = useState<ExpandedContext | null>(null);
+  const [loading, setLoading] = useState(false);
 
   // Pull a wider context window from the backend for real corpora. Fixture
   // corpora fall through to the `EXPANDED` demo map below.
@@ -29,6 +31,7 @@ export function ContextDrawer({ hit, corpus, onClose, onPrev, onNext }: ContextD
     setLive(null);
     if (!hasLiveData(corpus.id) || hit.hitPos == null) return;
     let cancelled = false;
+    setLoading(true);
     expandContext({
       corpusId: corpus.id,
       docId: Number(hit.docId),
@@ -40,6 +43,9 @@ export function ContextDrawer({ hit, corpus, onClose, onPrev, onNext }: ContextD
       })
       .catch((e) => {
         console.error("expandContext failed:", e);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
       });
     return () => {
       cancelled = true;
@@ -59,6 +65,25 @@ export function ContextDrawer({ hit, corpus, onClose, onPrev, onNext }: ContextD
         <span style={{ color: "var(--fg-muted)" }}>{live.before} </span>
         <span className="cx-drawer-hit">{live.hit}</span>
         <span style={{ color: "var(--fg-muted)" }}> {live.after}</span>
+      </DrawerShell>
+    );
+  }
+
+  // Live corpus, context not yet in — show a wheel rather than the
+  // fixture text (which would be a different document entirely).
+  if (isLive) {
+    return (
+      <DrawerShell
+        docTitle="loading…"
+        docMeta={loading ? "fetching context" : "no context available"}
+        pos={hit.hitPos ?? hit.pos}
+        onClose={onClose}
+        onPrev={onPrev}
+        onNext={onNext}
+      >
+        <div className="cx-loading-row">
+          <span className="cx-spinner" /> loading context…
+        </div>
       </DrawerShell>
     );
   }

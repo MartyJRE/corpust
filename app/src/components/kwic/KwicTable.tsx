@@ -50,7 +50,9 @@ export function KwicTable({
   if (loading && !result) {
     return (
       <div className="cx-results-empty">
-        <span>running query…</span>
+        <div className="cx-loading-row">
+          <span className="cx-spinner" /> running query…
+        </div>
       </div>
     );
   }
