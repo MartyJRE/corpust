@@ -8,10 +8,14 @@ A Rust corpus-linguistics toolkit — aiming for LancsBoxX-level functionality
 with modern performance. Cross-platform desktop app + library + CLI, built for
 billion-word corpora on commodity hardware.
 
-> **Status:** pre-alpha. CLI works end-to-end (ingest → annotate → KWIC).
-> Pure-Rust TreeTagger reimplementation reaches **99.80 % POS accuracy** on
-> the 10 KB Gutenberg sample (bit-identical with the reference tagger on
-> 722 / 722 contexts in the bigram tree). Tauri desktop app scaffolded.
+> **Status:** pre-alpha. CLI works end-to-end (ingest → annotate → KWIC),
+> and the Tauri desktop app now runs on real corpora: KWIC concordances,
+> collocations (log-Dice / MI / z-score, with network, scatter, and
+> by-distance views), frequency lists with dispersion, a word tree, the
+> document browser, and in-app corpus building. The pure-Rust TreeTagger
+> reimplementation reaches **99.80 % POS accuracy** on the 10 KB Gutenberg
+> sample (bit-identical with the reference tagger on 722 / 722 contexts in
+> the bigram tree).
 
 ## Quick start
 
@@ -111,8 +115,8 @@ linearly-extrapolated LancsBox run.
 | `corpust-io`       | Ingestion, paths, persisted corpus metadata.                           |
 | `corpust-annotate` | `Annotator` trait + TreeTagger subprocess adapter.                     |
 | `corpust-tagger`   | Pure-Rust TreeTagger reimplementation — `.par` parser + Viterbi.       |
-| `corpust-index`    | Tantivy-backed multi-layer positional index. The hot crate.            |
-| `corpust-query`    | Query layer over the index. KWIC + collocations.                       |
+| `corpust-index`    | Tantivy-backed multi-layer positional index — KWIC, collocation + association stats, frequencies, dispersion, distance profiles. The hot crate. |
+| `corpust-query`    | Thin query façade over the index (KWIC today; CQL planned here).       |
 | `corpust-cli`      | `corpust` binary — dev tool / power-user entry point.                  |
 | `app/src-tauri`    | `corpust-ui` — Tauri desktop app (React + Tailwind + shadcn/ui).       |
 
@@ -133,16 +137,24 @@ them to a GitHub release.
 
 ## Roadmap
 
-Open items live as GitHub issues. The two non-trivial ones:
+Open items live as GitHub issues. Highlights:
 
-- [#6](https://github.com/MartyJRE/corpust/issues/6) — UI polish pass for
-  non-collocation views (KWIC table, frequency view, command palette, …).
-- [#15](https://github.com/MartyJRE/corpust/issues/15) — merge case-insensitive
-  lex entries to close the last ~0.6 pp of UNSC POS accuracy. Requires
-  reverse-engineering tree-tagger's second lex table.
+- **More analysis viz:** keyness / corpus comparison
+  ([#37](https://github.com/MartyJRE/corpust/issues/37)), collocation diff
+  ([#38](https://github.com/MartyJRE/corpust/issues/38)), frequency-over-time
+  ([#34](https://github.com/MartyJRE/corpust/issues/34)), term × period heatmap
+  ([#35](https://github.com/MartyJRE/corpust/issues/35)), n-grams
+  ([#36](https://github.com/MartyJRE/corpust/issues/36)).
+- **Concordance & UI:** paging beyond the 200-line cap
+  ([#32](https://github.com/MartyJRE/corpust/issues/32)), POS colouring of
+  collocate nodes ([#31](https://github.com/MartyJRE/corpust/issues/31)),
+  real query filters ([#30](https://github.com/MartyJRE/corpust/issues/30)),
+  graph export ([#28](https://github.com/MartyJRE/corpust/issues/28)), and the
+  broader polish pass ([#6](https://github.com/MartyJRE/corpust/issues/6)).
 
-Further out: CQL parser + executor, keyness / dispersion stats, XML/TEI
-ingestion, Tauri IPC wiring for the build dialog → real backend commands.
+Further out: a CQL parser + executor, XML/TEI ingestion, and a corpust MCP
+server ([#27](https://github.com/MartyJRE/corpust/issues/27)) exposing queries
+to agents.
 
 ## License
 
