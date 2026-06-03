@@ -181,7 +181,16 @@ export function App() {
   // out-of-order responses so a stale answer can't clobber a fresh one.
   const collReqRef = useRef(0);
   const fetchCollocates = () => {
-    if (subview !== "coll" || !activeCorpus || !term.trim()) return;
+    if (subview !== "coll" || !activeCorpus) return;
+    // Empty query: clear stale collocates instead of leaving the last
+    // result on screen with a blank node.
+    if (!term.trim()) {
+      collReqRef.current++;
+      setCollocates(inTauri() && !CORPORA.some((c) => c.id === activeCorpus.id) ? [] : null);
+      setCollLoading(false);
+      setCollTruncated(false);
+      return;
+    }
     if (!inTauri() || CORPORA.some((c) => c.id === activeCorpus.id)) {
       setCollocates(null);
       setCollLoading(false);
