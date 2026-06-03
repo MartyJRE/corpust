@@ -1,4 +1,4 @@
-import { BarChart3, Grid3x3, ListTree, Network, Table2 } from "lucide-react";
+import { BarChart3, Grid3x3, LineChart, ListTree, Network, Table2 } from "lucide-react";
 import type { KwicResult, SubView } from "@/types";
 
 export interface ViewTabsProps {
@@ -19,6 +19,7 @@ export function ViewTabs({ view, onView, result }: ViewTabsProps) {
     { id: "freq", label: "frequency", Icon: BarChart3, count: null },
     { id: "tree", label: "word tree", Icon: ListTree, count: null },
     { id: "dist", label: "distance", Icon: Grid3x3, count: null },
+    { id: "time", label: "over time", Icon: LineChart, count: null },
   ];
   return (
     <div className="cx-viewtabs">

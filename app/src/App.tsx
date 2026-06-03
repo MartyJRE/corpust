@@ -15,6 +15,7 @@ import { HitDensityGutter } from "@/components/kwic/HitDensityGutter";
 import { ContextDrawer } from "@/components/kwic/ContextDrawer";
 import { CollocationsView } from "@/components/analyses/CollocationsView";
 import { CollocationDistance } from "@/components/analyses/CollocationDistance";
+import { FrequencyOverTime } from "@/components/analyses/FrequencyOverTime";
 import { WordTree } from "@/components/analyses/WordTree";
 import { FrequencyView } from "@/components/analyses/FrequencyView";
 import { CorpusDetail } from "@/components/analyses/CorpusDetail";
@@ -428,6 +429,9 @@ export function App() {
           )}
           {subview === "dist" && activeCorpus && (
             <CollocationDistance corpus={activeCorpus} term={term} layer={layer} />
+          )}
+          {subview === "time" && activeCorpus && (
+            <FrequencyOverTime corpus={activeCorpus} term={term} layer={layer} />
           )}
         </div>
       </>
