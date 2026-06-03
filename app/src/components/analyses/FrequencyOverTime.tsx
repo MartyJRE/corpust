@@ -141,7 +141,9 @@ export function FrequencyOverTime({ corpus, term, layer }: FrequencyOverTimeProp
             <div className="cx-dist-msg">
               {!term.trim()
                 ? "enter a search term to see its trend over time"
-                : `no dated occurrences of “${term}” to chart`}
+                : undated > 0
+                  ? `none of this corpus's ${undated.toLocaleString()} documents have a detected year — rebuild the corpus to extract publication dates`
+                  : `no dated occurrences of “${term}” to chart`}
             </div>
           ) : points && scale ? (
             <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet" style={{ width: "100%", height: "100%", display: "block" }}>
