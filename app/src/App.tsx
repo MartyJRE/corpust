@@ -37,6 +37,9 @@ import type {
   SubView,
 } from "@/types";
 
+/** Concordance lines fetched per page. */
+const KWIC_PAGE = 200;
+
 export function App() {
   const [corpora, setCorpora] = useState<CorpusMeta[]>(CORPORA);
   const [activeId, setActiveId] = useState<string | null>("gut-en");
@@ -117,58 +120,65 @@ export function App() {
   // A request-id guard drops superseded responses, so a real corpus can
   // never end up showing a previous (fixture) corpus's stale hits.
   const kwicReqRef = useRef(0);
-  const fetchKwic = useCallback((corpus: CorpusMeta | null, q: string, lyr: QueryLayer) => {
-    if (!corpus || !q.trim()) {
-      setResult(null);
-      setLoading(false);
-      return;
-    }
-    const myId = ++kwicReqRef.current;
-    setLoading(true);
-    // Fixture corpora (or non-Tauri preview) use the baked-in demo hits.
-    if (!inTauri() || isFixtureCorpus(corpus.id)) {
-      const hits = pickHits(corpus.id, q.trim(), lyr);
-      if (myId === kwicReqRef.current) {
-        setResult({ hits, elapsedMs: 0.2 + Math.random() * 1.6, truncated: hits.length >= 1000 });
-        setSelected(null);
+  const fetchKwic = useCallback(
+    (corpus: CorpusMeta | null, q: string, lyr: QueryLayer, offset: number) => {
+      if (!corpus || !q.trim()) {
+        setResult(null);
         setLoading(false);
+        return;
       }
-      return;
-    }
-    runKwicTauri({ corpusId: corpus.id, term: q.trim(), layer: lyr, context: 8, limit: 200 })
-      .then((r) => {
-        if (myId !== kwicReqRef.current) return;
-        const hits: KwicHit[] = r.hits.map((h, i) => ({
-          docId: String(h.docId),
-          pos: i,
-          hitPos: h.hitPosition,
-          left: h.left,
-          hit: h.hit,
-          right: h.right,
-        }));
-        setResult({ hits, elapsedMs: r.elapsedMs, truncated: r.truncated });
-        setSelected(null);
-      })
-      .catch((e) => {
-        if (myId !== kwicReqRef.current) return;
-        console.error("runKwic failed:", e);
-        setResult({ hits: [], elapsedMs: 0, truncated: false });
-        setSelected(null);
-      })
-      .finally(() => {
-        if (myId === kwicReqRef.current) setLoading(false);
-      });
-  }, []);
+      const myId = ++kwicReqRef.current;
+      setLoading(true);
+      // Fixture corpora (or non-Tauri preview) use the baked-in demo hits.
+      if (!inTauri() || isFixtureCorpus(corpus.id)) {
+        const hits = pickHits(corpus.id, q.trim(), lyr);
+        if (myId === kwicReqRef.current) {
+          setResult({ hits, elapsedMs: 0.2 + Math.random() * 1.6, truncated: false, total: hits.length, offset: 0 });
+          setSelected(null);
+          setLoading(false);
+        }
+        return;
+      }
+      runKwicTauri({ corpusId: corpus.id, term: q.trim(), layer: lyr, context: 8, limit: KWIC_PAGE, offset })
+        .then((r) => {
+          if (myId !== kwicReqRef.current) return;
+          const hits: KwicHit[] = r.hits.map((h, i) => ({
+            docId: String(h.docId),
+            pos: i,
+            hitPos: h.hitPosition,
+            left: h.left,
+            hit: h.hit,
+            right: h.right,
+          }));
+          setResult({ hits, elapsedMs: r.elapsedMs, truncated: r.truncated, total: r.total, offset: r.offset });
+          setSelected(null);
+        })
+        .catch((e) => {
+          if (myId !== kwicReqRef.current) return;
+          console.error("runKwic failed:", e);
+          setResult({ hits: [], elapsedMs: 0, truncated: false, total: 0, offset: 0 });
+          setSelected(null);
+        })
+        .finally(() => {
+          if (myId === kwicReqRef.current) setLoading(false);
+        });
+    },
+    [],
+  );
 
-  // Auto-fetch on corpus / term / layer change (debounced so typing
-  // coalesces). The guard inside drops stale responses.
+  // Auto-fetch on corpus / term / layer change — always resets to the
+  // first page (debounced so typing coalesces). The guard drops stale
+  // responses.
   useEffect(() => {
-    const t = window.setTimeout(() => fetchKwic(activeCorpus, term, layer), 100);
+    const t = window.setTimeout(() => fetchKwic(activeCorpus, term, layer, 0), 100);
     return () => window.clearTimeout(t);
   }, [activeCorpus, term, layer, fetchKwic]);
 
-  // Explicit Enter / "Run" — fetch immediately, no debounce.
-  const run = () => fetchKwic(activeCorpus, term, layer);
+  // Jump to a concordance page (offset in hits) — fetches immediately.
+  const goToPage = (offset: number) => fetchKwic(activeCorpus, term, layer, offset);
+
+  // Explicit Enter / "Run" — fetch the first page immediately.
+  const run = () => fetchKwic(activeCorpus, term, layer, 0);
 
   // Fetch real collocates when the Collocations view is active on a
   // real (backend-registered) corpus. Fixture corpora keep whatever
@@ -379,6 +389,8 @@ export function App() {
                 onSort={onSortChange}
                 selected={selected}
                 onSelect={setSelected}
+                pageSize={KWIC_PAGE}
+                onPage={goToPage}
               />
               <HitDensityGutter density={density} scrollPct={scrollPct} onJump={() => {}} />
               {selected && activeCorpus && (

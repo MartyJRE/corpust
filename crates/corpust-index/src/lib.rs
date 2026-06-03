@@ -121,6 +121,15 @@ pub struct KwicHit {
     pub right: String,
 }
 
+/// A page of concordance lines plus the total match count, so callers can
+/// paginate ("showing 1–200 of 12,431").
+#[derive(Debug, Clone)]
+pub struct KwicPage {
+    pub hits: Vec<KwicHit>,
+    /// Total occurrences of the term on the layer (the paging denominator).
+    pub total: usize,
+}
+
 /// One document's summary, for the corpus document list.
 #[derive(Debug, Clone)]
 pub struct DocumentInfo {
@@ -456,7 +465,8 @@ impl CorpusIndex {
         layer: QueryLayer,
         context: usize,
         limit: usize,
-    ) -> Result<Vec<KwicHit>> {
+        offset: usize,
+    ) -> Result<KwicPage> {
         let searcher = self.reader.searcher();
         let (query_field, lookup_term) = match layer {
             QueryLayer::Word => (self.fields.body, term.to_lowercase()),
@@ -465,13 +475,17 @@ impl CorpusIndex {
         };
         let term_obj = Term::from_field_text(query_field, &lookup_term);
 
-        let mut hits = Vec::with_capacity(limit);
+        // Hits are globally ordered by (segment, doc, position). We walk
+        // every posting to count the grand total (cheap — `term_freq` per
+        // doc, no positions needed) but only fetch the document + build
+        // windows for the docs whose hit range intersects the requested
+        // page `[offset, offset + limit)`.
+        let page_end = offset.saturating_add(limit);
+        let mut hits = Vec::with_capacity(limit.min(512));
+        let mut total: usize = 0;
         let mut positions_buf: Vec<u32> = Vec::new();
 
         'segments: for (seg_ord, seg_reader) in searcher.segment_readers().iter().enumerate() {
-            if hits.len() >= limit {
-                break;
-            }
             let inv_idx = seg_reader.inverted_index(query_field)?;
             let Some(mut postings) =
                 inv_idx.read_postings(&term_obj, IndexRecordOption::WithFreqsAndPositions)?
@@ -484,57 +498,62 @@ impl CorpusIndex {
                 if doc == TERMINATED {
                     continue 'segments;
                 }
-                if hits.len() >= limit {
-                    break 'segments;
-                }
+                let tf = postings.term_freq() as usize;
+                let doc_start = total;
+                total += tf;
 
-                let doc_addr = DocAddress::new(seg_ord as u32, doc);
-                let retrieved: TantivyDocument = searcher.doc(doc_addr)?;
-                let body = retrieved
-                    .get_first(self.fields.body)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let path = retrieved
-                    .get_first(self.fields.path)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let doc_id = retrieved
-                    .get_first(self.fields.doc_id)
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let offsets_bytes = retrieved
-                    .get_first(self.fields.token_offsets)
-                    .and_then(|v| v.as_bytes())
-                    .unwrap_or_default();
-                let offsets = bytes_to_offsets(offsets_bytes);
+                // Build hits only for docs overlapping the page window.
+                if doc_start < page_end && total > offset {
+                    let doc_addr = DocAddress::new(seg_ord as u32, doc);
+                    let retrieved: TantivyDocument = searcher.doc(doc_addr)?;
+                    let body = retrieved
+                        .get_first(self.fields.body)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let path = retrieved
+                        .get_first(self.fields.path)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let doc_id = retrieved
+                        .get_first(self.fields.doc_id)
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let offsets = bytes_to_offsets(
+                        retrieved
+                            .get_first(self.fields.token_offsets)
+                            .and_then(|v| v.as_bytes())
+                            .unwrap_or_default(),
+                    );
 
-                positions_buf.clear();
-                postings.positions(&mut positions_buf);
-
-                for &pos in &positions_buf {
-                    if hits.len() >= limit {
-                        break;
+                    positions_buf.clear();
+                    postings.positions(&mut positions_buf);
+                    for (k, &pos) in positions_buf.iter().enumerate() {
+                        let gi = doc_start + k; // global hit index
+                        if gi < offset {
+                            continue;
+                        }
+                        if gi >= page_end {
+                            break;
+                        }
+                        let p = pos as usize;
+                        if let Some((left, hit, right)) = window(body, &offsets, p, context) {
+                            hits.push(KwicHit {
+                                doc_id,
+                                path: PathBuf::from(path),
+                                hit_position: p,
+                                left,
+                                hit,
+                                right,
+                            });
+                        }
                     }
-                    let p = pos as usize;
-                    let Some((left, hit, right)) = window(body, &offsets, p, context) else {
-                        continue;
-                    };
-
-                    hits.push(KwicHit {
-                        doc_id,
-                        path: PathBuf::from(path),
-                        hit_position: p,
-                        left,
-                        hit,
-                        right,
-                    });
                 }
 
                 postings.advance();
             }
         }
 
-        Ok(hits)
+        Ok(KwicPage { hits, total })
     }
 
     /// Re-extract the concordance window around a known hit position in a
@@ -1568,7 +1587,7 @@ mod tests {
         )
         .unwrap();
 
-        let hits = idx.kwic("the", QueryLayer::Word, 2, 10).unwrap();
+        let hits = idx.kwic("the", QueryLayer::Word, 2, 10, 0).unwrap().hits;
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].hit, "the");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1588,7 +1607,7 @@ mod tests {
         )
         .unwrap();
 
-        let hits = idx.kwic("the", QueryLayer::Word, 1, 10).unwrap();
+        let hits = idx.kwic("the", QueryLayer::Word, 1, 10, 0).unwrap().hits;
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().any(|h| h.hit == "The"));
         assert!(hits.iter().any(|h| h.hit == "THE"));
@@ -1609,7 +1628,7 @@ mod tests {
         )
         .unwrap();
 
-        let hits = idx.kwic("target", QueryLayer::Word, 2, 10).unwrap();
+        let hits = idx.kwic("target", QueryLayer::Word, 2, 10, 0).unwrap().hits;
         assert_eq!(hits.len(), 1);
         let h = &hits[0];
         assert_eq!(h.left, "gamma delta");
@@ -1632,7 +1651,10 @@ mod tests {
         )
         .unwrap();
 
-        let hits = idx.kwic("target", QueryLayer::Word, 10, 10).unwrap();
+        let hits = idx
+            .kwic("target", QueryLayer::Word, 10, 10, 0)
+            .unwrap()
+            .hits;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].left, "");
         assert_eq!(hits[0].right, "one two three");
@@ -1655,7 +1677,7 @@ mod tests {
         )
         .unwrap();
 
-        let hits = idx.kwic("quick", QueryLayer::Word, 1, 10).unwrap();
+        let hits = idx.kwic("quick", QueryLayer::Word, 1, 10, 0).unwrap().hits;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].hit, "quick");
         assert_eq!(hits[0].left, "the");
@@ -1663,9 +1685,9 @@ mod tests {
 
         // WordOnly emits empty lemma / pos tokens — queries on those
         // layers find nothing.
-        let no_lemma = idx.kwic("quick", QueryLayer::Lemma, 1, 10).unwrap();
+        let no_lemma = idx.kwic("quick", QueryLayer::Lemma, 1, 10, 0).unwrap().hits;
         assert!(no_lemma.is_empty());
-        let no_pos = idx.kwic("NN", QueryLayer::Pos, 1, 10).unwrap();
+        let no_pos = idx.kwic("NN", QueryLayer::Pos, 1, 10, 0).unwrap().hits;
         assert!(no_pos.is_empty());
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1812,7 +1834,7 @@ mod tests {
     fn context_at_reexpands_window() {
         let (tmp, idx) = two_doc_index();
         // Locate a hit first, then re-expand it wider.
-        let hits = idx.kwic("sat", QueryLayer::Word, 1, 10).unwrap();
+        let hits = idx.kwic("sat", QueryLayer::Word, 1, 10, 0).unwrap().hits;
         assert_eq!(hits.len(), 1);
         let h = &hits[0];
         assert_eq!(h.left, "cat");

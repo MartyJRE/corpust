@@ -50,6 +50,8 @@ export interface KwicResultRaw {
   hits: KwicHitRaw[];
   elapsedMs: number;
   truncated: boolean;
+  total: number;
+  offset: number;
 }
 
 export interface DocumentInfo {

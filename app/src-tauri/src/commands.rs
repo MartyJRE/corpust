@@ -277,16 +277,20 @@ fn run_kwic_inner(state: &State<'_, AppState>, req: &KwicRequest) -> Result<Kwic
     let kreq = CoreKwicRequest::new(&req.term)
         .layer(req.layer.into())
         .context(context)
-        .limit(limit);
+        .limit(limit)
+        .offset(req.offset);
 
     let t0 = Instant::now();
-    let hits = with_corpus(state, &req.corpus_id, |index| {
+    let page = with_corpus(state, &req.corpus_id, |index| {
         run_core_kwic(index, kreq).map_err(|e| format!("kwic failed: {e:#}"))
     })?;
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let truncated = hits.len() == limit;
+    let total = page.total;
+    // "truncated" now just means there are more pages after this one.
+    let truncated = req.offset + page.hits.len() < total;
     Ok(KwicResult {
-        hits: hits
+        hits: page
+            .hits
             .into_iter()
             .map(|h| KwicHitDto {
                 doc_id: h.doc_id,
@@ -299,6 +303,8 @@ fn run_kwic_inner(state: &State<'_, AppState>, req: &KwicRequest) -> Result<Kwic
             .collect(),
         elapsed_ms,
         truncated,
+        total: total as u64,
+        offset: req.offset as u64,
     })
 }
 

@@ -14,7 +14,7 @@ export function ViewTabs({ view, onView, result }: ViewTabsProps) {
     Icon: typeof Table2;
     count: number | null;
   }[] = [
-    { id: "kwic", label: "concordance", Icon: Table2, count: result ? result.hits.length : null },
+    { id: "kwic", label: "concordance", Icon: Table2, count: result ? result.total : null },
     { id: "coll", label: "collocations", Icon: Network, count: null },
     { id: "freq", label: "frequency", Icon: BarChart3, count: null },
     { id: "tree", label: "word tree", Icon: ListTree, count: null },
