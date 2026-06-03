@@ -6,7 +6,7 @@
 //! callers' import paths.
 
 use anyhow::Result;
-use corpust_index::{CorpusIndex, DEFAULT_CONTEXT, DEFAULT_LIMIT, KwicHit, QueryLayer};
+use corpust_index::{CorpusIndex, DEFAULT_CONTEXT, DEFAULT_LIMIT, KwicPage, QueryLayer};
 
 pub use corpust_index::QueryLayer as Layer;
 
@@ -17,6 +17,8 @@ pub struct KwicRequest<'a> {
     pub layer: QueryLayer,
     pub context: usize,
     pub limit: usize,
+    /// Hits to skip before the page — for concordance pagination.
+    pub offset: usize,
 }
 
 impl<'a> KwicRequest<'a> {
@@ -26,6 +28,7 @@ impl<'a> KwicRequest<'a> {
             layer: QueryLayer::Word,
             context: DEFAULT_CONTEXT,
             limit: DEFAULT_LIMIT,
+            offset: 0,
         }
     }
 
@@ -43,10 +46,21 @@ impl<'a> KwicRequest<'a> {
         self.limit = limit;
         self
     }
+
+    pub fn offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
+    }
 }
 
-pub fn kwic(index: &CorpusIndex, request: KwicRequest<'_>) -> Result<Vec<KwicHit>> {
-    index.kwic(request.term, request.layer, request.context, request.limit)
+pub fn kwic(index: &CorpusIndex, request: KwicRequest<'_>) -> Result<KwicPage> {
+    index.kwic(
+        request.term,
+        request.layer,
+        request.context,
+        request.limit,
+        request.offset,
+    )
 }
 
 #[cfg(test)]
@@ -93,8 +107,22 @@ mod tests {
     #[test]
     fn kwic_facade_returns_index_hits() {
         let (_tmp, idx) = tiny_index();
-        let hits = kwic(&idx, KwicRequest::new("the").context(2).limit(10)).unwrap();
-        assert_eq!(hits.len(), 2);
-        assert!(hits.iter().all(|h| h.hit == "the"));
+        let page = kwic(&idx, KwicRequest::new("the").context(2).limit(10)).unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.hits.len(), 2);
+        assert!(page.hits.iter().all(|h| h.hit == "the"));
+    }
+
+    #[test]
+    fn kwic_facade_paginates() {
+        let (_tmp, idx) = tiny_index();
+        // "the" occurs twice; page size 1 yields one hit per page, total 2.
+        let p0 = kwic(&idx, KwicRequest::new("the").context(2).limit(1).offset(0)).unwrap();
+        assert_eq!(p0.total, 2);
+        assert_eq!(p0.hits.len(), 1);
+        let p1 = kwic(&idx, KwicRequest::new("the").context(2).limit(1).offset(1)).unwrap();
+        assert_eq!(p1.total, 2);
+        assert_eq!(p1.hits.len(), 1);
+        assert_ne!(p0.hits[0].hit_position, p1.hits[0].hit_position);
     }
 }

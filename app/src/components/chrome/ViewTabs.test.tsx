@@ -10,6 +10,8 @@ const result: KwicResult = {
   ],
   elapsedMs: 0,
   truncated: false,
+  total: 2,
+  offset: 0,
 };
 
 describe("ViewTabs", () => {

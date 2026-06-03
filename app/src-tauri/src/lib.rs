@@ -95,6 +95,9 @@ pub struct KwicRequest {
     pub layer: QueryLayer,
     pub context: usize,
     pub limit: usize,
+    /// Hits to skip before this page (concordance pagination).
+    #[serde(default)]
+    pub offset: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -116,6 +119,10 @@ pub struct KwicResult {
     pub hits: Vec<KwicHit>,
     pub elapsed_ms: f64,
     pub truncated: bool,
+    /// Total matches across the whole corpus (paging denominator).
+    pub total: u64,
+    /// Index of the first hit in this page (0-based), for "N–M of total".
+    pub offset: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

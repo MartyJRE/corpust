@@ -42,22 +42,11 @@ export function StatusBar({ corpus, result, layer, memory = 0.42 }: StatusBarPro
         {result && (
           <>
             <span className="cx-sep">·</span>
-            <span>{result.hits.length.toLocaleString()} hits</span>
+            <span>{result.total.toLocaleString()} hits</span>
             <span className="cx-sep">·</span>
             <span className={`cx-layer-chip cx-layer-${layer}`}>{layer}</span>
             <span className="cx-sep">·</span>
             <span className="cx-status-time">{formatDuration(result.elapsedMs)}</span>
-            {result.truncated && (
-              <>
-                <span className="cx-sep">·</span>
-                <span
-                  className="cx-status-dim"
-                  title={`More matches exist than the ${result.hits.length.toLocaleString()}-line display cap; showing the first ${result.hits.length.toLocaleString()}. Frequency and collocation stats still use the whole corpus.`}
-                >
-                  first {result.hits.length.toLocaleString()} shown
-                </span>
-              </>
-            )}
           </>
         )}
       </div>

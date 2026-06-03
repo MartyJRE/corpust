@@ -409,13 +409,14 @@ fn run_kwic(
         .with_context(|| format!("opening index at {}", index_path.display()))?;
 
     let t0 = Instant::now();
-    let hits = kwic(
+    let page = kwic(
         &index,
         KwicRequest::new(term)
             .layer(layer)
             .context(context)
             .limit(limit),
     )?;
+    let hits = &page.hits;
     let elapsed = t0.elapsed();
 
     let left_width = hits
@@ -429,7 +430,7 @@ fn run_kwic(
         .max()
         .unwrap_or(0);
 
-    for hit in &hits {
+    for hit in hits {
         let file = hit.path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
         println!(
             "{file:20} | {left:>lw$}  \x1b[1m{hit:^hw$}\x1b[0m  {right}",
@@ -441,6 +442,11 @@ fn run_kwic(
             hw = hit_width,
         );
     }
-    println!("\n{} hit(s) in {:.2?}", hits.len(), elapsed);
+    println!(
+        "\nshowing {} of {} hit(s) in {:.2?}",
+        hits.len(),
+        page.total,
+        elapsed
+    );
     Ok(())
 }

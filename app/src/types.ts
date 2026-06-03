@@ -30,6 +30,8 @@ export interface KwicRequest {
   layer: QueryLayer;
   context: number;
   limit: number;
+  /** Hits to skip before this page (concordance pagination). */
+  offset?: number;
 }
 
 export interface KwicHit {
@@ -50,6 +52,10 @@ export interface KwicResult {
   hits: KwicHit[];
   elapsedMs: number;
   truncated: boolean;
+  /** Total matches across the corpus (paging denominator). */
+  total: number;
+  /** 0-based index of the first hit in this page. */
+  offset: number;
 }
 
 export interface ExpandedHit {

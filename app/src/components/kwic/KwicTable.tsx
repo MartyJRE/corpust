@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowUp, Download } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronLeft, ChevronRight, Download } from "lucide-react";
 import { useMemo } from "react";
 import type { KwicHit, KwicResult, QueryLayer, SortDir, SortMode } from "@/types";
 import { formatDuration } from "@/lib/utils";
@@ -15,6 +15,10 @@ export interface KwicTableProps {
   onSort: (mode: SortMode) => void;
   selected: KwicHit | null;
   onSelect: (h: KwicHit) => void;
+  /** Hits per page. */
+  pageSize: number;
+  /** Jump to a page (offset in hits). */
+  onPage: (offset: number) => void;
 }
 
 function sortHits(hits: KwicHit[], mode: SortMode, dir: SortDir): KwicHit[] {
@@ -41,6 +45,8 @@ export function KwicTable({
   onSort,
   selected,
   onSelect,
+  pageSize,
+  onPage,
 }: KwicTableProps) {
   const sortedHits = useMemo(
     () => (result ? sortHits(result.hits, sortMode, sortDir) : []),
@@ -103,7 +109,28 @@ export function KwicTable({
           );
         })}
         <span className="sep">·</span>
-        <span>{result.hits.length.toLocaleString()} hits</span>
+        <span>
+          {(result.total === 0 ? 0 : result.offset + 1).toLocaleString()}–
+          {(result.offset + result.hits.length).toLocaleString()} of {result.total.toLocaleString()}
+        </span>
+        <button
+          type="button"
+          className="cx-sort-btn"
+          disabled={result.offset === 0}
+          onClick={() => onPage(Math.max(0, result.offset - pageSize))}
+          title="previous page"
+        >
+          <ChevronLeft size={12} />
+        </button>
+        <button
+          type="button"
+          className="cx-sort-btn"
+          disabled={result.offset + result.hits.length >= result.total}
+          onClick={() => onPage(result.offset + pageSize)}
+          title="next page"
+        >
+          <ChevronRight size={12} />
+        </button>
         <span className="sep">·</span>
         <span className="cx-status-time">{formatDuration(result.elapsedMs)}</span>
         <span className="cx-spacer" />
