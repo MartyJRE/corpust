@@ -191,9 +191,13 @@ fn run_collocates_inner(
             // candidate pool rather than every distinct collocate type
             // (which can be tens of thousands for a frequent node).
             let pool = (limit * 8).max(200);
+            // Exclude the node from its own collocate list (it co-occurs
+            // with itself within the window, e.g. "the Jew … the Jew").
+            let node_word = req.term.trim().to_lowercase();
             let mut cand: Vec<(String, u32, u32)> = scan
                 .counts
                 .iter()
+                .filter(|(w, _)| **w != node_word)
                 .map(|(w, &(l, r))| (w.clone(), l, r))
                 .collect();
             cand.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)).then_with(|| a.0.cmp(&b.0)));
@@ -469,9 +473,11 @@ fn run_collocate_distance_inner(
         let prof = index
             .collocate_by_distance(&req.term, layer, lw, rw, MAX_NODE_OCCURRENCES)
             .map_err(|e| format!("distance scan failed: {e:#}"))?;
+        let node_word = req.term.trim().to_lowercase();
         let rows: Vec<DistanceRow> = prof
             .rows
             .into_iter()
+            .filter(|(word, _)| *word != node_word) // exclude the node itself
             .map(|(word, counts)| {
                 let total = counts.iter().sum();
                 DistanceRow {

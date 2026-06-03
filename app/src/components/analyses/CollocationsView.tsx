@@ -348,9 +348,11 @@ export function CollocationsView({
                 padding: 24,
               }}
             >
-              {layer === "pos"
-                ? `no matches for “${term}” on the POS layer — search a tag (NN, VB, JJ…)`
-                : `no collocates for “${term}” on this layer`}
+              {!term.trim()
+                ? "enter a search term to see its collocates"
+                : layer === "pos"
+                  ? `no matches for “${term}” on the POS layer — search a tag (NN, VB, JJ…)`
+                  : `no collocates for “${term}” on this layer`}
             </div>
           ) : vizMode === "network" ? (
             <NetworkChart {...chartProps} />
