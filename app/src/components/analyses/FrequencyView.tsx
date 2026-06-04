@@ -8,11 +8,13 @@ import {
   runTermDistribution,
 } from "@/lib/tauri";
 import { basename } from "@/lib/utils";
-import type { CorpusMeta, FreqBy } from "@/types";
+import type { CorpusMeta, DocFilter, FreqBy } from "@/types";
 
 export interface FrequencyViewProps {
   corpus: CorpusMeta;
   term: string;
+  /** Active metadata filter (already normalized); scopes both tables. */
+  filter?: DocFilter;
 }
 
 /** How many bars to show in the top-terms list, and how many buckets to
@@ -49,7 +51,7 @@ interface DocFreqRow {
   per1m: number;
 }
 
-export function FrequencyView({ corpus, term }: FrequencyViewProps) {
+export function FrequencyView({ corpus, term, filter }: FrequencyViewProps) {
   const [by, setBy] = useState<FreqBy>("word");
   const [liveFreq, setLiveFreq] = useState<FreqResultRow[] | null>(null);
   const [liveDist, setLiveDist] = useState<TermDistResult | null>(null);
@@ -63,7 +65,7 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
     setLiveFreq(null);
     if (!hasLiveData(corpus.id)) return;
     let cancelled = false;
-    runFrequencies({ corpusId: corpus.id, layer: by, limit: TOP_N })
+    runFrequencies({ corpusId: corpus.id, layer: by, limit: TOP_N, filter })
       .then((r) => {
         if (!cancelled) setLiveFreq(r.rows);
       })
@@ -74,14 +76,14 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
     return () => {
       cancelled = true;
     };
-  }, [corpus.id, by]);
+  }, [corpus.id, by, filter]);
 
   // Per-document hit counts + dispersion for the queried term.
   useEffect(() => {
     setLiveDist(null);
     if (!hasLiveData(corpus.id) || !term.trim()) return;
     let cancelled = false;
-    runTermDistribution({ corpusId: corpus.id, term: term.trim(), layer: by, buckets: BUCKETS })
+    runTermDistribution({ corpusId: corpus.id, term: term.trim(), layer: by, buckets: BUCKETS, filter })
       .then((r) => {
         if (!cancelled) setLiveDist(r);
       })
@@ -92,7 +94,7 @@ export function FrequencyView({ corpus, term }: FrequencyViewProps) {
     return () => {
       cancelled = true;
     };
-  }, [corpus.id, term, by]);
+  }, [corpus.id, term, by, filter]);
 
   const isLive = hasLiveData(corpus.id);
   // For a live corpus, show the spinner until the *real* data arrives —

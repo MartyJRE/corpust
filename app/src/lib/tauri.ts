@@ -8,6 +8,7 @@ import type {
   BuildRequest,
   Collocate,
   CorpusMeta,
+  DocFilter,
   KwicRequest,
   QueryLayer,
 } from "@/types";
@@ -21,6 +22,7 @@ export interface CollocatesRequest {
   /** Tokens to consider on the right of the node. 0 = skip right. */
   rightWindow: number;
   limit: number;
+  filter?: DocFilter;
 }
 
 export interface CollocatesResult {
@@ -68,6 +70,7 @@ export interface FrequenciesRequest {
   corpusId: string;
   layer: QueryLayer;
   limit: number;
+  filter?: DocFilter;
 }
 
 export interface FreqResultRow {
@@ -87,6 +90,7 @@ export interface TermDistRequest {
   term: string;
   layer: QueryLayer;
   buckets: number;
+  filter?: DocFilter;
 }
 
 export interface DocTermCount {
@@ -111,6 +115,7 @@ export interface CollocateDistanceRequest {
   leftWindow: number;
   rightWindow: number;
   limit: number;
+  filter?: DocFilter;
 }
 
 export interface DistanceRow {

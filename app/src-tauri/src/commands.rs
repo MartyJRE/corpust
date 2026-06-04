@@ -8,9 +8,10 @@
 use crate::{
     AppState, BuildRequest, Collocate as CollocateDto, CollocateDistanceRequest,
     CollocateDistanceResult, CollocatesRequest, CollocatesResult, CorpusMeta, CorpusMetaEnvelope,
-    DistanceRow, DocTermCount as DocTermCountDto, DocumentInfo as DocumentInfoDto, ExpandRequest,
-    ExpandedContext, FreqRow, FrequenciesRequest, FrequenciesResult, KwicHit as KwicHitDto,
-    KwicRequest, KwicResult, OpenedCorpus, TaggerKind, TermDistRequest, TermDistResult,
+    DistanceRow, DocFilterDto, DocTermCount as DocTermCountDto, DocumentInfo as DocumentInfoDto,
+    ExpandRequest, ExpandedContext, FreqRow, FrequenciesRequest, FrequenciesResult,
+    KwicHit as KwicHitDto, KwicRequest, KwicResult, OpenedCorpus, TaggerKind, TermDistRequest,
+    TermDistResult,
 };
 use corpust_annotate::{Annotator, treetagger::TreeTagger};
 use corpust_index::{CorpusIndex, DEFAULT_CONTEXT, QueryLayer};
@@ -172,19 +173,20 @@ fn run_collocates_inner(
     let layer: QueryLayer = req.layer.into();
     let limit = req.limit.clamp(1, 200);
     let span = (lw + rw) as u64;
+    let filter = DocFilterDto::resolve(req.filter.clone());
     let t0 = Instant::now();
 
     let (collocates, node_freq, window_tokens, truncated) =
         with_corpus(state, &req.corpus_id, |index| {
             let scan = index
-                .collocate_counts(&req.term, layer, lw, rw, MAX_NODE_OCCURRENCES)
+                .collocate_counts_filtered(&req.term, layer, lw, rw, MAX_NODE_OCCURRENCES, Some(&filter))
                 .map_err(|e| format!("collocate scan failed: {e:#}"))?;
 
             // Corpus size and collocate marginals are taken on the
             // surface (word) layer — collocates are surface forms read
             // from `body`, regardless of which layer the node matched on.
             let n = index
-                .layer_total_tokens(corpust_index::QueryLayer::Word)
+                .layer_total_tokens_filtered(corpust_index::QueryLayer::Word, Some(&filter))
                 .map_err(|e| format!("corpus size lookup failed: {e:#}"))?;
 
             // Bound the marginal lookups: score a generous top-by-raw-count
@@ -205,7 +207,7 @@ fn run_collocates_inner(
 
             let words: Vec<String> = cand.iter().map(|(w, _, _)| w.clone()).collect();
             let f_coll = index
-                .term_totals(&words, corpust_index::QueryLayer::Word)
+                .term_totals_filtered(&words, corpust_index::QueryLayer::Word, Some(&filter))
                 .map_err(|e| format!("collocate frequency lookup failed: {e:#}"))?;
 
             let mut collocates: Vec<CollocateDto> = cand
@@ -278,7 +280,8 @@ fn run_kwic_inner(state: &State<'_, AppState>, req: &KwicRequest) -> Result<Kwic
         .layer(req.layer.into())
         .context(context)
         .limit(limit)
-        .offset(req.offset);
+        .offset(req.offset)
+        .filter(DocFilterDto::resolve(req.filter.clone()));
 
     let t0 = Instant::now();
     let page = with_corpus(state, &req.corpus_id, |index| {
@@ -372,17 +375,27 @@ fn run_frequencies_inner(
 ) -> Result<FrequenciesResult, String> {
     let limit = req.limit.clamp(1, 1000);
     let layer: QueryLayer = req.layer.into();
+    let filter = DocFilterDto::resolve(req.filter.clone());
     let t0 = Instant::now();
-    // Prefer the precomputed sidecar written at build time; fall back to
-    // a live term-dictionary scan for corpora built before it existed
-    // (or if the request asks for more rows than were precomputed).
-    let (rows, total_tokens) = match load_precomputed_frequencies(&req.corpus_id, layer, limit) {
-        Some(table) => table,
-        None => with_corpus(state, &req.corpus_id, |index| {
+    // With no filter, prefer the precomputed sidecar written at build time
+    // (falling back to a live term-dictionary scan for older corpora or
+    // deeper requests). A filter scopes the counts to a subcorpus, so the
+    // corpus-wide sidecar can't apply — scan live, restricted to matches.
+    let (rows, total_tokens) = if filter.is_empty() {
+        match load_precomputed_frequencies(&req.corpus_id, layer, limit) {
+            Some(table) => table,
+            None => with_corpus(state, &req.corpus_id, |index| {
+                index
+                    .frequencies(layer, limit)
+                    .map_err(|e| format!("frequencies failed: {e:#}"))
+            })?,
+        }
+    } else {
+        with_corpus(state, &req.corpus_id, |index| {
             index
-                .frequencies(layer, limit)
+                .frequencies_filtered(layer, limit, Some(&filter))
                 .map_err(|e| format!("frequencies failed: {e:#}"))
-        })?,
+        })?
     };
     let denom = total_tokens.max(1) as f64;
     let rows = rows
@@ -423,10 +436,11 @@ fn run_term_distribution_inner(
     req: &TermDistRequest,
 ) -> Result<TermDistResult, String> {
     let buckets = req.buckets.clamp(1, 1000);
+    let filter = DocFilterDto::resolve(req.filter.clone());
     let t0 = Instant::now();
     let dist = with_corpus(state, &req.corpus_id, |index| {
         index
-            .term_distribution(&req.term, req.layer.into(), buckets)
+            .term_distribution_filtered(&req.term, req.layer.into(), buckets, Some(&filter))
             .map_err(|e| format!("term distribution failed: {e:#}"))
     })?;
     Ok(TermDistResult {
@@ -473,11 +487,12 @@ fn run_collocate_distance_inner(
     }
     let layer: QueryLayer = req.layer.into();
     let limit = req.limit.clamp(1, 60);
+    let filter = DocFilterDto::resolve(req.filter.clone());
     let t0 = Instant::now();
 
     let (offsets, mut rows, node_freq, truncated) = with_corpus(state, &req.corpus_id, |index| {
         let prof = index
-            .collocate_by_distance(&req.term, layer, lw, rw, MAX_NODE_OCCURRENCES)
+            .collocate_by_distance_filtered(&req.term, layer, lw, rw, MAX_NODE_OCCURRENCES, Some(&filter))
             .map_err(|e| format!("distance scan failed: {e:#}"))?;
         let node_word = req.term.trim().to_lowercase();
         let rows: Vec<DistanceRow> = prof

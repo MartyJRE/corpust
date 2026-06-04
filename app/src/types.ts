@@ -24,6 +24,18 @@ export interface CorpusMeta {
 
 export type QueryLayer = "word" | "lemma" | "pos";
 
+/** Document-metadata filter applied to every query so KWIC / collocations
+ *  / frequency / dispersion all see the same subcorpus. Every dimension is
+ *  optional; an all-empty filter (or `undefined`) matches the whole corpus.
+ *  Author / path are case-insensitive substring matches; the year range is
+ *  inclusive and excludes documents with no detected year. */
+export interface DocFilter {
+  yearMin?: number;
+  yearMax?: number;
+  author?: string;
+  path?: string;
+}
+
 export interface KwicRequest {
   corpusId: string;
   term: string;
@@ -32,6 +44,7 @@ export interface KwicRequest {
   limit: number;
   /** Hits to skip before this page (concordance pagination). */
   offset?: number;
+  filter?: DocFilter;
 }
 
 export interface KwicHit {

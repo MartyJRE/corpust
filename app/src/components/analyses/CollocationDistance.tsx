@@ -10,18 +10,20 @@ import {
   hasLiveData,
   runCollocateDistance,
 } from "@/lib/tauri";
-import type { CorpusMeta, QueryLayer } from "@/types";
+import type { CorpusMeta, DocFilter, QueryLayer } from "@/types";
 
 export interface CollocationDistanceProps {
   corpus: CorpusMeta;
   term: string;
   layer: QueryLayer;
+  /** Active metadata filter (already normalized); scopes the scan. */
+  filter?: DocFilter;
 }
 
 const WINDOW = 5;
 const LIMIT = 25;
 
-export function CollocationDistance({ corpus, term, layer }: CollocationDistanceProps) {
+export function CollocationDistance({ corpus, term, layer, filter }: CollocationDistanceProps) {
   const isLive = hasLiveData(corpus.id);
   const [offsets, setOffsets] = useState<number[] | null>(null);
   const [rows, setRows] = useState<DistanceRow[] | null>(null);
@@ -40,6 +42,7 @@ export function CollocationDistance({ corpus, term, layer }: CollocationDistance
       leftWindow: WINDOW,
       rightWindow: WINDOW,
       limit: LIMIT,
+      filter,
     })
       .then((r) => {
         if (cancelled) return;
@@ -59,7 +62,7 @@ export function CollocationDistance({ corpus, term, layer }: CollocationDistance
     return () => {
       cancelled = true;
     };
-  }, [corpus.id, term, layer, isLive]);
+  }, [corpus.id, term, layer, isLive, filter]);
 
   const maxCount = useMemo(
     () => Math.max(1, ...(rows ?? []).flatMap((r) => r.counts)),

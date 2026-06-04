@@ -6,9 +6,9 @@
 //! callers' import paths.
 
 use anyhow::Result;
-use corpust_index::{CorpusIndex, DEFAULT_CONTEXT, DEFAULT_LIMIT, KwicPage, QueryLayer};
+use corpust_index::{CorpusIndex, DEFAULT_CONTEXT, DEFAULT_LIMIT, DocFilter, KwicPage, QueryLayer};
 
-pub use corpust_index::QueryLayer as Layer;
+pub use corpust_index::{DocFilter as Filter, QueryLayer as Layer};
 
 /// Parameters for a KWIC query.
 #[derive(Debug, Clone)]
@@ -19,6 +19,9 @@ pub struct KwicRequest<'a> {
     pub limit: usize,
     /// Hits to skip before the page — for concordance pagination.
     pub offset: usize,
+    /// Document-metadata filter; an empty filter (the default) matches
+    /// the whole corpus.
+    pub filter: DocFilter,
 }
 
 impl<'a> KwicRequest<'a> {
@@ -29,11 +32,17 @@ impl<'a> KwicRequest<'a> {
             context: DEFAULT_CONTEXT,
             limit: DEFAULT_LIMIT,
             offset: 0,
+            filter: DocFilter::default(),
         }
     }
 
     pub fn layer(mut self, layer: QueryLayer) -> Self {
         self.layer = layer;
+        self
+    }
+
+    pub fn filter(mut self, filter: DocFilter) -> Self {
+        self.filter = filter;
         self
     }
 
@@ -54,12 +63,14 @@ impl<'a> KwicRequest<'a> {
 }
 
 pub fn kwic(index: &CorpusIndex, request: KwicRequest<'_>) -> Result<KwicPage> {
-    index.kwic(
+    let filter = (!request.filter.is_empty()).then_some(&request.filter);
+    index.kwic_filtered(
         request.term,
         request.layer,
         request.context,
         request.limit,
         request.offset,
+        filter,
     )
 }
 

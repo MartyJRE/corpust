@@ -368,6 +368,39 @@
 .cx-filter-chip .x { color: var(--fg-subtle); display: inline-flex; }
 .cx-filter-chip .x:hover { color: var(--danger); }
 
+/* Metadata-filter popover (opened from the + filter chip) */
+.cx-filter-wrap { position: relative; display: inline-flex; }
+.cx-filter-backdrop { position: fixed; inset: 0; z-index: 19; }
+.cx-filter-pop {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 20;
+  width: 260px; padding: 12px;
+  background: var(--bg-raised); border: 1px solid var(--border-strong);
+  border-radius: 8px; box-shadow: var(--shadow-lg);
+  display: flex; flex-direction: column; gap: 10px;
+  animation: cx-slide-in var(--dur-2) var(--ease);
+}
+.cx-filter-pop-title {
+  font-family: var(--font-mono); font-size: 10px; color: var(--fg-subtle);
+  text-transform: uppercase; letter-spacing: 0.05em;
+}
+.cx-filter-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.cx-filter-row > span:first-child {
+  font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); width: 48px;
+}
+.cx-filter-range { display: inline-flex; align-items: center; gap: 6px; }
+.cx-filter-dash { color: var(--fg-subtle); }
+.cx-filter-input {
+  height: 28px; width: 64px; padding: 0 8px;
+  background: var(--bg-inset); border: 1px solid var(--border); border-radius: 4px;
+  color: var(--fg); font-family: var(--font-mono); font-size: 12px; outline: none;
+  transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease);
+}
+.cx-filter-input.wide { width: 150px; }
+.cx-filter-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in oklch, var(--accent) 40%, transparent); }
+.cx-filter-input::placeholder { color: var(--fg-subtle); }
+.cx-filter-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
+.cx-filter-actions .cx-btn { height: 28px; padding: 0 12px; font-size: 12px; }
+
 /* Buttons */
 .cx-btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
