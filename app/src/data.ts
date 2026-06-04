@@ -1,6 +1,7 @@
-// Placeholder fixtures — will be replaced with Tauri IPC calls once the
-// backend commands in app/src-tauri/src/commands.rs are fleshed out.
-// Shape mirrors types.ts exactly.
+// Demo fixtures: the fallback dataset shown when no real corpus is loaded
+// (the vite-only preview, or the baked-in demo corpora). Real corpora are
+// served from the backend over Tauri IPC (see lib/tauri.ts). Shape mirrors
+// types.ts exactly.
 
 import type {
   Collocate,

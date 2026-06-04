@@ -1,10 +1,8 @@
 //! Tauri backend for the corpust desktop app.
 //!
 //! Thin command layer over `corpust-query` + `corpust-index`. The React
-//! frontend calls these via `@tauri-apps/api::invoke`. Everything below
-//! is intentionally stub-heavy right now — the visual shape of the UI
-//! comes first; command bodies get fleshed out once the layout is
-//! locked in.
+//! frontend calls these via `@tauri-apps/api::invoke`; the command
+//! bodies live in `commands.rs` and drive the real index / query crates.
 
 use corpust_index::CorpusIndex;
 use serde::{Deserialize, Serialize};
@@ -56,6 +54,7 @@ pub fn run() {
             commands::run_term_distribution,
             commands::run_collocate_distance,
             commands::expand_context,
+            commands::write_text_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running corpust");

@@ -1,7 +1,6 @@
-// Thin typed wrapper over Tauri's `invoke`. Today these are stubs — real
-// implementations land once the commands in app/src-tauri/src/commands.rs
-// are fleshed out. UI code reaches through these fns so swapping fixture
-// data for real IPC is a single-file change.
+// Thin typed wrapper over Tauri's `invoke`. Each fn calls a real command
+// implemented in app/src-tauri/src/commands.rs. UI code reaches through
+// these so the fixture-vs-IPC decision (see hasLiveData) stays in one place.
 
 import { CORPORA } from "@/data";
 import type {
@@ -188,6 +187,12 @@ export async function runTermDistribution(req: TermDistRequest): Promise<TermDis
 
 export async function expandContext(req: ExpandRequest): Promise<ExpandedContext> {
   return invokeSafe<ExpandedContext>("expand_context", { req });
+}
+
+/** Write a UTF-8 string to an absolute path on disk. Backs the export
+ *  actions once the save dialog has chosen a destination. */
+export async function writeTextFile(path: string, contents: string): Promise<void> {
+  return invokeSafe<void>("write_text_file", { path, contents });
 }
 
 /** True when running inside the Tauri shell. Frontend can fall back to

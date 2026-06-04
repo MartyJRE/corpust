@@ -1,6 +1,8 @@
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { Download, Eye, Search } from "lucide-react";
 import { useEffect, useState } from "react";
 import { DOCUMENTS } from "@/data";
+import { documentsCsv, saveText, slug } from "@/lib/export";
 import { type DocumentInfo, hasLiveData, listDocuments } from "@/lib/tauri";
 import type { CorpusMeta } from "@/types";
 import { basename, formatBuildTime, formatBytes, formatDate } from "@/lib/utils";
@@ -68,6 +70,18 @@ export function CorpusDetail({ corpus, onDismiss }: CorpusDetailProps) {
         year: d.year ?? null,
         tokens: d.tokens,
       }));
+
+  // Reveal the built index folder in the OS file manager. Only meaningful
+  // for real corpora — fixtures carry a placeholder `~/corpora/…` path.
+  const onReveal = () => {
+    if (!isLive) return;
+    void revealItemInDir(corpus.indexPath).catch((e) => console.error("reveal failed:", e));
+  };
+  // Export the document table as CSV (works for fixtures and live alike).
+  const onExportDocs = () => {
+    void saveText(`${slug(corpus.name)}-documents.csv`, documentsCsv(docRows), "text/csv");
+  };
+
   return (
     <div className="cx-detail">
       <div className="cx-detail-head">
@@ -77,11 +91,17 @@ export function CorpusDetail({ corpus, onDismiss }: CorpusDetailProps) {
           <div className="cx-detail-sub">{corpus.indexPath}</div>
         </div>
         <div className="cx-detail-actions">
-          <button type="button" className="cx-btn cx-btn-outline">
+          <button
+            type="button"
+            className="cx-btn cx-btn-outline"
+            onClick={onReveal}
+            disabled={!isLive}
+            title={isLive ? "Reveal the index folder" : "Available once the corpus is built"}
+          >
             <Eye size={13} />
             reveal
           </button>
-          <button type="button" className="cx-btn cx-btn-outline">
+          <button type="button" className="cx-btn cx-btn-outline" onClick={onExportDocs} title="Export the document list as CSV">
             <Download size={13} />
             export
           </button>
