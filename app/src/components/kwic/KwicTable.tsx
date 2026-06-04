@@ -139,12 +139,16 @@ export function KwicTable({
         </button>
       </div>
       <table className="cx-kwic">
+        {/* idx / doc / position are a fixed left gutter; the two unsized
+            cols (left + right context) split the remaining width evenly so
+            the node column stays centred between them. Kept lean so narrow
+            windows still leave room for context on both sides. */}
         <colgroup>
-          <col style={{ width: 38 }} />
-          <col style={{ width: 180 }} />
-          <col style={{ width: 60 }} />
+          <col style={{ width: 36 }} />
+          <col style={{ width: 128 }} />
+          <col style={{ width: 52 }} />
           <col />
-          <col style={{ width: 140 }} />
+          <col style={{ width: 132 }} />
           <col />
         </colgroup>
         <tbody>
