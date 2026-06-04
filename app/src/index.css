@@ -316,16 +316,9 @@
 /* The layer toggle doesn't apply to a CQL query (it sets layers per token). */
 .cx-layer-toggle.is-muted { opacity: 0.4; }
 
-/* Inline query (CQL parse) error, shown under the query bar. */
-.cx-query-error {
-  display: flex; align-items: center; gap: 8px;
-  padding: 7px 14px;
-  background: color-mix(in oklch, var(--danger) 14%, var(--bg-raised));
-  border-bottom: 1px solid color-mix(in oklch, var(--danger) 40%, transparent);
-  color: var(--fg);
-  font-family: var(--font-mono); font-size: 12px;
-}
-.cx-query-error .label { color: var(--danger); font-weight: 600; }
+/* Query errors are shown inline in the editor (squiggle + hover); the
+   suffix just flags the state at a glance, full message on hover. */
+.cx-suffix-error { color: var(--danger); font-weight: 600; cursor: help; }
 .cx-layer {
   border: 0; background: transparent;
   font-family: var(--font-mono); font-size: 12px; color: var(--fg-muted);

@@ -15,8 +15,8 @@ import {
 } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { bracketMatching } from "@codemirror/language";
-import { linter } from "@codemirror/lint";
-import { Compartment, EditorState, RangeSetBuilder } from "@codemirror/state";
+import { forceLinting, linter } from "@codemirror/lint";
+import { Compartment, EditorState, RangeSetBuilder, StateEffect, StateField } from "@codemirror/state";
 import {
   Decoration,
   type DecorationSet,
@@ -42,7 +42,22 @@ export interface CqlInputProps {
   disabled?: boolean;
   placeholder?: string;
   className?: string;
+  /** A backend error for the current query (e.g. an exec failure the
+   *  client validator can't catch). Shown inline as a whole-query
+   *  diagnostic — no separate banner. */
+  error?: string | null;
 }
+
+// Carries the backend error into the editor so it shows as an inline
+// diagnostic alongside client-side parse errors.
+const setExternalError = StateEffect.define<string | null>();
+const externalErrorField = StateField.define<string | null>({
+  create: () => null,
+  update(value, tr) {
+    for (const e of tr.effects) if (e.is(setExternalError)) return e.value;
+    return value;
+  },
+});
 
 /** Decoration plugin: re-mark CQL tokens on every doc change. */
 const cqlHighlight = ViewPlugin.fromClass(
@@ -67,9 +82,18 @@ function buildDecorations(view: EditorView): DecorationSet {
 }
 
 const cqlLinter = linter((view) => {
-  const d = validateCql(view.state.doc.toString());
-  if (!d) return [];
-  return [{ from: d.from, to: Math.max(d.to, d.from + 1), severity: "error" as const, message: d.message }];
+  const text = view.state.doc.toString();
+  // Precise client-side parse error wins (specific span); otherwise fall
+  // back to a backend error spanning the whole query.
+  const d = validateCql(text);
+  if (d) {
+    return [{ from: d.from, to: Math.max(d.to, d.from + 1), severity: "error" as const, message: d.message }];
+  }
+  const ext = view.state.field(externalErrorField, false);
+  if (ext) {
+    return [{ from: 0, to: Math.max(text.length, 1), severity: "error" as const, message: ext }];
+  }
+  return [];
 });
 
 function cqlCompletion(ctx: CompletionContext): CompletionResult | null {
@@ -137,7 +161,7 @@ const theme = EditorView.theme({
   },
 }, { dark: true }); // tell CodeMirror this is a dark theme → dark popups/selection
 
-export function CqlInput({ value, onChange, onRun, disabled, placeholder, className }: CqlInputProps) {
+export function CqlInput({ value, onChange, onRun, disabled, placeholder, className, error }: CqlInputProps) {
   const host = useRef<HTMLDivElement | null>(null);
   const view = useRef<EditorView | null>(null);
   // Latest callbacks, so the once-built keymap/listener always call current props.
@@ -167,6 +191,7 @@ export function CqlInput({ value, onChange, onRun, disabled, placeholder, classN
         bracketMatching(),
         autocompletion({ override: [cqlCompletion] }),
         cqlHighlight,
+        externalErrorField,
         cqlLinter,
         singleLine,
         theme,
@@ -213,6 +238,15 @@ export function CqlInput({ value, onChange, onRun, disabled, placeholder, classN
       ]),
     });
   }, [disabled]);
+
+  // Push the backend error into the editor and re-lint so it surfaces
+  // inline (squiggle + hover) instead of in a separate banner.
+  useEffect(() => {
+    const v = view.current;
+    if (!v) return;
+    v.dispatch({ effects: setExternalError.of(error ?? null) });
+    forceLinting(v);
+  }, [error]);
 
   return <div ref={host} className={className} />;
 }
