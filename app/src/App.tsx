@@ -24,6 +24,7 @@ import { CommandPalette, type CommandDef } from "@/components/overlays/CommandPa
 import { BuildDialog } from "@/components/overlays/BuildDialog";
 import { CORPORA, RECENT_QUERIES, pickHits } from "@/data";
 import { isCql } from "@/lib/cql";
+import { validateCql } from "@/lib/cqlLang";
 import { concordanceCsv, concordanceJson, saveText, slug } from "@/lib/export";
 import { normalizeFilter } from "@/lib/filter";
 import { makeDensity } from "@/lib/utils";
@@ -138,6 +139,15 @@ export function App() {
     (corpus: CorpusMeta | null, q: string, lyr: QueryLayer, offset: number) => {
       if (!corpus || !q.trim()) {
         setResult(null);
+        setQueryError(null);
+        setLoading(false);
+        return;
+      }
+      // A client-invalid CQL query is already flagged inline by the editor;
+      // don't round-trip it to the backend (typing autocloses quotes, which
+      // momentarily makes `[pos=""]` and would surface a transient "empty
+      // value" error). Keep the last results on screen until it parses.
+      if (isCql(q) && validateCql(q)) {
         setQueryError(null);
         setLoading(false);
         return;
@@ -450,13 +460,8 @@ export function App() {
           filter={filter}
           onFilterChange={setFilter}
           filterable={!!activeCorpus && hasLiveData(activeCorpus.id)}
+          error={queryError}
         />
-        {queryError && (
-          <div className="cx-query-error">
-            <span className="label">query error</span>
-            <span>{queryError}</span>
-          </div>
-        )}
         <ViewTabs view={subview} onView={setSubview} result={result} />
         <div className="cx-results-wrap">
           {subview === "kwic" && (

@@ -1,6 +1,7 @@
 import { Plus, Search, X } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
 import { isCql } from "@/lib/cql";
+import { validateCql } from "@/lib/cqlLang";
 import { clearDimension, filterChips, normalizeFilter } from "@/lib/filter";
 import type { DocFilter, QueryLayer } from "@/types";
 import { CqlInput } from "./CqlInput";
@@ -26,6 +27,8 @@ export interface QueryBarProps {
   /** Whether the active corpus supports filtering (real, backend-backed).
    *  Fixtures / preview have no queryable metadata, so the control hides. */
   filterable: boolean;
+  /** Backend error for the current query, surfaced inline in the editor. */
+  error?: string | null;
 }
 
 export function QueryBar({
@@ -40,6 +43,7 @@ export function QueryBar({
   filter,
   onFilterChange,
   filterable,
+  error,
 }: QueryBarProps) {
   const submit = (e: FormEvent) => {
     e.preventDefault();
@@ -50,6 +54,11 @@ export function QueryBar({
   // A CQL query spans layers itself, so the word/lemma/pos toggle no longer
   // applies — dim it and flag the input as CQL.
   const cql = isCql(term);
+  // Error state for the suffix marker: a client-side parse error (precise)
+  // or a backend error. The full message shows on hover + as an inline
+  // squiggle in the editor.
+  const parseErr = cql && term.trim() ? validateCql(term) : null;
+  const errMsg = parseErr?.message ?? error ?? null;
 
   return (
     <form onSubmit={submit} className="cx-querybar">
@@ -86,6 +95,7 @@ export function QueryBar({
             if (term.trim()) onRun();
           }}
           disabled={disabled}
+          error={error}
           placeholder={
             layer === "pos"
               ? 'POS tag, or [pos="NN"]…'
@@ -95,7 +105,14 @@ export function QueryBar({
           }
         />
         <div className="cx-input-suffix">
-          {term && <span>{cql ? "CQL" : layer === "pos" ? "exact" : "regex ok"}</span>}
+          {term &&
+            (errMsg ? (
+              <span className="cx-suffix-error" title={errMsg}>
+                error
+              </span>
+            ) : (
+              <span>{cql ? "CQL" : layer === "pos" ? "exact" : "regex ok"}</span>
+            ))}
         </div>
       </div>
 

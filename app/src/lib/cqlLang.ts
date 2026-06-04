@@ -17,6 +17,44 @@ export const POS_TAGS = [
   "PRP", "PRP$", "WP", "WDT", "MD", "TO", "UH", "FW",
 ] as const;
 
+/** A completion candidate with JetBrains-style detail + doc. */
+export interface CqlCompletion {
+  label: string;
+  /** Short type shown right-aligned (e.g. "layer", "POS"). */
+  detail: string;
+  /** Longer description shown in the side panel. */
+  info: string;
+}
+
+/** Attribute completions (with aliases), richest first. */
+export const ATTR_COMPLETIONS: CqlCompletion[] = [
+  { label: "word", detail: "layer", info: "Surface form of the token (case-insensitive)." },
+  { label: "lemma", detail: "layer", info: "Dictionary form. Requires an annotated corpus." },
+  { label: "pos", detail: "layer", info: "Part-of-speech tag, e.g. NN, VBD (case-sensitive)." },
+  { label: "hw", detail: "alias → lemma", info: "Headword — alias for lemma." },
+  { label: "tag", detail: "alias → pos", info: "Alias for pos." },
+];
+
+/** Penn-Treebank tag → human label, for POS value completion + docs. */
+export const POS_LABELS: Record<string, string> = {
+  NN: "noun, singular", NNS: "noun, plural", NNP: "proper noun, singular",
+  NNPS: "proper noun, plural", VB: "verb, base form", VBD: "verb, past tense",
+  VBG: "verb, gerund/present participle", VBN: "verb, past participle",
+  VBP: "verb, non-3rd person singular present", VBZ: "verb, 3rd person singular present",
+  JJ: "adjective", JJR: "adjective, comparative", JJS: "adjective, superlative",
+  RB: "adverb", RBR: "adverb, comparative", RBS: "adverb, superlative",
+  DT: "determiner", IN: "preposition / subordinating conjunction",
+  CC: "coordinating conjunction", CD: "cardinal number", PRP: "personal pronoun",
+  "PRP$": "possessive pronoun", WP: "wh-pronoun", WDT: "wh-determiner",
+  MD: "modal", TO: "to", UH: "interjection", FW: "foreign word",
+};
+
+export const POS_COMPLETIONS: CqlCompletion[] = POS_TAGS.map((t) => ({
+  label: t,
+  detail: "POS",
+  info: POS_LABELS[t] ?? "part-of-speech tag",
+}));
+
 export type TokenKind = "bracket" | "attr" | "operator" | "string" | "regex" | "invalid";
 
 export interface CqlToken {
