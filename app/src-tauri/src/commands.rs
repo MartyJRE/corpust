@@ -25,6 +25,19 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 const PROGRESS_EVENT: &str = "build:progress";
 
+/// Parse `term` as CQL when it looks like a CQL query, else `None` (a bare
+/// term keeps the classic single-layer path). A parse error becomes a
+/// user-facing command error.
+fn parse_cql_opt(term: &str) -> Result<Option<corpust_index::CqlQuery>, String> {
+    if corpust_query::is_cql(term) {
+        corpust_query::parse_cql(term)
+            .map(Some)
+            .map_err(|e| format!("query error: {e:#}"))
+    } else {
+        Ok(None)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BuildProgress {
@@ -174,20 +187,26 @@ fn run_collocates_inner(
     let limit = req.limit.clamp(1, 200);
     let span = (lw + rw) as u64;
     let filter = DocFilterDto::resolve(req.filter.clone());
+    let cql = parse_cql_opt(&req.term)?;
     let t0 = Instant::now();
 
     let (collocates, node_freq, window_tokens, truncated) =
         with_corpus(state, &req.corpus_id, |index| {
-            let scan = index
-                .collocate_counts_filtered(
-                    &req.term,
-                    layer,
-                    lw,
-                    rw,
-                    MAX_NODE_OCCURRENCES,
-                    Some(&filter),
-                )
-                .map_err(|e| format!("collocate scan failed: {e:#}"))?;
+            let scan = match &cql {
+                Some(q) => index
+                    .cql_collocate_counts(q, lw, rw, Some(&filter))
+                    .map_err(|e| format!("collocate scan failed: {e:#}"))?,
+                None => index
+                    .collocate_counts_filtered(
+                        &req.term,
+                        layer,
+                        lw,
+                        rw,
+                        MAX_NODE_OCCURRENCES,
+                        Some(&filter),
+                    )
+                    .map_err(|e| format!("collocate scan failed: {e:#}"))?,
+            };
 
             // Corpus size and collocate marginals are taken on the
             // surface (word) layer — collocates are surface forms read
@@ -200,9 +219,13 @@ fn run_collocates_inner(
             // candidate pool rather than every distinct collocate type
             // (which can be tens of thousands for a frequent node).
             let pool = (limit * 8).max(200);
-            // Exclude the node from its own collocate list (it co-occurs
-            // with itself within the window, e.g. "the Jew … the Jew").
-            let node_word = req.term.trim().to_lowercase();
+            // Exclude the node from its own collocate list (bare-term only;
+            // a CQL span has no single node word to exclude).
+            let node_word = if cql.is_some() {
+                String::new()
+            } else {
+                req.term.trim().to_lowercase()
+            };
             let mut cand: Vec<(String, u32, u32)> = scan
                 .counts
                 .iter()
@@ -444,11 +467,19 @@ fn run_term_distribution_inner(
 ) -> Result<TermDistResult, String> {
     let buckets = req.buckets.clamp(1, 1000);
     let filter = DocFilterDto::resolve(req.filter.clone());
+    let cql = parse_cql_opt(&req.term)?;
     let t0 = Instant::now();
     let dist = with_corpus(state, &req.corpus_id, |index| {
-        index
-            .term_distribution_filtered(&req.term, req.layer.into(), buckets, Some(&filter))
-            .map_err(|e| format!("term distribution failed: {e:#}"))
+        match &cql {
+            Some(q) => index.cql_term_distribution(q, buckets, Some(&filter)),
+            None => index.term_distribution_filtered(
+                &req.term,
+                req.layer.into(),
+                buckets,
+                Some(&filter),
+            ),
+        }
+        .map_err(|e| format!("term distribution failed: {e:#}"))
     })?;
     Ok(TermDistResult {
         doc_counts: dist
@@ -495,20 +526,30 @@ fn run_collocate_distance_inner(
     let layer: QueryLayer = req.layer.into();
     let limit = req.limit.clamp(1, 60);
     let filter = DocFilterDto::resolve(req.filter.clone());
+    let cql = parse_cql_opt(&req.term)?;
     let t0 = Instant::now();
 
     let (offsets, mut rows, node_freq, truncated) = with_corpus(state, &req.corpus_id, |index| {
-        let prof = index
-            .collocate_by_distance_filtered(
-                &req.term,
-                layer,
-                lw,
-                rw,
-                MAX_NODE_OCCURRENCES,
-                Some(&filter),
-            )
-            .map_err(|e| format!("distance scan failed: {e:#}"))?;
-        let node_word = req.term.trim().to_lowercase();
+        let prof = match &cql {
+            Some(q) => index
+                .cql_collocate_by_distance(q, lw, rw, Some(&filter))
+                .map_err(|e| format!("distance scan failed: {e:#}"))?,
+            None => index
+                .collocate_by_distance_filtered(
+                    &req.term,
+                    layer,
+                    lw,
+                    rw,
+                    MAX_NODE_OCCURRENCES,
+                    Some(&filter),
+                )
+                .map_err(|e| format!("distance scan failed: {e:#}"))?,
+        };
+        let node_word = if cql.is_some() {
+            String::new()
+        } else {
+            req.term.trim().to_lowercase()
+        };
         let rows: Vec<DistanceRow> = prof
             .rows
             .into_iter()

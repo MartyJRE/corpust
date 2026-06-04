@@ -1,5 +1,6 @@
 import { Plus, Search, X } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
+import { isCql } from "@/lib/cql";
 import { clearDimension, filterChips, normalizeFilter } from "@/lib/filter";
 import type { DocFilter, QueryLayer } from "@/types";
 
@@ -45,10 +46,16 @@ export function QueryBar({
   };
 
   const chips = filterChips(filter);
+  // A CQL query spans layers itself, so the word/lemma/pos toggle no longer
+  // applies — dim it and flag the input as CQL.
+  const cql = isCql(term);
 
   return (
     <form onSubmit={submit} className="cx-querybar">
-      <div className="cx-layer-toggle" title="Linguistic query layer">
+      <div
+        className={`cx-layer-toggle ${cql ? "is-muted" : ""}`}
+        title={cql ? "Layer is ignored for CQL queries (the query sets it per token)" : "Linguistic query layer"}
+      >
         {LAYERS.map((l) => {
           const locked = l.value !== "word" && !annotated;
           return (
@@ -84,7 +91,9 @@ export function QueryBar({
           disabled={disabled}
           spellCheck={false}
         />
-        <div className="cx-input-suffix">{term && <span>{layer === "pos" ? "exact" : "regex ok"}</span>}</div>
+        <div className="cx-input-suffix">
+          {term && <span>{cql ? "CQL" : layer === "pos" ? "exact" : "regex ok"}</span>}
+        </div>
       </div>
 
       {filterable && (

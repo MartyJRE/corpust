@@ -23,6 +23,7 @@ import { Onboarding } from "@/components/analyses/Onboarding";
 import { CommandPalette, type CommandDef } from "@/components/overlays/CommandPalette";
 import { BuildDialog } from "@/components/overlays/BuildDialog";
 import { CORPORA, RECENT_QUERIES, pickHits } from "@/data";
+import { isCql } from "@/lib/cql";
 import { concordanceCsv, concordanceJson, saveText, slug } from "@/lib/export";
 import { normalizeFilter } from "@/lib/filter";
 import { makeDensity } from "@/lib/utils";
@@ -78,6 +79,8 @@ export function App() {
   // is set) that travels to the backend.
   const [filter, setFilter] = useState<DocFilter>({});
   const queryFilter = useMemo(() => normalizeFilter(filter), [filter]);
+  // A malformed CQL query's parse error, shown under the query bar.
+  const [queryError, setQueryError] = useState<string | null>(null);
   // Concordance scroll position (0–1), tracked from the KWIC column so the
   // hit-density gutter's thumb reflects where you actually are, and clicks
   // on the gutter scroll there.
@@ -135,6 +138,7 @@ export function App() {
     (corpus: CorpusMeta | null, q: string, lyr: QueryLayer, offset: number) => {
       if (!corpus || !q.trim()) {
         setResult(null);
+        setQueryError(null);
         setLoading(false);
         return;
       }
@@ -146,6 +150,7 @@ export function App() {
         if (myId === kwicReqRef.current) {
           setResult({ hits, elapsedMs: 0.2 + Math.random() * 1.6, truncated: false, total: hits.length, offset: 0 });
           setSelected(null);
+          setQueryError(null);
           setLoading(false);
         }
         return;
@@ -163,12 +168,16 @@ export function App() {
           }));
           setResult({ hits, elapsedMs: r.elapsedMs, truncated: r.truncated, total: r.total, offset: r.offset });
           setSelected(null);
+          setQueryError(null);
         })
         .catch((e) => {
           if (myId !== kwicReqRef.current) return;
           console.error("runKwic failed:", e);
           setResult({ hits: [], elapsedMs: 0, truncated: false, total: 0, offset: 0 });
           setSelected(null);
+          // Surface a malformed-CQL error in place of an empty table.
+          const msg = String(e).replace(/^.*?query error:\s*/i, "");
+          setQueryError(isCql(q) ? msg : null);
         })
         .finally(() => {
           if (myId === kwicReqRef.current) setLoading(false);
@@ -433,6 +442,12 @@ export function App() {
           onFilterChange={setFilter}
           filterable={!!activeCorpus && hasLiveData(activeCorpus.id)}
         />
+        {queryError && (
+          <div className="cx-query-error">
+            <span className="label">query error</span>
+            <span>{queryError}</span>
+          </div>
+        )}
         <ViewTabs view={subview} onView={setSubview} result={result} />
         <div className="cx-results-wrap">
           {subview === "kwic" && (
