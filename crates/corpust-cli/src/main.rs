@@ -22,9 +22,9 @@ enum TaggerArg {
     /// parity) but slow.
     Subprocess,
     /// Pure-Rust in-process tagger (`corpust-tagger::Tagger`).
-    /// ~200× faster per call, currently at ~92% POS accuracy
-    /// because dtree Viterbi hasn't landed. Use for indexing where
-    /// throughput matters more than exact parity.
+    /// ~200× faster per call at ~99% POS accuracy (98.8–99.8% across the
+    /// Gutenberg / UNSC samples). Use for indexing where throughput
+    /// matters more than exact reference parity.
     Rust,
 }
 

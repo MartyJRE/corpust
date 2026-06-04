@@ -304,7 +304,7 @@ export function BuildDialog({ open, onClose, onBuilt }: BuildDialogProps) {
                   disabled={phase !== "idle"}
                 />
                 <span>
-                  pure-Rust<span className="sub"> · in-process, ~92% POS</span>
+                  pure-Rust<span className="sub"> · in-process, ~99% POS</span>
                 </span>
               </label>
               <label className="cx-checkbox">

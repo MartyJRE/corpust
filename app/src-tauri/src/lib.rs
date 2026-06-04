@@ -192,7 +192,8 @@ pub struct BuildRequest {
 #[serde(rename_all = "lowercase")]
 pub enum TaggerKind {
     /// Pure-Rust in-process TreeTagger port. Fast (~2.5× end-to-end
-    /// speedup over subprocess) but currently ~92% POS accuracy.
+    /// speedup over subprocess) at ~99% POS accuracy (98.8–99.8% across
+    /// the Gutenberg / UNSC samples).
     #[default]
     Rust,
     /// Bundled `tree-tagger` binary; one subprocess per document.
