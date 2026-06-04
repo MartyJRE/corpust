@@ -369,6 +369,106 @@
   text-decoration: underline wavy color-mix(in oklch, var(--danger) 80%, transparent);
   text-underline-offset: 3px;
 }
+/* Matched/!matched brackets — subtle accent, not the default grey block. */
+.cm-matchingBracket {
+  background: color-mix(in oklch, var(--accent) 20%, transparent);
+  color: var(--fg) !important;
+  outline: none;
+}
+.cm-nonmatchingBracket { color: var(--danger) !important; background: none; }
+
+/* CodeMirror popups (completion + lint) rendered in a portal — a polished,
+   IDE-style dark popup instead of CodeMirror's default light tooltip. */
+.cm-tooltip {
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow-lg);
+  color: var(--fg);
+  overflow: hidden;
+}
+.cm-tooltip.cm-tooltip-autocomplete {
+  margin-top: 4px;
+}
+.cm-tooltip.cm-tooltip-autocomplete > ul {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  max-height: 16em;
+  min-width: 230px;
+  padding: 4px;
+}
+.cm-tooltip.cm-tooltip-autocomplete > ul > li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 5px;
+  color: var(--fg);
+}
+.cm-tooltip-autocomplete > ul > li[aria-selected] {
+  background: color-mix(in oklch, var(--accent) 22%, transparent);
+  color: var(--fg);
+}
+/* Kind glyph — a small rounded badge, coloured by completion type. */
+.cm-completionIcon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 4px;
+  opacity: 1;
+  padding: 0;
+}
+.cm-completionIcon::after { content: "•"; }
+.cm-completionIcon-property {
+  color: var(--layer-lemma);
+  background: color-mix(in oklch, var(--layer-lemma) 18%, transparent);
+}
+.cm-completionIcon-property::after { content: "A"; }
+.cm-completionIcon-enum {
+  color: var(--layer-pos);
+  background: color-mix(in oklch, var(--layer-pos) 18%, transparent);
+}
+.cm-completionIcon-enum::after { content: "#"; }
+.cm-completionLabel { color: inherit; flex: 1; }
+.cm-completionMatchedText {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 700;
+}
+.cm-completionDetail {
+  margin-left: auto;
+  padding-left: 12px;
+  font-style: normal;
+  font-size: 11px;
+  color: var(--fg-subtle);
+}
+/* Doc side-panel for the focused completion. */
+.cm-tooltip.cm-completionInfo {
+  margin: -1px 0 0 8px;
+  padding: 10px 12px;
+  max-width: 280px;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--fg-muted);
+  border-radius: 8px;
+}
+/* Lint hover tooltip. */
+.cm-tooltip.cm-tooltip-lint { padding: 0; }
+.cm-diagnostic {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 7px 11px;
+  white-space: normal;
+  max-width: 320px;
+}
+.cm-diagnostic-error { border-left: 3px solid var(--danger); }
 .cx-input::placeholder { color: var(--fg-subtle); }
 .cx-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in oklch, var(--accent) 40%, transparent); }
 .cx-input-icon {

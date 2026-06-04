@@ -27,7 +27,13 @@ import {
   placeholder as cmPlaceholder,
 } from "@codemirror/view";
 import { useEffect, useRef } from "react";
-import { ATTRS, POS_TAGS, completionAt, tokenizeCql, validateCql } from "@/lib/cqlLang";
+import {
+  ATTR_COMPLETIONS,
+  POS_COMPLETIONS,
+  completionAt,
+  tokenizeCql,
+  validateCql,
+} from "@/lib/cqlLang";
 
 export interface CqlInputProps {
   value: string;
@@ -71,14 +77,24 @@ function cqlCompletion(ctx: CompletionContext): CompletionResult | null {
   if (spot.kind === "attr") {
     return {
       from: spot.from,
-      options: ATTRS.map((label) => ({ label, type: "property" })),
+      options: ATTR_COMPLETIONS.map((c) => ({
+        label: c.label,
+        detail: c.detail,
+        info: c.info,
+        type: "property",
+      })),
       validFor: /^[A-Za-z]*$/,
     };
   }
   if (spot.kind === "posValue") {
     return {
       from: spot.from,
-      options: POS_TAGS.map((label) => ({ label, type: "constant" })),
+      options: POS_COMPLETIONS.map((c) => ({
+        label: c.label,
+        detail: c.detail,
+        info: c.info,
+        type: "enum",
+      })),
       validFor: /^[A-Za-z$]*$/,
     };
   }
@@ -115,7 +131,11 @@ const theme = EditorView.theme({
   ".cm-content": { padding: "0 12px 0 32px", caretColor: "var(--fg)" },
   ".cm-line": { padding: "0" },
   ".cm-placeholder": { color: "var(--fg-subtle)" },
-});
+  // Selection in the editor itself (not the popup).
+  "&.cm-focused .cm-selectionBackground, ::selection": {
+    background: "color-mix(in oklch, var(--accent) 30%, transparent)",
+  },
+}, { dark: true }); // tell CodeMirror this is a dark theme → dark popups/selection
 
 export function CqlInput({ value, onChange, onRun, disabled, placeholder, className }: CqlInputProps) {
   const host = useRef<HTMLDivElement | null>(null);
