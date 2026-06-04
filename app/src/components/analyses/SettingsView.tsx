@@ -1,10 +1,16 @@
 import { useState } from "react";
+import { THEMES, applyTheme, loadTheme } from "@/lib/theme";
 
 export function SettingsView() {
   const [ann, setAnn] = useState(true);
   const [annotator, setAnnotator] = useState("treetagger");
-  const [theme, setTheme] = useState("dark");
+  const [theme, setTheme] = useState(loadTheme);
   const [ligs, setLigs] = useState(false);
+
+  const onTheme = (id: string) => {
+    setTheme(id);
+    applyTheme(id);
+  };
 
   return (
     <div className="cx-settings">
@@ -14,13 +20,24 @@ export function SettingsView() {
       <div className="cx-setting-group">
         <div className="cx-setting-label">
           theme
-          <span className="desc">dark is tuned for long reading sessions.</span>
+          <span className="desc">applies app-wide — UI, query editor, and all.</span>
         </div>
         <div className="cx-setting-control">
-          <select className="cx-select" value={theme} onChange={(e) => setTheme(e.target.value)}>
-            <option value="dark">dark</option>
-            <option value="light">light</option>
-            <option value="system">follow system</option>
+          <select className="cx-select" value={theme} onChange={(e) => onTheme(e.target.value)}>
+            <optgroup label="Dark">
+              {THEMES.filter((t) => t.dark).map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                </option>
+              ))}
+            </optgroup>
+            <optgroup label="Light">
+              {THEMES.filter((t) => !t.dark).map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                </option>
+              ))}
+            </optgroup>
           </select>
         </div>
       </div>

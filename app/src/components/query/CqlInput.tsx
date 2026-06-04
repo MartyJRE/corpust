@@ -34,6 +34,7 @@ import {
   tokenizeCql,
   validateCql,
 } from "@/lib/cqlLang";
+import { THEME_EVENT, currentThemeId, isThemeDark } from "@/lib/theme";
 
 export interface CqlInputProps {
   value: string;
@@ -129,8 +130,10 @@ function cqlCompletion(ctx: CompletionContext): CompletionResult | null {
  *  newline (e.g. paste of multi-line text collapses to nothing extra). */
 const singleLine = EditorState.transactionFilter.of((tr) => (tr.newDoc.lines > 1 ? [] : tr));
 
-/** Editor chrome matched to `.cx-input` (34px, inset bg, accent focus). */
-const theme = EditorView.theme({
+/** Editor chrome matched to `.cx-input` (34px, inset bg, accent focus).
+ *  Colours come from CSS variables, so it follows the active app theme;
+ *  the `dark` flag (CM base chrome) is supplied per-theme by `makeTheme`. */
+const THEME_SPEC = {
   "&": {
     flex: "1",
     minWidth: "0",
@@ -159,7 +162,11 @@ const theme = EditorView.theme({
   "&.cm-focused .cm-selectionBackground, ::selection": {
     background: "color-mix(in oklch, var(--accent) 30%, transparent)",
   },
-}, { dark: true }); // tell CodeMirror this is a dark theme → dark popups/selection
+};
+
+/** Build the editor theme with the right `dark` flag for CM's base chrome
+ *  (completion popup, selection) so light themes don't get dark popups. */
+const makeTheme = (dark: boolean) => EditorView.theme(THEME_SPEC, { dark });
 
 export function CqlInput({ value, onChange, onRun, disabled, placeholder, className, error }: CqlInputProps) {
   const host = useRef<HTMLDivElement | null>(null);
@@ -171,6 +178,7 @@ export function CqlInput({ value, onChange, onRun, disabled, placeholder, classN
   onRunRef.current = onRun;
   const placeholderComp = useRef(new Compartment());
   const editableComp = useRef(new Compartment());
+  const themeComp = useRef(new Compartment());
 
   // Build the editor once.
   useEffect(() => {
@@ -194,7 +202,7 @@ export function CqlInput({ value, onChange, onRun, disabled, placeholder, classN
         externalErrorField,
         cqlLinter,
         singleLine,
-        theme,
+        themeComp.current.of(makeTheme(isThemeDark(currentThemeId()))),
         placeholderComp.current.of(cmPlaceholder(placeholder ?? "")),
         editableComp.current.of([
           EditorView.editable.of(!disabled),
@@ -247,6 +255,18 @@ export function CqlInput({ value, onChange, onRun, disabled, placeholder, classN
     v.dispatch({ effects: setExternalError.of(error ?? null) });
     forceLinting(v);
   }, [error]);
+
+  // Follow the app theme: reconfigure CM's base `dark` flag so light
+  // themes get light popups/selection (colours already flow via CSS vars).
+  useEffect(() => {
+    const onTheme = () => {
+      view.current?.dispatch({
+        effects: themeComp.current.reconfigure(makeTheme(isThemeDark(currentThemeId()))),
+      });
+    };
+    window.addEventListener(THEME_EVENT, onTheme);
+    return () => window.removeEventListener(THEME_EVENT, onTheme);
+  }, []);
 
   return <div ref={host} className={className} />;
 }
