@@ -305,6 +305,15 @@ export function App() {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const meta = e.metaKey || e.ctrlKey;
+      // Bare-key shortcuts (Escape, j/k nav) must not fire while typing in
+      // the query editor or any text field.
+      const t = e.target as HTMLElement | null;
+      const editable =
+        !!t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.isContentEditable ||
+          !!t.closest(".cm-editor"));
       if (meta && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setPaletteOpen(true);
@@ -323,9 +332,9 @@ export function App() {
       } else if (meta && e.key.toLowerCase() === "e") {
         e.preventDefault();
         exportConcordance("csv");
-      } else if (e.key === "Escape") {
+      } else if (e.key === "Escape" && !editable) {
         setSelected(null);
-      } else if ((e.key === "j" || e.key === "k") && result && !paletteOpen && !buildOpen) {
+      } else if ((e.key === "j" || e.key === "k") && !editable && result && !paletteOpen && !buildOpen) {
         const hits = result.hits;
         if (!hits.length) return;
         const idx = selected
