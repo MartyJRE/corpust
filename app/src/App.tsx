@@ -24,11 +24,13 @@ import { CommandPalette, type CommandDef } from "@/components/overlays/CommandPa
 import { BuildDialog } from "@/components/overlays/BuildDialog";
 import { CORPORA, RECENT_QUERIES, pickHits } from "@/data";
 import { concordanceCsv, concordanceJson, saveText, slug } from "@/lib/export";
+import { normalizeFilter } from "@/lib/filter";
 import { makeDensity } from "@/lib/utils";
-import { inTauri, isFixtureCorpus, listCorpora, runCollocates, runKwic as runKwicTauri } from "@/lib/tauri";
+import { hasLiveData, inTauri, isFixtureCorpus, listCorpora, runCollocates, runKwic as runKwicTauri } from "@/lib/tauri";
 import type { Collocate } from "@/types";
 import type {
   CorpusMeta,
+  DocFilter,
   KwicHit,
   KwicResult,
   MainView,
@@ -71,6 +73,11 @@ export function App() {
   );
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [buildOpen, setBuildOpen] = useState(false);
+  // Document-metadata filter applied to every query. `queryFilter` is the
+  // normalized form (empty dimensions dropped, or undefined when nothing
+  // is set) that travels to the backend.
+  const [filter, setFilter] = useState<DocFilter>({});
+  const queryFilter = useMemo(() => normalizeFilter(filter), [filter]);
   // Concordance scroll position (0–1), tracked from the KWIC column so the
   // hit-density gutter's thumb reflects where you actually are, and clicks
   // on the gutter scroll there.
@@ -143,7 +150,7 @@ export function App() {
         }
         return;
       }
-      runKwicTauri({ corpusId: corpus.id, term: q.trim(), layer: lyr, context: 8, limit: KWIC_PAGE, offset })
+      runKwicTauri({ corpusId: corpus.id, term: q.trim(), layer: lyr, context: 8, limit: KWIC_PAGE, offset, filter: queryFilter })
         .then((r) => {
           if (myId !== kwicReqRef.current) return;
           const hits: KwicHit[] = r.hits.map((h, i) => ({
@@ -167,7 +174,7 @@ export function App() {
           if (myId === kwicReqRef.current) setLoading(false);
         });
     },
-    [],
+    [queryFilter],
   );
 
   // Auto-fetch on corpus / term / layer change — always resets to the
@@ -257,6 +264,7 @@ export function App() {
       leftWindow: collLeft,
       rightWindow: collRight,
       limit: 60,
+      filter: queryFilter,
     })
       .then((r) => {
         if (myId !== collReqRef.current) return;
@@ -276,7 +284,7 @@ export function App() {
   useEffect(() => {
     fetchCollocates();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [subview, activeCorpus, layer, collLeft, collRight]);
+  }, [subview, activeCorpus, layer, collLeft, collRight, queryFilter]);
 
   useEffect(() => {
     const t = window.setTimeout(fetchCollocates, 100);
@@ -421,6 +429,9 @@ export function App() {
           disabled={!activeCorpus}
           annotated={!!activeCorpus?.annotated}
           onOpenPalette={() => setPaletteOpen(true)}
+          filter={filter}
+          onFilterChange={setFilter}
+          filterable={!!activeCorpus && hasLiveData(activeCorpus.id)}
         />
         <ViewTabs view={subview} onView={setSubview} result={result} />
         <div className="cx-results-wrap">
@@ -469,16 +480,16 @@ export function App() {
             />
           )}
           {subview === "freq" && activeCorpus && (
-            <FrequencyView corpus={activeCorpus} term={term} />
+            <FrequencyView corpus={activeCorpus} term={term} filter={queryFilter} />
           )}
           {subview === "tree" && activeCorpus && (
             <WordTree corpusName={activeCorpus.name} term={term} result={result} loading={loading} />
           )}
           {subview === "dist" && activeCorpus && (
-            <CollocationDistance corpus={activeCorpus} term={term} layer={layer} />
+            <CollocationDistance corpus={activeCorpus} term={term} layer={layer} filter={queryFilter} />
           )}
           {subview === "time" && activeCorpus && (
-            <FrequencyOverTime corpus={activeCorpus} term={term} layer={layer} />
+            <FrequencyOverTime corpus={activeCorpus} term={term} layer={layer} filter={queryFilter} />
           )}
         </div>
       </>

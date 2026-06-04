@@ -22,11 +22,12 @@ use anyhow::{Context, Result};
 use corpust_annotate::{AnnotatedToken, Annotator};
 use corpust_core::{DocId, Document};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use tantivy::{
-    DocAddress, DocSet, Index, IndexReader, ReloadPolicy, TERMINATED, TantivyDocument, Term, doc,
+    DocAddress, DocSet, Index, IndexReader, ReloadPolicy, Searcher, TERMINATED, TantivyDocument,
+    Term, doc,
     postings::Postings,
     schema::{
         BytesOptions, FAST, Field, IndexRecordOption, STORED, Schema, TextFieldIndexing,
@@ -152,6 +153,64 @@ pub struct DocMetadata {
     pub title: Option<String>,
     pub author: Option<String>,
     pub year: Option<u32>,
+}
+
+/// A metadata predicate over documents, applied to every query so KWIC /
+/// collocations / frequency / dispersion all see the same subcorpus.
+/// Every dimension is optional; an empty filter matches all documents.
+///
+/// Filtering is post-hoc: the predicate is evaluated against the cached
+/// [`DocumentInfo`] list to produce an allowed `doc_id` set, which the
+/// scan loops consult. Author / path are case-insensitive substring
+/// matches; year is an inclusive range. Documents missing a year are
+/// excluded by any year bound (we never guess).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DocFilter {
+    pub year_min: Option<u32>,
+    pub year_max: Option<u32>,
+    pub author: Option<String>,
+    pub path: Option<String>,
+}
+
+impl DocFilter {
+    /// True when no dimension constrains anything — the hot path skips
+    /// allow-set construction and stays exactly as fast as before.
+    pub fn is_empty(&self) -> bool {
+        self.year_min.is_none()
+            && self.year_max.is_none()
+            && self.author.as_deref().is_none_or(str::is_empty)
+            && self.path.as_deref().is_none_or(str::is_empty)
+    }
+
+    /// Whether a single document satisfies every active dimension.
+    pub fn matches(&self, d: &DocumentInfo) -> bool {
+        if self.year_min.is_some() || self.year_max.is_some() {
+            let Some(y) = d.year else { return false };
+            if self.year_min.is_some_and(|lo| y < lo) {
+                return false;
+            }
+            if self.year_max.is_some_and(|hi| y > hi) {
+                return false;
+            }
+        }
+        if let Some(a) = self.author.as_deref().filter(|s| !s.is_empty()) {
+            let needle = a.to_lowercase();
+            if !d
+                .author
+                .as_deref()
+                .is_some_and(|da| da.to_lowercase().contains(&needle))
+            {
+                return false;
+            }
+        }
+        if let Some(p) = self.path.as_deref().filter(|s| !s.is_empty()) {
+            let needle = p.to_lowercase();
+            if !d.path.to_string_lossy().to_lowercase().contains(&needle) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Per-document occurrence count of a term.
@@ -467,6 +526,22 @@ impl CorpusIndex {
         limit: usize,
         offset: usize,
     ) -> Result<KwicPage> {
+        self.kwic_filtered(term, layer, context, limit, offset, None)
+    }
+
+    /// [`Self::kwic`] restricted to documents matching `filter`. Both the
+    /// page and the total count (paging denominator) reflect only the
+    /// matching subcorpus.
+    pub fn kwic_filtered(
+        &self,
+        term: &str,
+        layer: QueryLayer,
+        context: usize,
+        limit: usize,
+        offset: usize,
+        filter: Option<&DocFilter>,
+    ) -> Result<KwicPage> {
+        let allowed = self.resolve_filter(filter)?;
         let searcher = self.reader.searcher();
         let (query_field, lookup_term) = match layer {
             QueryLayer::Word => (self.fields.body, term.to_lowercase()),
@@ -492,11 +567,24 @@ impl CorpusIndex {
             else {
                 continue;
             };
+            let doc_id_col = seg_reader.fast_fields().u64("doc_id").ok();
 
             loop {
                 let doc = postings.doc();
                 if doc == TERMINATED {
                     continue 'segments;
+                }
+                // Drop filtered-out docs before they reach the total — the
+                // paging denominator must count only the subcorpus.
+                if let Some(set) = &allowed {
+                    let sid = match &doc_id_col {
+                        Some(col) => col.first(doc).unwrap_or(0),
+                        None => self.stored_doc_id(&searcher, seg_ord, doc)?,
+                    };
+                    if !set.contains(&sid) {
+                        postings.advance();
+                        continue;
+                    }
                 }
                 let tf = postings.term_freq() as usize;
                 let doc_start = total;
@@ -658,6 +746,40 @@ impl CorpusIndex {
         Ok(out)
     }
 
+    /// The set of `doc_id`s satisfying `filter`. Cheap: a pass over the
+    /// cached document list. The query scans consult this set to restrict
+    /// results to the matching subcorpus. Returns an empty set if nothing
+    /// matches (every query then yields zero hits, as expected).
+    pub fn matching_doc_ids(&self, filter: &DocFilter) -> Result<HashSet<DocId>> {
+        let docs = self.list_documents()?;
+        Ok(docs
+            .iter()
+            .filter(|d| filter.matches(d))
+            .map(|d| d.doc_id)
+            .collect())
+    }
+
+    /// Resolve a filter to an allow-set, or `None` when the filter is
+    /// empty (the caller then skips all membership checks).
+    fn resolve_filter(&self, filter: Option<&DocFilter>) -> Result<Option<HashSet<DocId>>> {
+        match filter {
+            Some(f) if !f.is_empty() => Ok(Some(self.matching_doc_ids(f)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Fallback `doc_id` lookup for indexes built before `doc_id` became a
+    /// FAST field: fetch the stored document and read it. Hit only when
+    /// the columnar accessor is unavailable; the FAST column is preferred.
+    fn stored_doc_id(&self, searcher: &Searcher, seg_ord: usize, doc: u32) -> Result<DocId> {
+        let doc_addr = DocAddress::new(seg_ord as u32, doc);
+        let retrieved: TantivyDocument = searcher.doc(doc_addr)?;
+        Ok(retrieved
+            .get_first(self.fields.doc_id)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0))
+    }
+
     /// Corpus-wide top-`limit` term frequencies on `layer`. Returns the
     /// `(term, count)` rows sorted by descending count, plus the grand
     /// total of (non-empty) token occurrences in the field — the
@@ -667,11 +789,26 @@ impl CorpusIndex {
     /// per term. Fine at the current scale; for billion-word corpora the
     /// table should be precomputed at build time instead.
     pub fn frequencies(&self, layer: QueryLayer, limit: usize) -> Result<FreqTable> {
-        if let Some(cached) = self
-            .freq_cache
-            .lock()
-            .expect("freq_cache poisoned")
-            .get(&(layer, limit))
+        self.frequencies_filtered(layer, limit, None)
+    }
+
+    /// [`Self::frequencies`] restricted to documents matching `filter`.
+    /// Counts (and the grand total) reflect only the matching subcorpus.
+    /// The corpus-wide cache is consulted only for the unfiltered case;
+    /// filtered scans always run fresh.
+    pub fn frequencies_filtered(
+        &self,
+        layer: QueryLayer,
+        limit: usize,
+        filter: Option<&DocFilter>,
+    ) -> Result<FreqTable> {
+        let allowed = self.resolve_filter(filter)?;
+        if allowed.is_none()
+            && let Some(cached) = self
+                .freq_cache
+                .lock()
+                .expect("freq_cache poisoned")
+                .get(&(layer, limit))
         {
             return Ok(cached.clone());
         }
@@ -679,8 +816,9 @@ impl CorpusIndex {
         let field = self.layer_field(layer);
         let mut totals: HashMap<String, u64> = HashMap::new();
         let mut grand_total: u64 = 0;
-        for seg_reader in searcher.segment_readers() {
+        for (seg_ord, seg_reader) in searcher.segment_readers().iter().enumerate() {
             let inv = seg_reader.inverted_index(field)?;
+            let doc_id_col = seg_reader.fast_fields().u64("doc_id").ok();
             let term_dict = inv.terms();
             let mut stream = term_dict.stream()?;
             while stream.advance() {
@@ -697,21 +835,39 @@ impl CorpusIndex {
                     if doc == TERMINATED {
                         break;
                     }
+                    if let Some(set) = &allowed {
+                        let sid = match &doc_id_col {
+                            Some(col) => col.first(doc).unwrap_or(0),
+                            None => self.stored_doc_id(&searcher, seg_ord, doc)?,
+                        };
+                        if !set.contains(&sid) {
+                            postings.advance();
+                            continue;
+                        }
+                    }
                     sum += postings.term_freq() as u64;
                     postings.advance();
                 }
                 grand_total += sum;
-                *totals.entry(key).or_default() += sum;
+                // A term may exist corpus-wide yet have zero hits inside
+                // the filtered subcorpus — don't surface it as a 0-count
+                // row. (Unfiltered, every term has sum > 0, so this is a
+                // no-op there.)
+                if sum > 0 {
+                    *totals.entry(key).or_default() += sum;
+                }
             }
         }
         let mut rows: Vec<(String, u64)> = totals.into_iter().collect();
         rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         rows.truncate(limit);
         let result = (rows, grand_total);
-        self.freq_cache
-            .lock()
-            .expect("freq_cache poisoned")
-            .insert((layer, limit), result.clone());
+        if allowed.is_none() {
+            self.freq_cache
+                .lock()
+                .expect("freq_cache poisoned")
+                .insert((layer, limit), result.clone());
+        }
         Ok(result)
     }
 
@@ -738,6 +894,72 @@ impl CorpusIndex {
             total += seg_reader.inverted_index(field)?.total_num_tokens();
         }
         Ok(total)
+    }
+
+    /// [`Self::layer_total_tokens`] restricted to a filtered subcorpus —
+    /// the `N` denominator association scores need when a filter is
+    /// active. With a filter set, returns the summed word-layer token
+    /// count of the matching documents (collocate scoring is always on the
+    /// surface layer, so per-layer subcorpus totals aren't needed).
+    pub fn layer_total_tokens_filtered(
+        &self,
+        layer: QueryLayer,
+        filter: Option<&DocFilter>,
+    ) -> Result<u64> {
+        match self.resolve_filter(filter)? {
+            None => self.layer_total_tokens(layer),
+            Some(set) => Ok(self
+                .list_documents()?
+                .iter()
+                .filter(|d| set.contains(&d.doc_id))
+                .map(|d| d.token_count as u64)
+                .sum()),
+        }
+    }
+
+    /// [`Self::term_totals`] restricted to documents matching `filter`, so
+    /// the `f(collocate)` marginals are scoped to the same subcorpus as
+    /// the co-occurrence counts.
+    pub fn term_totals_filtered(
+        &self,
+        terms: &[String],
+        layer: QueryLayer,
+        filter: Option<&DocFilter>,
+    ) -> Result<HashMap<String, u64>> {
+        let Some(allowed) = self.resolve_filter(filter)? else {
+            return self.term_totals(terms, layer);
+        };
+        let searcher = self.reader.searcher();
+        let field = self.layer_field(layer);
+        let mut out: HashMap<String, u64> = HashMap::with_capacity(terms.len());
+        for term in terms {
+            let term_obj = Term::from_field_text(field, term);
+            let mut sum = 0u64;
+            for (seg_ord, seg_reader) in searcher.segment_readers().iter().enumerate() {
+                let inv = seg_reader.inverted_index(field)?;
+                let doc_id_col = seg_reader.fast_fields().u64("doc_id").ok();
+                if let Some(mut postings) =
+                    inv.read_postings(&term_obj, IndexRecordOption::WithFreqs)?
+                {
+                    loop {
+                        let doc = postings.doc();
+                        if doc == TERMINATED {
+                            break;
+                        }
+                        let sid = match &doc_id_col {
+                            Some(col) => col.first(doc).unwrap_or(0),
+                            None => self.stored_doc_id(&searcher, seg_ord, doc)?,
+                        };
+                        if allowed.contains(&sid) {
+                            sum += postings.term_freq() as u64;
+                        }
+                        postings.advance();
+                    }
+                }
+            }
+            out.insert(term.clone(), sum);
+        }
+        Ok(out)
     }
 
     /// Corpus-wide frequency of each given term on `layer`. Used to fetch
@@ -791,17 +1013,33 @@ impl CorpusIndex {
         right: usize,
         max_nodes: usize,
     ) -> Result<CollocateScan> {
+        self.collocate_counts_filtered(term, layer, left, right, max_nodes, None)
+    }
+
+    /// [`Self::collocate_counts`] restricted to documents matching
+    /// `filter`. The scan cache is used only for the unfiltered case.
+    pub fn collocate_counts_filtered(
+        &self,
+        term: &str,
+        layer: QueryLayer,
+        left: usize,
+        right: usize,
+        max_nodes: usize,
+        filter: Option<&DocFilter>,
+    ) -> Result<CollocateScan> {
+        let allowed = self.resolve_filter(filter)?;
         let (query_field, lookup_term) = match layer {
             QueryLayer::Word => (self.fields.body, term.to_lowercase()),
             QueryLayer::Lemma => (self.fields.body_lemma, term.to_lowercase()),
             QueryLayer::Pos => (self.fields.body_pos, term.to_string()),
         };
         let cache_key = (lookup_term.clone(), layer, left, right);
-        if let Some(cached) = self
-            .colloc_cache
-            .lock()
-            .expect("colloc_cache poisoned")
-            .get(&cache_key)
+        if allowed.is_none()
+            && let Some(cached) = self
+                .colloc_cache
+                .lock()
+                .expect("colloc_cache poisoned")
+                .get(&cache_key)
         {
             return Ok(cached.clone());
         }
@@ -822,11 +1060,22 @@ impl CorpusIndex {
             else {
                 continue;
             };
+            let doc_id_col = seg_reader.fast_fields().u64("doc_id").ok();
 
             loop {
                 let doc = postings.doc();
                 if doc == TERMINATED {
                     continue 'segments;
+                }
+                if let Some(set) = &allowed {
+                    let sid = match &doc_id_col {
+                        Some(col) => col.first(doc).unwrap_or(0),
+                        None => self.stored_doc_id(&searcher, seg_ord, doc)?,
+                    };
+                    if !set.contains(&sid) {
+                        postings.advance();
+                        continue;
+                    }
                 }
 
                 let doc_addr = DocAddress::new(seg_ord as u32, doc);
@@ -873,10 +1122,12 @@ impl CorpusIndex {
             window_tokens,
             truncated,
         };
-        self.colloc_cache
-            .lock()
-            .expect("colloc_cache poisoned")
-            .insert(cache_key, scan.clone());
+        if allowed.is_none() {
+            self.colloc_cache
+                .lock()
+                .expect("colloc_cache poisoned")
+                .insert(cache_key, scan.clone());
+        }
         Ok(scan)
     }
 
@@ -893,6 +1144,21 @@ impl CorpusIndex {
         right: usize,
         max_nodes: usize,
     ) -> Result<DistanceProfile> {
+        self.collocate_by_distance_filtered(term, layer, left, right, max_nodes, None)
+    }
+
+    /// [`Self::collocate_by_distance`] restricted to documents matching
+    /// `filter`.
+    pub fn collocate_by_distance_filtered(
+        &self,
+        term: &str,
+        layer: QueryLayer,
+        left: usize,
+        right: usize,
+        max_nodes: usize,
+        filter: Option<&DocFilter>,
+    ) -> Result<DistanceProfile> {
+        let allowed = self.resolve_filter(filter)?;
         let (query_field, lookup_term) = match layer {
             QueryLayer::Word => (self.fields.body, term.to_lowercase()),
             QueryLayer::Lemma => (self.fields.body_lemma, term.to_lowercase()),
@@ -926,10 +1192,21 @@ impl CorpusIndex {
             else {
                 continue;
             };
+            let doc_id_col = seg_reader.fast_fields().u64("doc_id").ok();
             loop {
                 let doc = postings.doc();
                 if doc == TERMINATED {
                     continue 'segments;
+                }
+                if let Some(set) = &allowed {
+                    let sid = match &doc_id_col {
+                        Some(col) => col.first(doc).unwrap_or(0),
+                        None => self.stored_doc_id(&searcher, seg_ord, doc)?,
+                    };
+                    if !set.contains(&sid) {
+                        postings.advance();
+                        continue;
+                    }
                 }
                 let doc_addr = DocAddress::new(seg_ord as u32, doc);
                 let retrieved: TantivyDocument = searcher.doc(doc_addr)?;
@@ -1000,13 +1277,30 @@ impl CorpusIndex {
         layer: QueryLayer,
         buckets: usize,
     ) -> Result<TermDistribution> {
+        self.term_distribution_filtered(term, layer, buckets, None)
+    }
+
+    /// [`Self::term_distribution`] restricted to documents matching
+    /// `filter`. The global position axis (and so the dispersion buckets)
+    /// stays over the whole corpus; only hits from matching documents are
+    /// counted, and `doc_counts` lists just those documents. The cache is
+    /// used only for the unfiltered case.
+    pub fn term_distribution_filtered(
+        &self,
+        term: &str,
+        layer: QueryLayer,
+        buckets: usize,
+        filter: Option<&DocFilter>,
+    ) -> Result<TermDistribution> {
+        let allowed = self.resolve_filter(filter)?;
         let buckets = buckets.max(1);
         let cache_key = (term.to_string(), layer, buckets);
-        if let Some(cached) = self
-            .dist_cache
-            .lock()
-            .expect("dist_cache poisoned")
-            .get(&cache_key)
+        if allowed.is_none()
+            && let Some(cached) = self
+                .dist_cache
+                .lock()
+                .expect("dist_cache poisoned")
+                .get(&cache_key)
         {
             return Ok(cached.clone());
         }
@@ -1053,15 +1347,14 @@ impl CorpusIndex {
                 }
                 let stored_id = match &doc_id_col {
                     Some(col) => col.first(doc).unwrap_or(0),
-                    None => {
-                        let doc_addr = DocAddress::new(seg_ord as u32, doc);
-                        let retrieved: TantivyDocument = searcher.doc(doc_addr)?;
-                        retrieved
-                            .get_first(self.fields.doc_id)
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0)
-                    }
+                    None => self.stored_doc_id(&searcher, seg_ord, doc)?,
                 };
+                if let Some(set) = &allowed
+                    && !set.contains(&stored_id)
+                {
+                    postings.advance();
+                    continue;
+                }
                 let freq = postings.term_freq() as u64;
                 *doc_hits.entry(stored_id).or_default() += freq;
                 total_hits += freq;
@@ -1097,10 +1390,12 @@ impl CorpusIndex {
             dispersion,
             total_hits,
         };
-        self.dist_cache
-            .lock()
-            .expect("dist_cache poisoned")
-            .insert(cache_key, result.clone());
+        if allowed.is_none() {
+            self.dist_cache
+                .lock()
+                .expect("dist_cache poisoned")
+                .insert(cache_key, result.clone());
+        }
         Ok(result)
     }
 
@@ -2022,6 +2317,110 @@ by Mary Wollstonecraft (Godwin) Shelley
                 m.year
             );
         }
+    }
+
+    fn doc_info(
+        doc_id: DocId,
+        path: &str,
+        author: Option<&str>,
+        year: Option<u32>,
+    ) -> DocumentInfo {
+        DocumentInfo {
+            doc_id,
+            path: PathBuf::from(path),
+            token_count: 0,
+            title: None,
+            author: author.map(str::to_string),
+            year,
+        }
+    }
+
+    #[test]
+    fn doc_filter_empty_matches_everything() {
+        let f = DocFilter::default();
+        assert!(f.is_empty());
+        assert!(f.matches(&doc_info(0, "a.txt", None, None)));
+    }
+
+    #[test]
+    fn doc_filter_year_range_excludes_undated_and_out_of_range() {
+        let f = DocFilter {
+            year_min: Some(1850),
+            year_max: Some(1900),
+            ..Default::default()
+        };
+        assert!(!f.is_empty());
+        assert!(f.matches(&doc_info(0, "a.txt", None, Some(1875))));
+        assert!(!f.matches(&doc_info(1, "b.txt", None, Some(1801)))); // before range
+        assert!(!f.matches(&doc_info(2, "c.txt", None, Some(1950)))); // after range
+        assert!(!f.matches(&doc_info(3, "d.txt", None, None))); // undated never guessed
+    }
+
+    #[test]
+    fn doc_filter_author_and_path_are_case_insensitive_substrings() {
+        let author = DocFilter {
+            author: Some("austen".into()),
+            ..Default::default()
+        };
+        assert!(author.matches(&doc_info(0, "x.txt", Some("Jane Austen"), None)));
+        assert!(!author.matches(&doc_info(1, "x.txt", Some("Charles Dickens"), None)));
+        assert!(!author.matches(&doc_info(2, "x.txt", None, None)));
+
+        let path = DocFilter {
+            path: Some("FICTION".into()),
+            ..Default::default()
+        };
+        assert!(path.matches(&doc_info(0, "corpus/fiction/a.txt", None, None)));
+        assert!(!path.matches(&doc_info(1, "corpus/legal/b.txt", None, None)));
+    }
+
+    #[test]
+    fn filtered_kwic_and_frequencies_restrict_to_the_subcorpus() {
+        let tmp = tempdir();
+        let idx = CorpusIndex::create(&tmp).unwrap();
+        idx.add_documents(
+            [
+                Document {
+                    id: 0,
+                    path: PathBuf::from("alpha.txt"),
+                    text: "the lazy dog sat".to_string(),
+                },
+                Document {
+                    id: 1,
+                    path: PathBuf::from("beta.txt"),
+                    text: "the lazy cat ran".to_string(),
+                },
+            ],
+            None,
+        )
+        .unwrap();
+
+        // Unfiltered: "the" occurs in both documents.
+        let all = idx.kwic("the", QueryLayer::Word, 2, 10, 0).unwrap();
+        assert_eq!(all.total, 2);
+
+        // Path filter to just alpha.txt → only that document's hit, and
+        // the total (paging denominator) reflects the subcorpus too.
+        let only_alpha = DocFilter {
+            path: Some("alpha".into()),
+            ..Default::default()
+        };
+        let page = idx
+            .kwic_filtered("the", QueryLayer::Word, 2, 10, 0, Some(&only_alpha))
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.hits.len(), 1);
+        assert!(page.hits[0].path.to_string_lossy().contains("alpha"));
+
+        // Frequencies respect the same filter: "cat" only exists in beta,
+        // so it must be absent from an alpha-only frequency table.
+        let (rows, _total) = idx
+            .frequencies_filtered(QueryLayer::Word, 100, Some(&only_alpha))
+            .unwrap();
+        assert!(rows.iter().any(|(w, _)| w == "dog"));
+        assert!(!rows.iter().any(|(w, _)| w == "cat"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     fn tempdir() -> std::path::PathBuf {

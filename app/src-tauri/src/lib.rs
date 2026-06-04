@@ -86,6 +86,40 @@ impl From<QueryLayer> for corpust_index::QueryLayer {
     }
 }
 
+/// Document-metadata filter shared by every query command. Empty
+/// dimensions (the default) impose no constraint. Mirrors the TS
+/// `DocFilter` and converts into [`corpust_index::DocFilter`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocFilterDto {
+    #[serde(default)]
+    pub year_min: Option<u32>,
+    #[serde(default)]
+    pub year_max: Option<u32>,
+    #[serde(default)]
+    pub author: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl From<DocFilterDto> for corpust_index::DocFilter {
+    fn from(f: DocFilterDto) -> Self {
+        corpust_index::DocFilter {
+            year_min: f.year_min,
+            year_max: f.year_max,
+            author: f.author,
+            path: f.path,
+        }
+    }
+}
+
+impl DocFilterDto {
+    /// Convert an optional DTO into a resolved filter (empty when absent).
+    pub fn resolve(opt: Option<DocFilterDto>) -> corpust_index::DocFilter {
+        opt.map(Into::into).unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KwicRequest {
@@ -97,6 +131,8 @@ pub struct KwicRequest {
     /// Hits to skip before this page (concordance pagination).
     #[serde(default)]
     pub offset: usize,
+    #[serde(default)]
+    pub filter: Option<DocFilterDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,6 +173,8 @@ pub struct CollocatesRequest {
     pub right_window: usize,
     /// Max number of collocate candidates to return.
     pub limit: usize,
+    #[serde(default)]
+    pub filter: Option<DocFilterDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -224,6 +262,8 @@ pub struct FrequenciesRequest {
     pub corpus_id: String,
     pub layer: QueryLayer,
     pub limit: usize,
+    #[serde(default)]
+    pub filter: Option<DocFilterDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -251,6 +291,8 @@ pub struct TermDistRequest {
     pub term: String,
     pub layer: QueryLayer,
     pub buckets: usize,
+    #[serde(default)]
+    pub filter: Option<DocFilterDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -283,6 +325,8 @@ pub struct CollocateDistanceRequest {
     pub right_window: usize,
     /// How many of the busiest collocates to return rows for.
     pub limit: usize,
+    #[serde(default)]
+    pub filter: Option<DocFilterDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]

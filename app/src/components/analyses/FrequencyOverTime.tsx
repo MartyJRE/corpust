@@ -7,13 +7,17 @@
 // being bigger.
 
 import { useEffect, useMemo, useState } from "react";
+import { docMatchesFilter } from "@/lib/filter";
 import { hasLiveData, listDocuments, runTermDistribution } from "@/lib/tauri";
-import type { CorpusMeta, QueryLayer } from "@/types";
+import type { CorpusMeta, DocFilter, QueryLayer } from "@/types";
 
 export interface FrequencyOverTimeProps {
   corpus: CorpusMeta;
   term: string;
   layer: QueryLayer;
+  /** Active metadata filter (already normalized). Scopes the hit counts
+   *  and the per-year token denominator to the same subcorpus. */
+  filter?: DocFilter;
 }
 
 interface YearPoint {
@@ -49,7 +53,7 @@ function yearTicks(min: number, max: number, count = 6): number[] {
   return out;
 }
 
-export function FrequencyOverTime({ corpus, term, layer }: FrequencyOverTimeProps) {
+export function FrequencyOverTime({ corpus, term, layer, filter }: FrequencyOverTimeProps) {
   const isLive = hasLiveData(corpus.id);
   const [points, setPoints] = useState<YearPoint[] | null>(null);
   const [undated, setUndated] = useState(0);
@@ -64,10 +68,13 @@ export function FrequencyOverTime({ corpus, term, layer }: FrequencyOverTimeProp
     setLoading(true);
     Promise.all([
       listDocuments(corpus.id),
-      runTermDistribution({ corpusId: corpus.id, term: term.trim(), layer, buckets: 100 }),
+      runTermDistribution({ corpusId: corpus.id, term: term.trim(), layer, buckets: 100, filter }),
     ])
-      .then(([docs, dist]) => {
+      .then(([allDocs, dist]) => {
         if (cancelled) return;
+        // Restrict the per-year token denominator to the same subcorpus
+        // the filter scoped the hits to, so per-1M stays accurate.
+        const docs = allDocs.filter((d) => docMatchesFilter(d, filter));
         const hitsByDoc = new Map<number, number>();
         for (const d of dist.docCounts) hitsByDoc.set(d.docId, d.hits);
 
@@ -101,7 +108,7 @@ export function FrequencyOverTime({ corpus, term, layer }: FrequencyOverTimeProp
     return () => {
       cancelled = true;
     };
-  }, [corpus.id, term, layer, isLive]);
+  }, [corpus.id, term, layer, isLive, filter]);
 
   const scale = useMemo(() => {
     const pts = points ?? [];
