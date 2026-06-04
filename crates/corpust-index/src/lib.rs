@@ -17,6 +17,8 @@
 //! context extraction is O(context) regardless of document length.
 
 pub mod assoc;
+mod cql;
+pub use cql::{AttrConstraint, CqlQuery, Matcher, TokenPattern};
 
 use anyhow::{Context, Result};
 use corpust_annotate::{AnnotatedToken, Annotator};
@@ -1477,20 +1479,33 @@ fn window(
     p: usize,
     context: usize,
 ) -> Option<(String, String, String)> {
+    window_span(body, offsets, p, 1, context)
+}
+
+/// Like [`window`] but the node spans `len` tokens starting at `start`
+/// (`len == 1` is a single-token hit). Powers multi-token CQL hits, where
+/// the matched span covers a sequence of token positions.
+///
+/// Slices each token directly by its stored byte offset. `offsets[i]` is
+/// the start of token `i`; the start of the next token (or end of body) is
+/// its end. This keeps the displayed hit aligned with the indexed
+/// positions even when the indexing tokenizer (an annotator's
+/// tokenisation) splits the text differently from a naive re-tokenisation.
+fn window_span(
+    body: &str,
+    offsets: &[u32],
+    start: usize,
+    len: usize,
+    context: usize,
+) -> Option<(String, String, String)> {
     let n = offsets.len();
-    if p >= n {
+    if start >= n || len == 0 {
         return None;
     }
-    let window_start = p.saturating_sub(context);
-    let window_end = (p + context + 1).min(n); // exclusive token index
+    let node_end = (start + len).min(n); // exclusive token index of the span
+    let window_start = start.saturating_sub(context);
+    let window_end = (node_end + context).min(n); // exclusive token index
 
-    // Slice each token directly by its stored byte offset. `offsets[i]` is
-    // the start of token `i`; the start of token `i+1` (or end of body) is
-    // its end. This keeps the displayed hit aligned with the indexed
-    // position `p` even when the indexing tokenizer (an annotator's
-    // tokenisation) splits the text differently from a naive
-    // re-tokenisation — re-tokenising here silently mis-aligned the hit on
-    // annotated corpora.
     let start_of = |i: usize| -> usize {
         if i < n {
             offsets[i] as usize
@@ -1498,9 +1513,9 @@ fn window(
             body.len()
         }
     };
-    let left = body[start_of(window_start)..start_of(p)].trim();
-    let hit = body[start_of(p)..start_of(p + 1)].trim();
-    let right = body[start_of(p + 1)..start_of(window_end)].trim();
+    let left = body[start_of(window_start)..start_of(start)].trim();
+    let hit = body[start_of(start)..start_of(node_end)].trim();
+    let right = body[start_of(node_end)..start_of(window_end)].trim();
 
     Some((left.to_owned(), hit.to_owned(), right.to_owned()))
 }
@@ -2419,6 +2434,203 @@ by Mary Wollstonecraft (Godwin) Shelley
             .unwrap();
         assert!(rows.iter().any(|(w, _)| w == "dog"));
         assert!(!rows.iter().any(|(w, _)| w == "cat"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Deterministic POS/lemma tagger for CQL tests: a fixed word→tag map,
+    /// lemma = lowercased word. Avoids depending on TreeTagger models.
+    struct MockTagger;
+
+    impl Annotator for MockTagger {
+        fn annotate<'a>(
+            &self,
+            text: &'a str,
+        ) -> anyhow::Result<Vec<corpust_annotate::AnnotatedToken<'a>>> {
+            use std::borrow::Cow;
+            Ok(text
+                .unicode_word_indices()
+                .enumerate()
+                .map(|(pos, (start, word))| {
+                    let tag = match word.to_lowercase().as_str() {
+                        "the" | "a" => "DT",
+                        "dog" | "cat" | "fox" => "NN",
+                        "lazy" | "quick" | "brown" => "JJ",
+                        _ => "XX",
+                    };
+                    corpust_annotate::AnnotatedToken {
+                        word: Cow::Borrowed(word),
+                        lemma: Some(Cow::Owned(word.to_lowercase())),
+                        pos: Some(Cow::Borrowed(tag)),
+                        byte_start: start,
+                        byte_end: start + word.len(),
+                        position: pos as corpust_core::Position,
+                    }
+                })
+                .collect())
+        }
+        fn supported_languages(&self) -> &[&'static str] {
+            &["*"]
+        }
+        fn id(&self) -> &str {
+            "mock"
+        }
+    }
+
+    fn pos(tag: &str) -> TokenPattern {
+        TokenPattern {
+            constraints: vec![AttrConstraint {
+                layer: QueryLayer::Pos,
+                matcher: Matcher::Exact(tag.to_string()),
+            }],
+        }
+    }
+    fn word(w: &str) -> AttrConstraint {
+        AttrConstraint {
+            layer: QueryLayer::Word,
+            matcher: Matcher::Exact(w.to_string()),
+        }
+    }
+
+    #[test]
+    fn cql_matches_pos_attribute_and_multi_token_sequences() {
+        let tmp = tempdir();
+        let idx = CorpusIndex::create(&tmp).unwrap();
+        idx.add_documents(
+            [Document {
+                id: 0,
+                path: PathBuf::from("a.txt"),
+                // the/DT quick/JJ brown/JJ fox/NN jumps/XX over/XX the/DT lazy/JJ dog/NN
+                text: "the quick brown fox jumps over the lazy dog".to_string(),
+            }],
+            Some(&MockTagger),
+        )
+        .unwrap();
+
+        // [pos="NN"] → fox, dog
+        let nn = idx
+            .cql_kwic(
+                &CqlQuery {
+                    tokens: vec![pos("NN")],
+                },
+                2,
+                50,
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(nn.total, 2);
+        assert!(nn.hits.iter().any(|h| h.hit == "fox"));
+        assert!(nn.hits.iter().any(|h| h.hit == "dog"));
+
+        // Multi-attribute: [word="the" pos="DT"] → 2; [word="the" pos="NN"] → 0
+        let the_dt = CqlQuery {
+            tokens: vec![TokenPattern {
+                constraints: vec![
+                    word("the"),
+                    AttrConstraint {
+                        layer: QueryLayer::Pos,
+                        matcher: Matcher::Exact("DT".into()),
+                    },
+                ],
+            }],
+        };
+        assert_eq!(idx.cql_kwic(&the_dt, 1, 50, 0, None).unwrap().total, 2);
+        let the_nn = CqlQuery {
+            tokens: vec![TokenPattern {
+                constraints: vec![
+                    word("the"),
+                    AttrConstraint {
+                        layer: QueryLayer::Pos,
+                        matcher: Matcher::Exact("NN".into()),
+                    },
+                ],
+            }],
+        };
+        assert_eq!(idx.cql_kwic(&the_nn, 1, 50, 0, None).unwrap().total, 0);
+
+        // Sequence [pos="DT"] [pos="JJ"] → "the quick", "the lazy"
+        let seq = idx
+            .cql_kwic(
+                &CqlQuery {
+                    tokens: vec![pos("DT"), pos("JJ")],
+                },
+                2,
+                50,
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(seq.total, 2);
+        assert!(seq.hits.iter().all(|h| h.hit.starts_with("the ")));
+
+        // Regex on POS: [pos="N.*"] → the two NN tokens
+        let re = CqlQuery {
+            tokens: vec![TokenPattern {
+                constraints: vec![AttrConstraint {
+                    layer: QueryLayer::Pos,
+                    matcher: Matcher::Regex(regex::Regex::new("^(?:N.*)$").unwrap()),
+                }],
+            }],
+        };
+        assert_eq!(idx.cql_kwic(&re, 2, 50, 0, None).unwrap().total, 2);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cql_respects_the_document_filter() {
+        let tmp = tempdir();
+        let idx = CorpusIndex::create(&tmp).unwrap();
+        idx.add_documents(
+            [
+                Document {
+                    id: 0,
+                    path: PathBuf::from("alpha.txt"),
+                    text: "the lazy dog".into(),
+                },
+                Document {
+                    id: 1,
+                    path: PathBuf::from("beta.txt"),
+                    text: "the lazy cat".into(),
+                },
+            ],
+            Some(&MockTagger),
+        )
+        .unwrap();
+
+        // [pos="NN"] across both docs → dog + cat
+        let all = idx
+            .cql_kwic(
+                &CqlQuery {
+                    tokens: vec![pos("NN")],
+                },
+                1,
+                50,
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(all.total, 2);
+
+        // Filter to alpha.txt → only dog
+        let only_alpha = DocFilter {
+            path: Some("alpha".into()),
+            ..Default::default()
+        };
+        let page = idx
+            .cql_kwic(
+                &CqlQuery {
+                    tokens: vec![pos("NN")],
+                },
+                1,
+                50,
+                0,
+                Some(&only_alpha),
+            )
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.hits[0].hit, "dog");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

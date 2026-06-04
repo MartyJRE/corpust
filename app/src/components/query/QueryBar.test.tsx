@@ -36,6 +36,42 @@ describe("QueryBar filter", () => {
     expect(onFilterChange).toHaveBeenCalledWith({}); // year cleared
   });
 
+  it("flags a CQL query and mutes the layer toggle", () => {
+    const { container } = render(
+      <QueryBar
+        layer="word"
+        term={'[pos="NN"]'}
+        onLayer={vi.fn()}
+        onTerm={vi.fn()}
+        onRun={vi.fn()}
+        onOpenPalette={vi.fn()}
+        filter={{}}
+        onFilterChange={vi.fn()}
+        filterable={false}
+      />,
+    );
+    expect(screen.getByText("CQL")).toBeInTheDocument();
+    expect(container.querySelector(".cx-layer-toggle.is-muted")).not.toBeNull();
+  });
+
+  it("shows the layer hint for a bare term, not CQL", () => {
+    render(
+      <QueryBar
+        layer="word"
+        term="bank"
+        onLayer={vi.fn()}
+        onTerm={vi.fn()}
+        onRun={vi.fn()}
+        onOpenPalette={vi.fn()}
+        filter={{}}
+        onFilterChange={vi.fn()}
+        filterable={false}
+      />,
+    );
+    expect(screen.getByText("regex ok")).toBeInTheDocument();
+    expect(screen.queryByText("CQL")).toBeNull();
+  });
+
   it("opens the popover and commits a normalized filter on Apply", () => {
     const { onFilterChange } = setup();
     fireEvent.click(screen.getByRole("button", { name: /filter/i }));

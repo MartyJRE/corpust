@@ -754,6 +754,7 @@ dependencies = [
  "corpust-core",
  "corpust-tokenize",
  "rayon",
+ "regex",
  "tantivy",
  "unicode-segmentation",
 ]
@@ -779,6 +780,7 @@ dependencies = [
  "corpust-annotate",
  "corpust-core",
  "corpust-index",
+ "regex",
  "tempfile",
 ]
 
