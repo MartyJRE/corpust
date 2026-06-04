@@ -179,7 +179,14 @@ fn run_collocates_inner(
     let (collocates, node_freq, window_tokens, truncated) =
         with_corpus(state, &req.corpus_id, |index| {
             let scan = index
-                .collocate_counts_filtered(&req.term, layer, lw, rw, MAX_NODE_OCCURRENCES, Some(&filter))
+                .collocate_counts_filtered(
+                    &req.term,
+                    layer,
+                    lw,
+                    rw,
+                    MAX_NODE_OCCURRENCES,
+                    Some(&filter),
+                )
                 .map_err(|e| format!("collocate scan failed: {e:#}"))?;
 
             // Corpus size and collocate marginals are taken on the
@@ -492,7 +499,14 @@ fn run_collocate_distance_inner(
 
     let (offsets, mut rows, node_freq, truncated) = with_corpus(state, &req.corpus_id, |index| {
         let prof = index
-            .collocate_by_distance_filtered(&req.term, layer, lw, rw, MAX_NODE_OCCURRENCES, Some(&filter))
+            .collocate_by_distance_filtered(
+                &req.term,
+                layer,
+                lw,
+                rw,
+                MAX_NODE_OCCURRENCES,
+                Some(&filter),
+            )
             .map_err(|e| format!("distance scan failed: {e:#}"))?;
         let node_word = req.term.trim().to_lowercase();
         let rows: Vec<DistanceRow> = prof

@@ -803,15 +803,14 @@ impl CorpusIndex {
         filter: Option<&DocFilter>,
     ) -> Result<FreqTable> {
         let allowed = self.resolve_filter(filter)?;
-        if allowed.is_none() {
-            if let Some(cached) = self
+        if allowed.is_none()
+            && let Some(cached) = self
                 .freq_cache
                 .lock()
                 .expect("freq_cache poisoned")
                 .get(&(layer, limit))
-            {
-                return Ok(cached.clone());
-            }
+        {
+            return Ok(cached.clone());
         }
         let searcher = self.reader.searcher();
         let field = self.layer_field(layer);
@@ -1035,15 +1034,14 @@ impl CorpusIndex {
             QueryLayer::Pos => (self.fields.body_pos, term.to_string()),
         };
         let cache_key = (lookup_term.clone(), layer, left, right);
-        if allowed.is_none() {
-            if let Some(cached) = self
+        if allowed.is_none()
+            && let Some(cached) = self
                 .colloc_cache
                 .lock()
                 .expect("colloc_cache poisoned")
                 .get(&cache_key)
-            {
-                return Ok(cached.clone());
-            }
+        {
+            return Ok(cached.clone());
         }
 
         let searcher = self.reader.searcher();
@@ -1297,15 +1295,14 @@ impl CorpusIndex {
         let allowed = self.resolve_filter(filter)?;
         let buckets = buckets.max(1);
         let cache_key = (term.to_string(), layer, buckets);
-        if allowed.is_none() {
-            if let Some(cached) = self
+        if allowed.is_none()
+            && let Some(cached) = self
                 .dist_cache
                 .lock()
                 .expect("dist_cache poisoned")
                 .get(&cache_key)
-            {
-                return Ok(cached.clone());
-            }
+        {
+            return Ok(cached.clone());
         }
         let searcher = self.reader.searcher();
         let field = self.layer_field(layer);
@@ -1352,11 +1349,11 @@ impl CorpusIndex {
                     Some(col) => col.first(doc).unwrap_or(0),
                     None => self.stored_doc_id(&searcher, seg_ord, doc)?,
                 };
-                if let Some(set) = &allowed {
-                    if !set.contains(&stored_id) {
-                        postings.advance();
-                        continue;
-                    }
+                if let Some(set) = &allowed
+                    && !set.contains(&stored_id)
+                {
+                    postings.advance();
+                    continue;
                 }
                 let freq = postings.term_freq() as u64;
                 *doc_hits.entry(stored_id).or_default() += freq;
@@ -2322,7 +2319,12 @@ by Mary Wollstonecraft (Godwin) Shelley
         }
     }
 
-    fn doc_info(doc_id: DocId, path: &str, author: Option<&str>, year: Option<u32>) -> DocumentInfo {
+    fn doc_info(
+        doc_id: DocId,
+        path: &str,
+        author: Option<&str>,
+        year: Option<u32>,
+    ) -> DocumentInfo {
         DocumentInfo {
             doc_id,
             path: PathBuf::from(path),
