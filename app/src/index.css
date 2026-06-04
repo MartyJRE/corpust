@@ -110,11 +110,16 @@
       transition-duration: 0.01ms !important;
     }
   }
+  /* Scrollbars stay visible whenever a surface overflows — a persistent
+     (if subtle) thumb is the only signal that clipped content continues.
+     They were transparent-until-hover before, which read as "cut off with
+     no affordance". */
+  * { scrollbar-width: thin; scrollbar-color: color-mix(in oklch, var(--fg-subtle) 35%, transparent) transparent; }
   *::-webkit-scrollbar { width: 10px; height: 10px; }
   *::-webkit-scrollbar-track { background: transparent; }
-  *::-webkit-scrollbar-thumb { background: transparent; border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
-  *:hover::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg-subtle) 40%, transparent); background-clip: content-box; border: 2px solid transparent; }
-  *::-webkit-scrollbar-thumb:hover { background: var(--fg-subtle); background-clip: content-box; border: 2px solid transparent; }
+  *::-webkit-scrollbar-corner { background: transparent; }
+  *::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg-subtle) 30%, transparent); border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
+  *::-webkit-scrollbar-thumb:hover { background: color-mix(in oklch, var(--fg-subtle) 65%, transparent); background-clip: content-box; border: 2px solid transparent; }
 }
 
 /* ============================================================
@@ -262,12 +267,21 @@
   background: var(--bg-raised);
   border-bottom: 1px solid var(--border);
   padding: 0 8px; height: 36px;
+  /* Too many tabs for a narrow window scroll horizontally rather than
+     spilling under the window edge. The strip is too short for a usable
+     scrollbar, so a right-edge fade is the affordance instead. */
+  overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent 100%);
+  mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent 100%);
 }
+.cx-viewtabs::-webkit-scrollbar { display: none; }
 .cx-viewtab {
   border: 0; background: transparent; color: var(--fg-muted);
   padding: 0 12px; display: inline-flex; align-items: center; gap: 6px;
   font-size: 12px; cursor: pointer; position: relative;
   font-family: var(--font-sans);
+  flex-shrink: 0; white-space: nowrap;
 }
 .cx-viewtab:hover { color: var(--fg); }
 .cx-viewtab.is-on { color: var(--fg); }
@@ -289,6 +303,9 @@
   padding: 10px 14px;
   background: var(--bg-raised);
   border-bottom: 1px solid var(--border);
+  /* On a narrow window the chips / buttons wrap to a second row instead
+     of spilling past the window edge. */
+  flex-wrap: wrap; row-gap: 8px;
 }
 .cx-layer-toggle {
   display: inline-flex;
@@ -308,7 +325,7 @@
 .cx-layer-pos.is-on { color: var(--layer-pos); }
 .cx-layer:disabled { opacity: 0.4; cursor: not-allowed; }
 
-.cx-input-wrap { flex: 1; position: relative; display: flex; align-items: center; min-width: 0; }
+.cx-input-wrap { flex: 1 1 220px; position: relative; display: flex; align-items: center; min-width: 180px; }
 .cx-input {
   flex: 1; height: 34px;
   background: var(--bg-inset);
@@ -416,7 +433,7 @@
   backdrop-filter: blur(8px) saturate(1.1);
   border-bottom: 1px solid var(--border);
   box-shadow: 0 1px 0 color-mix(in oklch, var(--bg) 60%, transparent);
-  display: flex; align-items: center; gap: 10px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   padding: 6px 14px;
   font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted);
 }
@@ -433,6 +450,11 @@
 
 .cx-kwic {
   width: 100%;
+  /* Fixed layout keeps the table bounded to the column: the node column
+     stays anchored at centre and the context columns clip+fade at their
+     outer edges, instead of long context expanding the table and shoving
+     the node off-screen. Full context lives in the row's detail drawer. */
+  table-layout: fixed;
   border-collapse: separate; border-spacing: 0;
   font-family: var(--font-mono); font-size: 13px;
   line-height: 1.7;
@@ -450,17 +472,29 @@
 }
 .cx-kwic-cpath {
   font-size: 11px; color: var(--fg-muted);
-  max-width: 180px; overflow: hidden; text-overflow: ellipsis;
+  overflow: hidden; text-overflow: ellipsis;
   padding-right: 14px;
 }
-.cx-kwic-left { text-align: right; color: var(--fg); direction: rtl; unicode-bidi: plaintext; }
+.cx-kwic-left {
+  text-align: right; color: var(--fg);
+  direction: rtl; unicode-bidi: plaintext;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to right, transparent 0, #000 28px);
+  mask-image: linear-gradient(to right, transparent 0, #000 28px);
+}
 .cx-kwic-chit {
   text-align: center; font-weight: 700; padding: 4px 14px;
   color: var(--accent); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
 }
 .cx-kwic-chit.cx-layer-lemma { color: var(--layer-lemma); }
 .cx-kwic-chit.cx-layer-pos { color: var(--layer-pos); }
-.cx-kwic-right { text-align: left; color: var(--fg); }
+.cx-kwic-right {
+  text-align: left; color: var(--fg);
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to left, transparent 0, #000 28px);
+  mask-image: linear-gradient(to left, transparent 0, #000 28px);
+}
 .cx-kwic-meta { font-size: 10px; color: var(--fg-subtle); font-family: var(--font-mono); padding-right: 14px; width: 50px; }
 
 /* Hit-density gutter */
