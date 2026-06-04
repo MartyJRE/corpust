@@ -3,6 +3,7 @@ import { type FormEvent, useEffect, useState } from "react";
 import { isCql } from "@/lib/cql";
 import { clearDimension, filterChips, normalizeFilter } from "@/lib/filter";
 import type { DocFilter, QueryLayer } from "@/types";
+import { CqlInput } from "./CqlInput";
 
 const LAYERS: { value: QueryLayer; label: string; hint: string }[] = [
   { value: "word", label: "word", hint: "surface form · case-insensitive" },
@@ -77,19 +78,21 @@ export function QueryBar({
         <span className="cx-input-icon">
           <Search size={14} />
         </span>
-        <input
-          className="cx-input cx-input-mono"
+        <CqlInput
+          className="cx-cql-host"
           value={term}
-          onChange={(e) => onTerm(e.target.value)}
+          onChange={onTerm}
+          onRun={() => {
+            if (term.trim()) onRun();
+          }}
+          disabled={disabled}
           placeholder={
             layer === "pos"
-              ? "POS tag (e.g. NN, VBD, IN)…"
+              ? 'POS tag, or [pos="NN"]…'
               : layer === "lemma"
-                ? "lemma (e.g. go, be, run)…"
-                : "term or regex…"
+                ? 'lemma, or [hw="be"]…'
+                : 'term, regex, or [word="x" pos="NN"]…'
           }
-          disabled={disabled}
-          spellCheck={false}
         />
         <div className="cx-input-suffix">
           {term && <span>{cql ? "CQL" : layer === "pos" ? "exact" : "regex ok"}</span>}

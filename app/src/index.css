@@ -353,6 +353,22 @@
   min-width: 0; width: 100%;
 }
 .cx-input-mono { font-family: var(--font-mono); }
+
+/* CQL editor (CodeMirror) — host fills the input wrap; chrome is themed in
+   CqlInput.tsx, token colours + lint underline here (CSS-variable driven so
+   they follow any future theme). */
+.cx-cql-host { flex: 1; min-width: 0; display: flex; }
+.cx-cql-host .cm-editor { width: 100%; }
+.cm-cql-bracket { color: var(--fg-subtle); }
+.cm-cql-attr { color: var(--layer-lemma); }
+.cm-cql-operator { color: var(--fg-subtle); }
+.cm-cql-string { color: var(--success); }
+.cm-cql-regex { color: var(--warn); }
+.cm-cql-invalid { color: var(--danger); }
+.cm-lintRange-error {
+  text-decoration: underline wavy color-mix(in oklch, var(--danger) 80%, transparent);
+  text-underline-offset: 3px;
+}
 .cx-input::placeholder { color: var(--fg-subtle); }
 .cx-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in oklch, var(--accent) 40%, transparent); }
 .cx-input-icon {
