@@ -584,10 +584,6 @@
 .cx-layer-chip.cx-layer-lemma { color: var(--layer-lemma); background: color-mix(in oklch, var(--layer-lemma) 18%, transparent); }
 .cx-layer-chip.cx-layer-pos { color: var(--layer-pos); background: color-mix(in oklch, var(--layer-pos) 22%, transparent); }
 
-.cx-status-mem { display: inline-flex; align-items: center; gap: 4px; }
-.cx-status-mem-bar { width: 30px; height: 4px; background: var(--bg-inset); border-radius: 2px; overflow: hidden; }
-.cx-status-mem-bar > div { height: 100%; background: var(--fg-subtle); }
-
 /* Command Palette */
 .cx-palette-backdrop {
   position: fixed; inset: 0; background: rgba(0,0,0,0.5);

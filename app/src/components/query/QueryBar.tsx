@@ -1,4 +1,4 @@
-import { Plus, Search, X } from "lucide-react";
+import { Search } from "lucide-react";
 import type { FormEvent } from "react";
 import type { QueryLayer } from "@/types";
 
@@ -7,11 +7,6 @@ const LAYERS: { value: QueryLayer; label: string; hint: string }[] = [
   { value: "lemma", label: "lemma", hint: "dictionary form · requires annotation" },
   { value: "pos", label: "pos", hint: "POS tag · case-sensitive (NN, VBD, …)" },
 ];
-
-export interface Filter {
-  key: string;
-  label: string;
-}
 
 export interface QueryBarProps {
   layer: QueryLayer;
@@ -22,8 +17,6 @@ export interface QueryBarProps {
   disabled?: boolean;
   annotated?: boolean;
   onOpenPalette: () => void;
-  filters: Filter[];
-  onRemoveFilter: (k: string) => void;
 }
 
 export function QueryBar({
@@ -35,8 +28,6 @@ export function QueryBar({
   disabled,
   annotated,
   onOpenPalette,
-  filters,
-  onRemoveFilter,
 }: QueryBarProps) {
   const submit = (e: FormEvent) => {
     e.preventDefault();
@@ -83,25 +74,6 @@ export function QueryBar({
         />
         <div className="cx-input-suffix">{term && <span>{layer === "pos" ? "exact" : "regex ok"}</span>}</div>
       </div>
-
-      {filters.map((f) => (
-        <span
-          key={f.key}
-          className="cx-filter-chip is-on"
-          onClick={() => onRemoveFilter(f.key)}
-          role="button"
-          tabIndex={0}
-        >
-          {f.label}
-          <span className="x">
-            <X size={10} />
-          </span>
-        </span>
-      ))}
-      <button type="button" className="cx-filter-chip" title="Add a metadata filter">
-        <Plus size={10} />
-        filter
-      </button>
 
       <button type="submit" className="cx-btn cx-btn-primary" disabled={disabled || !term.trim()}>
         Run

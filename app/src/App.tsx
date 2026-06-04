@@ -1,15 +1,14 @@
 // Top-level composition. Holds all view / corpus / query / overlay state.
-// TODO: replace in-memory `corpora` and `pickHits` with Tauri IPC —
-//   listCorpora()  → corpora
-//   runKwic(req)   → result
-//   buildIndex(…)  → stream progress into BuildDialog
+// Real corpora are served over Tauri IPC (listCorpora / runKwic /
+// buildIndex …); the baked-in `@/data` fixtures are the fallback shown
+// when no real corpus is loaded (vite preview or the demo set).
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Sidebar } from "@/components/chrome/Sidebar";
 import { StatusBar } from "@/components/chrome/StatusBar";
 import { TitleStrip } from "@/components/chrome/TitleStrip";
 import { ViewTabs } from "@/components/chrome/ViewTabs";
-import { QueryBar, type Filter } from "@/components/query/QueryBar";
+import { QueryBar } from "@/components/query/QueryBar";
 import { KwicTable } from "@/components/kwic/KwicTable";
 import { HitDensityGutter } from "@/components/kwic/HitDensityGutter";
 import { ContextDrawer } from "@/components/kwic/ContextDrawer";
@@ -24,6 +23,7 @@ import { Onboarding } from "@/components/analyses/Onboarding";
 import { CommandPalette, type CommandDef } from "@/components/overlays/CommandPalette";
 import { BuildDialog } from "@/components/overlays/BuildDialog";
 import { CORPORA, RECENT_QUERIES, pickHits } from "@/data";
+import { concordanceCsv, concordanceJson, saveText, slug } from "@/lib/export";
 import { makeDensity } from "@/lib/utils";
 import { inTauri, isFixtureCorpus, listCorpora, runCollocates, runKwic as runKwicTauri } from "@/lib/tauri";
 import type { Collocate } from "@/types";
@@ -71,8 +71,11 @@ export function App() {
   );
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [buildOpen, setBuildOpen] = useState(false);
-  const [filters, setFilters] = useState<Filter[]>([{ key: "year", label: "year: 1800–1950" }]);
-  const scrollPct = 0.18;
+  // Concordance scroll position (0–1), tracked from the KWIC column so the
+  // hit-density gutter's thumb reflects where you actually are, and clicks
+  // on the gutter scroll there.
+  const kwicScrollRef = useRef<HTMLDivElement>(null);
+  const [scrollPct, setScrollPct] = useState(0);
 
   // Refresh the corpora list from disk via the Tauri backend. Real
   // (persisted) corpora land at the top; baked-in fixtures stay below
@@ -181,6 +184,43 @@ export function App() {
   // Explicit Enter / "Run" — fetch the first page immediately.
   const run = () => fetchKwic(activeCorpus, term, layer, 0);
 
+  // Keep `scrollPct` in sync with the concordance column so the density
+  // gutter's thumb tracks the real scroll position. Re-attaches whenever
+  // the table remounts (result/subview change swap the scroll element).
+  useEffect(() => {
+    const el = kwicScrollRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const max = el.scrollHeight - el.clientHeight;
+      setScrollPct(max > 0 ? el.scrollTop / max : 0);
+    };
+    onScroll();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [result, subview, view]);
+
+  // Click on the density gutter → scroll the concordance to that fraction.
+  const onDensityJump = (pct: number) => {
+    const el = kwicScrollRef.current;
+    if (!el) return;
+    el.scrollTo({ top: pct * (el.scrollHeight - el.clientHeight), behavior: "smooth" });
+  };
+
+  // Export the current concordance page. CSV is flat (n, doc, position,
+  // left, node, right); JSON carries the query context + any lemma/POS.
+  const exportConcordance = useCallback(
+    (format: "csv" | "json") => {
+      if (!result || result.hits.length === 0) return;
+      const base = `${slug(activeCorpus?.name ?? "concordance")}-${slug(term || "query")}`;
+      if (format === "csv") {
+        void saveText(`${base}.csv`, concordanceCsv(result), "text/csv");
+      } else {
+        void saveText(`${base}.json`, concordanceJson(result, activeCorpus, term, layer), "application/json");
+      }
+    },
+    [result, activeCorpus, term, layer],
+  );
+
   // Fetch real collocates when the Collocations view is active on a
   // real (backend-registered) corpus. Fixture corpora keep whatever
   // data.ts ships.
@@ -263,6 +303,9 @@ export function App() {
       } else if (meta && e.key === "3") {
         e.preventDefault();
         if (activeCorpus?.annotated) setLayer("pos");
+      } else if (meta && e.key.toLowerCase() === "e") {
+        e.preventDefault();
+        exportConcordance("csv");
       } else if (e.key === "Escape") {
         setSelected(null);
       } else if ((e.key === "j" || e.key === "k") && result && !paletteOpen && !buildOpen) {
@@ -280,7 +323,7 @@ export function App() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [activeCorpus, result, selected, paletteOpen, buildOpen]);
+  }, [activeCorpus, result, selected, paletteOpen, buildOpen, exportConcordance]);
 
   const runRecent = (q: RecentQuery) => {
     setLayer(q.layer);
@@ -318,6 +361,10 @@ export function App() {
     } else if (cmd.id === "view-freq") {
       setView("search");
       setSubview("freq");
+    } else if (cmd.id === "export-csv") {
+      exportConcordance("csv");
+    } else if (cmd.id === "export-json") {
+      exportConcordance("json");
     }
   };
 
@@ -374,8 +421,6 @@ export function App() {
           disabled={!activeCorpus}
           annotated={!!activeCorpus?.annotated}
           onOpenPalette={() => setPaletteOpen(true)}
-          filters={filters}
-          onRemoveFilter={(k) => setFilters((fs) => fs.filter((f) => f.key !== k))}
         />
         <ViewTabs view={subview} onView={setSubview} result={result} />
         <div className="cx-results-wrap">
@@ -392,8 +437,10 @@ export function App() {
                 onSelect={setSelected}
                 pageSize={KWIC_PAGE}
                 onPage={goToPage}
+                onExport={exportConcordance}
+                scrollRef={kwicScrollRef}
               />
-              <HitDensityGutter density={density} scrollPct={scrollPct} onJump={() => {}} />
+              <HitDensityGutter density={density} scrollPct={scrollPct} onJump={onDensityJump} />
               {selected && activeCorpus && (
                 <ContextDrawer
                   hit={selected}
@@ -460,7 +507,6 @@ export function App() {
             corpus={activeCorpus}
             result={view === "search" ? result : null}
             layer={layer}
-            memory={0.42}
           />
         </main>
       </div>

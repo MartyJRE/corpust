@@ -1021,6 +1021,21 @@ fn resolve_treetagger_bundle_root(app: &AppHandle) -> Result<PathBuf, String> {
     ))
 }
 
+/// Write a UTF-8 string to `path`, creating or truncating the file.
+///
+/// Backs the frontend's export actions: the UI builds the CSV/JSON text
+/// and picks a destination with the save dialog, then hands both here so
+/// the bytes land on disk. Kept deliberately minimal — no directory
+/// creation, no appends.
+#[tauri::command]
+pub async fn write_text_file(path: String, contents: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::write(&path, contents).map_err(|e| format!("write {path}: {e}"))
+    })
+    .await
+    .map_err(|e| format!("write task panicked: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

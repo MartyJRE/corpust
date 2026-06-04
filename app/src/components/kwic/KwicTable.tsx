@@ -1,5 +1,5 @@
 import { ArrowDown, ArrowUp, ChevronLeft, ChevronRight, Download } from "lucide-react";
-import { useMemo } from "react";
+import { type Ref, useMemo } from "react";
 import type { KwicHit, KwicResult, QueryLayer, SortDir, SortMode } from "@/types";
 import { formatDuration } from "@/lib/utils";
 
@@ -19,6 +19,11 @@ export interface KwicTableProps {
   pageSize: number;
   /** Jump to a page (offset in hits). */
   onPage: (offset: number) => void;
+  /** Export the current page in the given format. */
+  onExport: (format: "csv" | "json") => void;
+  /** Ref to the scroll container, so the parent can track scroll
+   *  position (density gutter) and scroll to a fraction on jump. */
+  scrollRef?: Ref<HTMLDivElement>;
 }
 
 function sortHits(hits: KwicHit[], mode: SortMode, dir: SortDir): KwicHit[] {
@@ -47,6 +52,8 @@ export function KwicTable({
   onSelect,
   pageSize,
   onPage,
+  onExport,
+  scrollRef,
 }: KwicTableProps) {
   const sortedHits = useMemo(
     () => (result ? sortHits(result.hits, sortMode, sortDir) : []),
@@ -82,7 +89,7 @@ export function KwicTable({
   }
 
   return (
-    <div className="cx-kwic-col">
+    <div className="cx-kwic-col" ref={scrollRef}>
       <div className="cx-kwic-sort-bar">
         <span>sort</span>
         {(
@@ -134,7 +141,7 @@ export function KwicTable({
         <span className="sep">·</span>
         <span className="cx-status-time">{formatDuration(result.elapsedMs)}</span>
         <span className="cx-spacer" />
-        <button type="button" className="cx-sort-btn">
+        <button type="button" className="cx-sort-btn" onClick={() => onExport("csv")} title="Export this page as CSV">
           <Download size={11} /> export csv
         </button>
       </div>
